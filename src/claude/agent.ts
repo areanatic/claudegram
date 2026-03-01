@@ -26,6 +26,7 @@ import {
   getTimingReport,
   type AgentTimer,
 } from '../utils/agent-timer.js';
+import { recordTranscript } from './transcript-logger.js';
 
 export interface AgentUsage {
   inputTokens: number;
@@ -59,6 +60,8 @@ interface AgentOptions {
   command?: string;
   model?: string;
   telegramCtx?: Context;
+  /** When true, appends voice-mode instructions for conversational TTS-friendly responses */
+  voiceMode?: boolean;
 }
 
 interface LoopOptions extends AgentOptions {
@@ -222,6 +225,24 @@ const TOOL_PROMPTS = [
   config.EXTRACT_ENABLED ? EXTRACT_TOOL_PROMPT : '',
 ].join('');
 
+const VOICE_MODE_PROMPT = `
+
+Voice Mode Active — the user is speaking to you via voice message.
+You are a digital employee on a phone call with your employer. Respond accordingly.
+
+Rules for voice responses:
+- Keep responses SHORT: 2-4 sentences for simple questions, max 1 short paragraph for complex ones
+- Use natural, conversational language — as if speaking on a phone call
+- NEVER use markdown formatting (no **, ##, \`code\`, lists, etc.) — your response will be read aloud via TTS
+- NEVER include code blocks, tables, or bullet lists — describe things verbally instead
+- Be direct and get to the point immediately
+- Use natural transition words ("Also,", "Gut,", "Verstanden,", "So,", "Right,")
+- If asked about code or files, summarize verbally. Offer to send details as a follow-up text message if needed
+- Say numbers naturally: "about two hundred" not "~200", "three files" not "3 files"
+- Match the user's language — if they speak German, respond in German. If English, respond in English
+- Do NOT include a Reasoning Summary section
+- Do NOT use emoji`;
+
 const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}${TOOL_PROMPTS}${config.CLAUDE_REASONING_SUMMARY ? REASONING_SUMMARY_INSTRUCTIONS : ''}`;
 
 /**
@@ -287,7 +308,7 @@ export async function sendToAgent(
   message: string,
   options: AgentOptions = {}
 ): Promise<AgentResponse> {
-  const { onProgress, onToolStart, onToolEnd, abortController, command, model } = options;
+  const { onProgress, onToolStart, onToolEnd, abortController, command, model, voiceMode } = options;
 
   const session = sessionManager.getOrResumeSession(sessionKey);
 
@@ -306,11 +327,12 @@ export async function sendToAgent(
     prompt = `Explore the codebase and answer: ${message}`;
   }
 
-  // Add user message to history
+  // Add user message to history and persist to transcript
   history.push({
     role: 'user',
     content: prompt,
   });
+  recordTranscript(sessionKey, 'user', message);
 
   let fullText = '';
   const toolsUsed: string[] = [];
@@ -454,7 +476,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: SYSTEM_PROMPT,
+        append: voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT,
       },
       settingSources: ['project', 'user'] as SettingSource[],
       model: effectiveModel,
@@ -654,12 +676,13 @@ export async function sendToAgent(
     clearActiveQuery(sessionKey);
   }
 
-  // Add assistant response to history
+  // Add assistant response to history and persist to transcript
   if (fullText && !abortController?.signal.aborted) {
     history.push({
       role: 'assistant',
       content: fullText,
     });
+    recordTranscript(sessionKey, 'assistant', fullText);
   }
 
   conversationHistory.set(sessionKey, history);
