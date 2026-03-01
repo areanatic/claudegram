@@ -1,7 +1,7 @@
 import { Context, InputFile } from 'grammy';
 import { config } from '../config.js';
 import { generateSpeech } from './tts.js';
-import { getTTSSettings, isTTSEnabled } from './tts-settings.js';
+import { getTTSSettings, isVoiceActive, getDetectedLanguage } from './tts-settings.js';
 import { getSessionKeyFromCtx } from '../utils/session-key.js';
 
 function stripMarkdown(input: string): string {
@@ -53,7 +53,10 @@ export async function maybeSendVoiceReply(ctx: Context, text: string): Promise<v
   const keyInfo = getSessionKeyFromCtx(ctx);
   if (!keyInfo) return;
   const { sessionKey } = keyInfo;
-  if (!isTTSEnabled(sessionKey)) return;
+
+  // Use isVoiceActive: respects both manual TTS toggle AND Voice-First Mode
+  if (!isVoiceActive(sessionKey)) return;
+
   const hasKey = config.TTS_PROVIDER === 'groq' ? !!config.GROQ_API_KEY : !!config.OPENAI_API_KEY;
   if (!hasKey) return;
   if (looksLikeError(text)) return;
@@ -66,8 +69,13 @@ export async function maybeSendVoiceReply(ctx: Context, text: string): Promise<v
 
   try {
     const settings = getTTSSettings(sessionKey);
-    const audioBuffer = await generateSpeech(safeText, settings.voice);
-    const format = config.TTS_PROVIDER === 'groq'
+    const language = getDetectedLanguage(sessionKey);
+    const audioBuffer = await generateSpeech(safeText, settings.voice, language);
+
+    // Determine format: if non-English fell back to OpenAI, use its format
+    const isNonEnglish = language && language !== 'en' && language !== 'english';
+    const usedOpenAI = config.TTS_PROVIDER === 'groq' && isNonEnglish && !!config.OPENAI_API_KEY;
+    const format = (config.TTS_PROVIDER === 'groq' && !usedOpenAI)
       ? 'ogg'
       : config.TTS_RESPONSE_FORMAT === 'opus' ? 'ogg' : config.TTS_RESPONSE_FORMAT;
     const file = new InputFile(audioBuffer, `response.${format}`);

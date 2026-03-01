@@ -138,6 +138,8 @@ const envSchema = z.object({
     .default('19')
     .transform((val) => parseInt(val, 10)),
   VOICE_LANGUAGE: z.string().default('en'),
+  VOICE_AUTO_DETECT: z.string().default('true').transform(toBool),
+  VOICE_FIRST_MODE_ENABLED: z.string().default('true').transform(toBool),
   VOICE_TIMEOUT_MS: z
     .string()
     .default('60000')

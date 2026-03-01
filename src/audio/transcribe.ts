@@ -13,15 +13,30 @@ export interface TranscribeOptions {
   allowEmpty?: boolean;
 }
 
+export interface TranscribeResult {
+  text: string;
+  language: string;
+}
+
 /**
  * Transcribe an audio file using the Groq Whisper API directly via fetch.
  * No Python subprocess - much faster, especially on first call.
  */
 export async function transcribeFile(filePath: string, options?: TranscribeOptions): Promise<string> {
+  const result = await transcribeFileWithLanguage(filePath, options);
+  return result.text;
+}
+
+/**
+ * Transcribe an audio file and return both the transcript and detected language.
+ * Uses verbose_json format when VOICE_AUTO_DETECT is enabled to get language detection.
+ */
+export async function transcribeFileWithLanguage(filePath: string, options?: TranscribeOptions): Promise<TranscribeResult> {
   if (!config.GROQ_API_KEY) {
     throw new Error('GROQ_API_KEY not configured. Set it in .env to enable voice transcription.');
   }
 
+  const autoDetect = config.VOICE_AUTO_DETECT;
   const timeoutMs = options?.timeoutMs ?? config.VOICE_TIMEOUT_MS;
   const fileBuffer = fs.readFileSync(filePath);
   const fileName = path.basename(filePath);
@@ -29,8 +44,14 @@ export async function transcribeFile(filePath: string, options?: TranscribeOptio
   const formData = new FormData();
   formData.append('file', new Blob([fileBuffer]), fileName);
   formData.append('model', GROQ_WHISPER_MODEL);
-  formData.append('language', config.VOICE_LANGUAGE);
-  formData.append('response_format', 'json');
+
+  if (autoDetect) {
+    // Don't pass language — let Whisper detect it
+    formData.append('response_format', 'verbose_json');
+  } else {
+    formData.append('language', config.VOICE_LANGUAGE);
+    formData.append('response_format', 'json');
+  }
 
   const response = await fetch(GROQ_WHISPER_ENDPOINT, {
     method: 'POST',
@@ -46,14 +67,19 @@ export async function transcribeFile(filePath: string, options?: TranscribeOptio
     throw new Error(`Groq Whisper API error ${response.status}: ${body.slice(0, 300)}`);
   }
 
-  const result = (await response.json()) as { text?: string };
+  const result = (await response.json()) as { text?: string; language?: string };
   const transcript = (result.text || '').trim();
+  const detectedLang = result.language || config.VOICE_LANGUAGE;
 
   if (!transcript && !options?.allowEmpty) {
     throw new Error('Empty transcription result');
   }
 
-  return transcript;
+  if (autoDetect) {
+    console.log(`[Voice] Auto-detected language: ${detectedLang}`);
+  }
+
+  return { text: transcript, language: detectedLang };
 }
 
 /**

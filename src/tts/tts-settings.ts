@@ -9,6 +9,8 @@ const ttsSettingsSchema = z.object({
   enabled: z.boolean().optional(),
   voice: z.string().optional(),
   autoplay: z.boolean().optional(),
+  voiceFirstMode: z.boolean().optional(),
+  detectedLanguage: z.string().optional(),
 });
 
 // Zod schema for the full TTS settings file
@@ -20,6 +22,10 @@ export interface TTSSettings {
   enabled: boolean;
   voice: string;
   autoplay: boolean;
+  /** Activated automatically when user sends a voice note */
+  voiceFirstMode: boolean;
+  /** Language detected from the last voice message */
+  detectedLanguage: string;
 }
 
 const SETTINGS_DIR = path.join(os.homedir(), '.claudegram');
@@ -62,6 +68,8 @@ function normalizeSettings(settings?: Partial<TTSSettings>): TTSSettings {
     enabled: typeof settings?.enabled === 'boolean' ? settings.enabled : false,
     voice: isValidVoiceForProvider(voice) ? voice : getDefaultVoice(),
     autoplay: typeof settings?.autoplay === 'boolean' ? settings.autoplay : true,
+    voiceFirstMode: typeof settings?.voiceFirstMode === 'boolean' ? settings.voiceFirstMode : false,
+    detectedLanguage: typeof settings?.detectedLanguage === 'string' ? settings.detectedLanguage : 'en',
   };
 }
 
@@ -134,4 +142,46 @@ export function setTTSAutoplay(sessionKey: string, autoplay: boolean): void {
 
 export function isTTSEnabled(sessionKey: string): boolean {
   return getTTSSettings(sessionKey).enabled;
+}
+
+/**
+ * Returns true if TTS is active for this session — either manually enabled
+ * or automatically activated via Voice-First Mode.
+ */
+export function isVoiceActive(sessionKey: string): boolean {
+  const settings = getTTSSettings(sessionKey);
+  return settings.enabled || settings.voiceFirstMode;
+}
+
+/**
+ * Activate Voice-First Mode: auto-enables TTS when user sends a voice note.
+ * Also stores the detected language for TTS provider selection.
+ */
+export function activateVoiceFirstMode(sessionKey: string, language: string): void {
+  const settings = getTTSSettings(sessionKey);
+  settings.voiceFirstMode = true;
+  settings.detectedLanguage = language;
+  saveSettings();
+  console.log(`[TTS] Voice-First Mode activated for ${sessionKey}, language: ${language}`);
+}
+
+/**
+ * Deactivate Voice-First Mode: called when user sends a text message,
+ * indicating they've switched away from voice interaction.
+ */
+export function deactivateVoiceFirstMode(sessionKey: string): void {
+  const settings = getTTSSettings(sessionKey);
+  if (settings.voiceFirstMode) {
+    settings.voiceFirstMode = false;
+    settings.detectedLanguage = 'en';
+    saveSettings();
+    console.log(`[TTS] Voice-First Mode deactivated for ${sessionKey}`);
+  }
+}
+
+/**
+ * Get the detected language for a session.
+ */
+export function getDetectedLanguage(sessionKey: string): string {
+  return getTTSSettings(sessionKey).detectedLanguage;
 }

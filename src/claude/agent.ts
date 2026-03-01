@@ -59,6 +59,8 @@ interface AgentOptions {
   command?: string;
   model?: string;
   telegramCtx?: Context;
+  /** When true, responses are optimized for text-to-speech playback */
+  voiceMode?: boolean;
 }
 
 interface LoopOptions extends AgentOptions {
@@ -215,6 +217,18 @@ Reasoning Summary (required when enabled):
 - Do NOT reveal chain-of-thought, hidden reasoning, or sensitive tool outputs.
 - Skip the summary for very short acknowledgements or pure error messages.`;
 
+const VOICE_MODE_PROMPT = `
+
+Voice Mode (ACTIVE — the user is speaking to you via voice, and your response will be read aloud by TTS):
+- Respond in the SAME LANGUAGE the user spoke in. If they speak German, respond in German. If English, respond in English.
+- Keep responses SHORT and conversational — 2-4 sentences max for simple questions.
+- Never use markdown formatting (no **, no ##, no \`code\`, no lists with - or *).
+- Write as if you're speaking to a colleague — natural, direct, human.
+- Don't read out URLs, file paths, or code unless specifically asked.
+- Use simple sentence structures. Avoid jargon when possible.
+- If the answer is complex, give a brief verbal summary and offer to send details as text.
+- Never say "I'll send you a voice message" or reference the medium — just answer naturally.`;
+
 const TOOL_PROMPTS = [
   config.REDDIT_ENABLED ? REDDIT_TOOL_PROMPT : '',
   config.VREDDIT_ENABLED ? REDDIT_VIDEO_TOOL_PROMPT : '',
@@ -287,7 +301,7 @@ export async function sendToAgent(
   message: string,
   options: AgentOptions = {}
 ): Promise<AgentResponse> {
-  const { onProgress, onToolStart, onToolEnd, abortController, command, model } = options;
+  const { onProgress, onToolStart, onToolEnd, abortController, command, model, voiceMode } = options;
 
   const session = sessionManager.getSession(sessionKey);
 
@@ -454,7 +468,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: SYSTEM_PROMPT,
+        append: voiceMode ? SYSTEM_PROMPT + VOICE_MODE_PROMPT : SYSTEM_PROMPT,
       },
       settingSources: ['project', 'user'] as SettingSource[],
       model: effectiveModel,

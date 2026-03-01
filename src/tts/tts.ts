@@ -260,8 +260,23 @@ async function generateSpeechGroq(text: string, voice?: string): Promise<Buffer>
  * Returns an audio Buffer (format depends on provider:
  *   - groq: OGG/Opus
  *   - openai: format from TTS_RESPONSE_FORMAT config)
+ *
+ * When language is provided and is not English, automatically falls back
+ * to OpenAI TTS (Groq Orpheus only supports English).
  */
-export async function generateSpeech(text: string, voice?: string): Promise<Buffer> {
+export async function generateSpeech(text: string, voice?: string, language?: string): Promise<Buffer> {
+  const isNonEnglish = language && language !== 'en' && language !== 'english';
+
+  // Groq Orpheus only supports English — fall back to OpenAI for other languages
+  if (config.TTS_PROVIDER === 'groq' && isNonEnglish) {
+    if (config.OPENAI_API_KEY) {
+      console.log(`[TTS] Non-English language (${language}), falling back to OpenAI TTS`);
+      return generateSpeechOpenAI(text, voice);
+    }
+    // No OpenAI key — try Groq anyway (will sound odd but won't crash)
+    console.warn(`[TTS] Non-English (${language}) but no OPENAI_API_KEY — using Groq (English-only)`);
+  }
+
   if (config.TTS_PROVIDER === 'groq') {
     return generateSpeechGroq(text, voice);
   }

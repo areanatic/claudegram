@@ -17,11 +17,12 @@ import {
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
 import { getStreamingMode } from './command.handler.js';
 import { maybeSendVoiceReply } from '../../tts/voice-reply.js';
-import { transcribeFile } from '../../audio/transcribe.js';
+import { transcribeFileWithLanguage } from '../../audio/transcribe.js';
 import { sendTranscriptResult } from './command.handler.js';
 import { downloadFileSecure, getTelegramFileUrl } from '../../utils/download.js';
 import { sanitizeError, sanitizePath } from '../../utils/sanitize.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
+import { activateVoiceFirstMode } from '../../tts/tts-settings.js';
 
 export async function handleVoice(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
@@ -100,10 +101,15 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
     console.log(`[Voice] Downloaded ${fileSizeMB.toFixed(1)}MB to ${tempFilePath}`);
 
-    // Transcribe using Groq Whisper API (native TypeScript)
-    const transcript = await transcribeFile(tempFilePath);
+    // Transcribe using Groq Whisper API with language detection
+    const { text: transcript, language: detectedLanguage } = await transcribeFileWithLanguage(tempFilePath);
 
-    console.log(`[Voice] Transcript received (${transcript.length} chars)`);
+    console.log(`[Voice] Transcript received (${transcript.length} chars, lang: ${detectedLanguage})`);
+
+    // Activate Voice-First Mode if enabled in config
+    if (config.VOICE_FIRST_MODE_ENABLED) {
+      activateVoiceFirstMode(sessionKey, detectedLanguage);
+    }
 
     // Show full transcript if configured (uses smart Telegram chunking)
     if (config.VOICE_SHOW_TRANSCRIPT) {
@@ -139,7 +145,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
       await ctx.reply(`⏳ Queued \\(position ${position}\\)`, { parse_mode: 'MarkdownV2' });
     }
 
-    // Feed transcript into agent
+    // Feed transcript into agent with voiceMode enabled
     await queueRequest(sessionKey, transcript, async () => {
       if (getStreamingMode() === 'streaming') {
         await messageSender.startStreaming(ctx);
@@ -153,6 +159,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
               messageSender.updateStream(ctx, progressText);
             },
             abortController,
+            voiceMode: true,
           });
 
           await messageSender.finishStreaming(ctx, response.text);
@@ -167,7 +174,10 @@ export async function handleVoice(ctx: Context): Promise<void> {
         const abortController = new AbortController();
         setAbortController(sessionKey, abortController);
 
-        const response = await sendToAgent(sessionKey, transcript, { abortController });
+        const response = await sendToAgent(sessionKey, transcript, {
+          abortController,
+          voiceMode: true,
+        });
         await messageSender.sendMessage(ctx, response.text);
         await maybeSendVoiceReply(ctx, response.text);
       }
@@ -233,7 +243,7 @@ async function handleTranscribeOnly(
       throw new Error('Downloaded empty voice file.');
     }
 
-    const transcript = await transcribeFile(tempFilePath);
+    const { text: transcript } = await transcribeFileWithLanguage(tempFilePath);
 
     // Remove ack
     try {

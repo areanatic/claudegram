@@ -20,6 +20,7 @@ import { getStreamingMode, executeRedditFetch, executeMediumFetch, showExtractMe
 import { executeVReddit } from '../../reddit/vreddit.js';
 import { detectPlatform, isValidUrl } from '../../media/extract.js';
 import { maybeSendVoiceReply } from '../../tts/voice-reply.js';
+import { deactivateVoiceFirstMode } from '../../tts/tts-settings.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
@@ -145,6 +146,9 @@ export async function handleMessage(ctx: Context): Promise<void> {
 
   if (!keyInfo || !text || !messageId || !messageDate) return;
   const { chatId, sessionKey } = keyInfo;
+
+  // Deactivate Voice-First Mode when user sends text (they switched to typing)
+  deactivateVoiceFirstMode(sessionKey);
 
   // Filter stale messages (sent before bot started)
   if (isStaleMessage(messageDate)) {
