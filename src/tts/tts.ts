@@ -276,7 +276,7 @@ export async function generateSpeech(text: string, voice?: string, options?: Gen
   // Groq Orpheus is English-only — fall back to OpenAI for other languages
   if (config.TTS_PROVIDER === 'groq' && isNonEnglish && config.OPENAI_API_KEY) {
     console.log(`[TTS] Non-English detected (${language}), using OpenAI TTS (Groq Orpheus is English-only)`);
-    return generateSpeechOpenAI(text, voice);
+    return generateSpeechOpenAI(text, undefined);
   }
 
   if (config.TTS_PROVIDER === 'groq') {
@@ -286,7 +286,7 @@ export async function generateSpeech(text: string, voice?: string, options?: Gen
       const msg = String(err);
       if (msg.includes('429') && config.OPENAI_API_KEY) {
         console.log('[TTS] Groq rate limit (429) — falling back to OpenAI TTS');
-        return generateSpeechOpenAI(text, voice);
+        return generateSpeechOpenAI(text, undefined);
       }
       throw err;
     }

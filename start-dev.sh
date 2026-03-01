@@ -21,6 +21,16 @@ fi
 echo "🧪 Starting Claudegram DEV Bot (@AstronDevBot)..."
 echo "📋 Config: $CLAUDEGRAM_ENV_PATH"
 
+# Persistent log — survives reboots, auto-rotates at 10k lines
+LOG_DIR="$HOME/.claudegram/logs"
+LOG_FILE="$LOG_DIR/dev.log"
+mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
+if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt 10000 ]; then
+  tail -5000 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+fi
+exec >> "$LOG_FILE" 2>&1
+echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (PID $$) ==="
+
 cleanup() { rm -f "$LOCK_FILE"; }
 trap cleanup EXIT
 
