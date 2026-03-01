@@ -16,6 +16,10 @@ import { sessionManager } from './session-manager.js';
 import { getWorkspaceRoot, isPathWithinRoot } from '../utils/workspace-guard.js';
 
 // Lazy imports to avoid circular deps and unnecessary module loading
+async function importInbox() {
+  return import('../inbox/inbox.js');
+}
+
 async function importReddit() {
   return import('../reddit/redditfetch.js');
 }
@@ -79,6 +83,13 @@ function buildToolList(toolsCtx: McpToolsContext) {
   if (config.TELEGRAPH_ENABLED) {
     tools.push(publishTelegraphTool(toolsCtx));
   }
+
+  if (config.DOCUMENT_INBOX_ENABLED) {
+    tools.push(inboxListTool(toolsCtx));
+    tools.push(inboxRouteTool(toolsCtx));
+  }
+
+  tools.push(sendFileTool(toolsCtx));
 
   return tools;
 }
@@ -327,6 +338,158 @@ function publishTelegraphTool(_toolsCtx: McpToolsContext) {
       } catch (error) {
         return {
           content: [{ type: 'text' as const, text: `Telegraph error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+// ── Inbox Tools ───────────────────────────────────────────────────────
+
+function inboxListTool(_toolsCtx: McpToolsContext) {
+  return tool(
+    'claudegram_inbox_list',
+    'List all files currently in the INBOX (unrouted documents received via Telegram). Shows filename, size, MIME type, date, and caption for each file.',
+    {},
+    async () => {
+      try {
+        const { listInbox, getInboxStats, formatFileSize } = await importInbox();
+        const items = listInbox();
+        const stats = getInboxStats();
+
+        if (items.length === 0) {
+          return {
+            content: [{ type: 'text' as const, text: 'INBOX is empty — no unrouted documents.' }],
+          };
+        }
+
+        const lines = items.map((item, i) => {
+          const caption = item.caption ? ` — "${item.caption}"` : '';
+          return `${i + 1}. ${item.originalFilename} (${formatFileSize(item.fileSize)}, ${item.mimeType || 'unknown'})${caption}\n   Saved: ${item.savedFilename} | Received: ${item.receivedAt}`;
+        });
+
+        const summary = `INBOX: ${stats.totalFiles} file(s), ${stats.totalSizeMB} MB total\n\n${lines.join('\n\n')}`;
+
+        return {
+          content: [{ type: 'text' as const, text: summary }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Inbox list error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+function inboxRouteTool(_toolsCtx: McpToolsContext) {
+  return tool(
+    'claudegram_inbox_route',
+    'Route (move) a file from the INBOX to a target directory within the workspace. Use claudegram_inbox_list first to see available files.',
+    {
+      filename: z.string().describe('The saved filename in the INBOX (from claudegram_inbox_list)'),
+      target_dir: z.string().describe('Target directory path (relative to workspace root or absolute)'),
+      new_name: z.string().optional().describe('Optional new filename after routing'),
+    },
+    async ({ filename, target_dir, new_name }) => {
+      try {
+        const { getInboxDir, routeFile } = await importInbox();
+        const inboxDir = getInboxDir();
+        const filePath = path.join(inboxDir, filename);
+
+        if (!fs.existsSync(filePath)) {
+          return {
+            content: [{ type: 'text' as const, text: `File not found in INBOX: ${filename}` }],
+            isError: true,
+          };
+        }
+
+        // Resolve target directory
+        const workspaceRoot = getWorkspaceRoot();
+        const resolvedTarget = path.isAbsolute(target_dir)
+          ? target_dir
+          : path.resolve(workspaceRoot, target_dir);
+
+        if (!isPathWithinRoot(workspaceRoot, resolvedTarget)) {
+          return {
+            content: [{ type: 'text' as const, text: `Error: Target must be within workspace root: ${workspaceRoot}` }],
+            isError: true,
+          };
+        }
+
+        const { newPath } = routeFile(filePath, resolvedTarget, new_name);
+
+        return {
+          content: [{ type: 'text' as const, text: `File routed: ${filename} → ${newPath}` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Inbox route error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+// ── Send File Tool ────────────────────────────────────────────────────
+
+function sendFileTool(toolsCtx: McpToolsContext) {
+  return tool(
+    'claudegram_send_file',
+    'Send a file from the workspace to the user via Telegram. The file must be within the workspace root. Use this to share project files, generated reports, or any file the user requests.',
+    {
+      file_path: z.string().describe('Path to the file (relative to workspace root or absolute)'),
+      caption: z.string().optional().describe('Optional caption to send with the file'),
+    },
+    async ({ file_path, caption }) => {
+      try {
+        const workspaceRoot = getWorkspaceRoot();
+        const resolvedPath = path.isAbsolute(file_path)
+          ? file_path
+          : path.resolve(workspaceRoot, file_path);
+
+        if (!isPathWithinRoot(workspaceRoot, resolvedPath)) {
+          return {
+            content: [{ type: 'text' as const, text: `Error: File must be within workspace root: ${workspaceRoot}` }],
+            isError: true,
+          };
+        }
+
+        if (!fs.existsSync(resolvedPath) || !fs.statSync(resolvedPath).isFile()) {
+          return {
+            content: [{ type: 'text' as const, text: `File not found: ${file_path}` }],
+            isError: true,
+          };
+        }
+
+        const stats = fs.statSync(resolvedPath);
+        const sizeMB = stats.size / (1024 * 1024);
+
+        // Standard API: 50MB send limit. Local API server: 2GB.
+        const maxSendMB = config.TELEGRAM_API_SERVER_URL ? 2000 : 50;
+        if (sizeMB > maxSendMB) {
+          return {
+            content: [{ type: 'text' as const, text: `File too large (${sizeMB.toFixed(1)} MB). Limit is ${maxSendMB} MB.` }],
+            isError: true,
+          };
+        }
+
+        const ctx = toolsCtx.telegramCtx;
+        const filename = path.basename(resolvedPath);
+
+        await ctx.replyWithDocument(new InputFile(resolvedPath, filename), {
+          caption: caption || undefined,
+        });
+
+        return {
+          content: [{ type: 'text' as const, text: `File sent to user: ${filename} (${sizeMB < 1 ? `${(stats.size / 1024).toFixed(1)} KB` : `${sizeMB.toFixed(1)} MB`})` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Send file error: ${error instanceof Error ? error.message : String(error)}` }],
           isError: true,
         };
       }

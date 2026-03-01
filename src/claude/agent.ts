@@ -227,21 +227,17 @@ const TOOL_PROMPTS = [
 
 const VOICE_MODE_PROMPT = `
 
-Voice Mode Active — the user is speaking to you via voice message.
-You are a digital employee on a phone call with your employer. Respond accordingly.
-
-Rules for voice responses:
-- Keep responses SHORT: 2-4 sentences for simple questions, max 1 short paragraph for complex ones
-- Use natural, conversational language — as if speaking on a phone call
-- NEVER use markdown formatting (no **, ##, \`code\`, lists, etc.) — your response will be read aloud via TTS
-- NEVER include code blocks, tables, or bullet lists — describe things verbally instead
-- Be direct and get to the point immediately
-- Use natural transition words ("Also,", "Gut,", "Verstanden,", "So,", "Right,")
-- If asked about code or files, summarize verbally. Offer to send details as a follow-up text message if needed
-- Say numbers naturally: "about two hundred" not "~200", "three files" not "3 files"
-- Match the user's language — if they speak German, respond in German. If English, respond in English
-- Do NOT include a Reasoning Summary section
-- Do NOT use emoji`;
+Voice Mode (ACTIVE — the user is speaking to you via voice, and your response will be read aloud by TTS):
+- Respond in the SAME LANGUAGE the user spoke in. If they speak German, respond in German. If English, respond in English.
+- Keep responses SHORT and conversational — 2-4 sentences max for simple questions.
+- Never use markdown formatting (no **, no ##, no \`code\`, no lists with - or *).
+- Write as if you're speaking to a colleague — natural, direct, human.
+- Don't read out URLs, file paths, or code unless specifically asked.
+- Use simple sentence structures. Avoid jargon when possible.
+- If the answer is complex, give a brief verbal summary and offer to send details as text.
+- Never say "I'll send you a voice message" or reference the medium — just answer naturally.
+- Do NOT include a Reasoning Summary section.
+- Do NOT use emoji.`;
 
 const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}${TOOL_PROMPTS}${config.CLAUDE_REASONING_SUMMARY ? REASONING_SUMMARY_INSTRUCTIONS : ''}`;
 
@@ -792,6 +788,7 @@ export function clearConversation(sessionKey: string): void {
   conversationHistory.delete(sessionKey);
   chatSessionIds.delete(sessionKey);
   chatUsageCache.delete(sessionKey);
+  chatModels.delete(sessionKey);
 }
 
 export function setModel(sessionKey: string, model: string): void {

@@ -138,6 +138,10 @@ const envSchema = z.object({
     .default('19')
     .transform((val) => parseInt(val, 10)),
   VOICE_LANGUAGE: z.string().default('en'),
+  // Voice-first mode: auto-enable TTS when user sends voice messages
+  VOICE_FIRST_MODE_ENABLED: z.string().default('true').transform(toBool),
+  // Auto-detect language from voice messages (uses Whisper verbose_json). When false, uses VOICE_LANGUAGE.
+  VOICE_AUTO_DETECT: z.string().default('true').transform(toBool),
   VOICE_TIMEOUT_MS: z
     .string()
     .default('60000')
@@ -199,6 +203,14 @@ const envSchema = z.object({
     .string()
     .default('0')
     .transform((val) => parseInt(val, 10)), // 0 = disabled
+  // Document INBOX configuration
+  DOCUMENT_INBOX_ENABLED: z.string().default('true').transform(toBool),
+  DOCUMENT_MAX_FILE_SIZE_MB: z
+    .string()
+    .default('20')
+    .transform((val) => parseInt(val, 10)),
+  // Local Telegram Bot API Server (optional — raises file limit from 20MB to 2GB)
+  TELEGRAM_API_SERVER_URL: z.string().optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);

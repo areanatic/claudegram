@@ -13,9 +13,85 @@ export interface TranscribeOptions {
   allowEmpty?: boolean;
 }
 
+export interface TranscribeResult {
+  text: string;
+  /** Full language name as returned by Whisper, e.g. "english", "german" */
+  language: string;
+  /** ISO 639-1 language code, e.g. "en", "de" */
+  languageCode: string;
+}
+
+/** Map Whisper's full language names to ISO 639-1 codes */
+const LANGUAGE_NAME_TO_CODE: Record<string, string> = {
+  english: 'en', german: 'de', spanish: 'es', french: 'fr',
+  portuguese: 'pt', italian: 'it', dutch: 'nl', russian: 'ru',
+  japanese: 'ja', chinese: 'zh', korean: 'ko', arabic: 'ar',
+  turkish: 'tr', polish: 'pl', swedish: 'sv', norwegian: 'no',
+  danish: 'da', finnish: 'fi', greek: 'el', czech: 'cs',
+  romanian: 'ro', hungarian: 'hu', ukrainian: 'uk', hindi: 'hi',
+  thai: 'th', vietnamese: 'vi', indonesian: 'id', malay: 'ms',
+  hebrew: 'he', persian: 'fa', catalan: 'ca', croatian: 'hr',
+  slovak: 'sk', slovenian: 'sl', serbian: 'sr', bulgarian: 'bg',
+  lithuanian: 'lt', latvian: 'lv', estonian: 'et',
+};
+
+/**
+ * Transcribe an audio file with auto-detected language using verbose_json format.
+ * Returns transcript text, detected language name, and ISO 639-1 code.
+ */
+export async function transcribeFileWithLanguage(filePath: string, options?: TranscribeOptions): Promise<TranscribeResult> {
+  if (!config.GROQ_API_KEY) {
+    throw new Error('GROQ_API_KEY not configured. Set it in .env to enable voice transcription.');
+  }
+
+  const timeoutMs = options?.timeoutMs ?? config.VOICE_TIMEOUT_MS;
+  const fileBuffer = fs.readFileSync(filePath);
+  const fileName = path.basename(filePath);
+
+  const formData = new FormData();
+  formData.append('file', new Blob([fileBuffer]), fileName);
+  formData.append('model', GROQ_WHISPER_MODEL);
+
+  if (config.VOICE_AUTO_DETECT) {
+    // Use verbose_json to get language detection from Whisper
+    formData.append('response_format', 'verbose_json');
+  } else {
+    // Use configured language, standard json format
+    formData.append('language', config.VOICE_LANGUAGE);
+    formData.append('response_format', 'verbose_json');
+  }
+
+  const response = await fetch(GROQ_WHISPER_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.GROQ_API_KEY}`,
+    },
+    body: formData,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`Groq Whisper API error ${response.status}: ${body.slice(0, 300)}`);
+  }
+
+  const result = (await response.json()) as { text?: string; language?: string };
+  const transcript = (result.text || '').trim();
+
+  if (!transcript && !options?.allowEmpty) {
+    throw new Error('Empty transcription result');
+  }
+
+  const detectedLanguage = (result.language || 'english').toLowerCase();
+  const languageCode = LANGUAGE_NAME_TO_CODE[detectedLanguage] || config.VOICE_LANGUAGE;
+
+  return { text: transcript, language: detectedLanguage, languageCode };
+}
+
 /**
  * Transcribe an audio file using the Groq Whisper API directly via fetch.
  * No Python subprocess - much faster, especially on first call.
+ * Uses fixed language from config (backward-compatible).
  */
 export async function transcribeFile(filePath: string, options?: TranscribeOptions): Promise<string> {
   if (!config.GROQ_API_KEY) {

@@ -39,6 +39,61 @@ export const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', 
 // Alternative spinner (dots)
 export const DOTS_SPINNER = ['⠁', '⠂', '⠄', '⡀', '⢀', '⠠', '⠐', '⠈'];
 
+// Animation Variants (configurable via .env ANIMATION_VARIANT)
+export const ANIMATION_VARIANTS = {
+  lightning: {
+    spinner: ['←', '↖', '↑', '↗', '→', '↘', '↓', '↙'],
+    emoji: '⚡',
+    defaultText: 'Denke nach...',
+    speed: 150,
+  },
+  brain: {
+    spinner: ['◐', '◓', '◑', '◒'],
+    emoji: '🧠',
+    defaultText: 'Prozessiere...',
+    speed: 200,
+  },
+  reload: {
+    spinner: ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'],
+    emoji: '🔄',
+    defaultText: 'Arbeite...',
+    speed: 100,
+  },
+  robot: {
+    spinner: ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '▇', '▆', '▅', '▄', '▃', '▂'],
+    emoji: '🤖',
+    defaultText: 'Berechne...',
+    speed: 120,
+  },
+  stars: {
+    spinner: ['✶', '✸', '✹', '✺', '✹', '✸'],
+    emoji: '💫',
+    defaultText: 'Moment...',
+    speed: 180,
+  },
+  // Original/default
+  default: {
+    spinner: ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'],
+    emoji: '💭',
+    defaultText: 'Processing...',
+    speed: 200,
+  },
+};
+
+// Get current animation config from env
+function getAnimationConfig() {
+  const variant = process.env.ANIMATION_VARIANT || 'default';
+  const config = ANIMATION_VARIANTS[variant as keyof typeof ANIMATION_VARIANTS] || ANIMATION_VARIANTS.default;
+
+  return {
+    ...config,
+    text: process.env.ANIMATION_TEXT || config.defaultText,
+    speed: parseInt(process.env.ANIMATION_SPEED || String(config.speed)),
+  };
+}
+
+export const CURRENT_ANIMATION = getAnimationConfig();
+
 // Progress bar characters
 export const PROGRESS = {
   empty: '░',
@@ -57,7 +112,29 @@ export function getToolIcon(toolName: string): string {
  * Get current spinner frame based on index
  */
 export function getSpinnerFrame(index: number): string {
-  return SPINNER_FRAMES[index % SPINNER_FRAMES.length];
+  const frames = CURRENT_ANIMATION.spinner;
+  return frames[index % frames.length];
+}
+
+/**
+ * Get animation emoji
+ */
+export function getAnimationEmoji(): string {
+  return CURRENT_ANIMATION.emoji;
+}
+
+/**
+ * Get animation text
+ */
+export function getAnimationText(): string {
+  return CURRENT_ANIMATION.text;
+}
+
+/**
+ * Get animation speed in ms
+ */
+export function getAnimationSpeed(): number {
+  return CURRENT_ANIMATION.speed;
 }
 
 /**

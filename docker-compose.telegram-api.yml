@@ -1,0 +1,35 @@
+# Local Telegram Bot API Server
+#
+# Raises the file upload/download limit from 20MB to 2GB.
+# Also provides faster file transfers (no round-trip to Telegram cloud).
+#
+# Requirements:
+#   - TELEGRAM_API_ID and TELEGRAM_API_HASH from https://my.telegram.org/apps
+#   - Docker installed on Mac Mini
+#
+# Usage:
+#   docker compose -f docker-compose.telegram-api.yml up -d
+#
+# Then set in your .env:
+#   TELEGRAM_API_SERVER_URL=http://localhost:8081
+#
+# The bot will automatically use the local server for all API calls.
+# Files are stored locally in ./telegram-bot-api-data/
+
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: "true"
+    volumes:
+      - ./telegram-bot-api-data:/var/lib/telegram-bot-api
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

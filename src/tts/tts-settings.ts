@@ -9,6 +9,8 @@ const ttsSettingsSchema = z.object({
   enabled: z.boolean().optional(),
   voice: z.string().optional(),
   autoplay: z.boolean().optional(),
+  voiceFirstMode: z.boolean().optional(),
+  detectedLanguage: z.string().nullable().optional(),
 });
 
 // Zod schema for the full TTS settings file
@@ -20,6 +22,10 @@ export interface TTSSettings {
   enabled: boolean;
   voice: string;
   autoplay: boolean;
+  /** Auto-enabled when user sends voice message, auto-disabled when they type text */
+  voiceFirstMode: boolean;
+  /** Last detected language code from STT (e.g. "de", "en") */
+  detectedLanguage: string | null;
 }
 
 const SETTINGS_DIR = path.join(os.homedir(), '.claudegram');
@@ -62,6 +68,8 @@ function normalizeSettings(settings?: Partial<TTSSettings>): TTSSettings {
     enabled: typeof settings?.enabled === 'boolean' ? settings.enabled : false,
     voice: isValidVoiceForProvider(voice) ? voice : getDefaultVoice(),
     autoplay: typeof settings?.autoplay === 'boolean' ? settings.autoplay : true,
+    voiceFirstMode: typeof settings?.voiceFirstMode === 'boolean' ? settings.voiceFirstMode : false,
+    detectedLanguage: typeof settings?.detectedLanguage === 'string' ? settings.detectedLanguage : null,
   };
 }
 
@@ -134,4 +142,30 @@ export function setTTSAutoplay(sessionKey: string, autoplay: boolean): void {
 
 export function isTTSEnabled(sessionKey: string): boolean {
   return getTTSSettings(sessionKey).enabled;
+}
+
+/** Returns true if TTS is explicitly enabled OR voice-first mode is active */
+export function isVoiceActive(sessionKey: string): boolean {
+  const settings = getTTSSettings(sessionKey);
+  return settings.enabled || settings.voiceFirstMode;
+}
+
+export function setVoiceFirstMode(sessionKey: string, enabled: boolean): void {
+  const settings = getTTSSettings(sessionKey);
+  settings.voiceFirstMode = enabled;
+  // Don't persist voiceFirstMode to disk — it's session-transient
+}
+
+export function setDetectedLanguage(sessionKey: string, language: string | null): void {
+  const settings = getTTSSettings(sessionKey);
+  // Validate: only accept 2-3 letter ISO 639-1 codes or null
+  if (language !== null && !/^[a-z]{2,3}$/.test(language)) {
+    console.warn(`[TTS] Invalid language code "${language}", ignoring`);
+    return;
+  }
+  settings.detectedLanguage = language;
+}
+
+export function getDetectedLanguage(sessionKey: string): string | null {
+  return getTTSSettings(sessionKey).detectedLanguage;
 }

@@ -17,7 +17,8 @@ import {
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
 import { getStreamingMode } from './command.handler.js';
 import { maybeSendVoiceReply } from '../../tts/voice-reply.js';
-import { transcribeFile } from '../../audio/transcribe.js';
+import { transcribeFile, transcribeFileWithLanguage } from '../../audio/transcribe.js';
+import { setVoiceFirstMode, setDetectedLanguage, isVoiceActive } from '../../tts/tts-settings.js';
 import { sendTranscriptResult } from './command.handler.js';
 import { downloadFileSecure, getTelegramFileUrl } from '../../utils/download.js';
 import { sanitizeError, sanitizePath } from '../../utils/sanitize.js';
@@ -53,11 +54,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
     }
   }
 
-  // Check session
-  const session = sessionManager.getSession(sessionKey);
+  // Check session — auto-resume from disk if bot restarted
+  const session = sessionManager.getOrResumeSession(sessionKey);
   if (!session) {
     await ctx.reply(
-      '⚠️ No project set\\.\n\nIf the bot restarted, use `/continue` or `/resume` to restore your last session\\.\nOr use `/project` to open a project first\\.',
+      '⚠️ No project set\\.\n\nUse `/project` to open a project first\\.',
       { parse_mode: 'MarkdownV2' }
     );
     return;
@@ -100,13 +101,32 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
     console.log(`[Voice] Downloaded ${fileSizeMB.toFixed(1)}MB to ${tempFilePath}`);
 
-    // Transcribe using Groq Whisper API (native TypeScript)
-    const transcript = await transcribeFile(tempFilePath);
+    // Transcribe using Groq Whisper API with auto language detection
+    const transcribeResult = await transcribeFileWithLanguage(tempFilePath);
+    const transcript = transcribeResult.text;
+    const detectedLanguage = transcribeResult.languageCode;
 
-    console.log(`[Voice] Transcript received (${transcript.length} chars)`);
+    console.log(`[Voice] Transcript received (${transcript.length} chars, lang=${detectedLanguage})`);
 
-    // Show full transcript if configured (uses smart Telegram chunking)
-    if (config.VOICE_SHOW_TRANSCRIPT) {
+    // Activate voice-first mode (if enabled in config) and store detected language
+    if (config.VOICE_FIRST_MODE_ENABLED) {
+      setVoiceFirstMode(sessionKey, true);
+    }
+    setDetectedLanguage(sessionKey, detectedLanguage);
+
+    const voiceActive = isVoiceActive(sessionKey);
+
+    // In voice-first mode: minimal transcript display to reduce noise
+    // In normal mode: show full transcript if configured
+    if (voiceActive) {
+      // Show a brief inline transcript (first ~80 chars) so user knows what was heard
+      const preview = transcript.length > 80 ? transcript.slice(0, 80) + '...' : transcript;
+      try {
+        await ctx.api.editMessageText(chatId, ackMsg.message_id, `🎤 "${preview}"`, { parse_mode: undefined });
+      } catch {
+        try { await ctx.api.deleteMessage(chatId, ackMsg.message_id); } catch { /* ignore */ }
+      }
+    } else if (config.VOICE_SHOW_TRANSCRIPT) {
       try {
         await ctx.api.editMessageText(
           chatId,
@@ -115,22 +135,12 @@ export async function handleVoice(ctx: Context): Promise<void> {
           { parse_mode: 'MarkdownV2' }
         );
       } catch {
-        try {
-          await ctx.api.deleteMessage(chatId, ackMsg.message_id);
-        } catch (e) {
-          // Telegram message deletion can fail if already deleted or expired
-          console.debug('[Voice] Failed to delete ack message:', e instanceof Error ? e.message : e);
-        }
+        try { await ctx.api.deleteMessage(chatId, ackMsg.message_id); } catch { /* ignore */ }
       }
 
       await messageSender.sendMessage(ctx, `👤 ${transcript}`);
     } else {
-      // Remove ack message
-      try {
-        await ctx.api.deleteMessage(chatId, ackMsg.message_id);
-      } catch (e) {
-        console.debug('[Voice] Failed to delete ack message:', e instanceof Error ? e.message : e);
-      }
+      try { await ctx.api.deleteMessage(chatId, ackMsg.message_id); } catch { /* ignore */ }
     }
 
     // Check if already processing - show queue position
@@ -141,7 +151,26 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
     // Feed transcript into agent
     await queueRequest(sessionKey, transcript, async () => {
-      if (getStreamingMode() === 'streaming') {
+      if (voiceActive) {
+        // Voice-first mode: skip streaming display, just show typing indicator
+        // This reduces latency by avoiding message creation/editing overhead
+        await ctx.replyWithChatAction('typing');
+
+        const abortController = new AbortController();
+        setAbortController(sessionKey, abortController);
+
+        const response = await sendToAgent(sessionKey, transcript, {
+          abortController,
+          voiceMode: true,
+          telegramCtx: ctx,
+        });
+
+        // Send voice reply FIRST (primary output in voice mode)
+        await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
+
+        // Send text as secondary reference (shorter in voice mode)
+        await messageSender.sendMessage(ctx, response.text);
+      } else if (getStreamingMode() === 'streaming') {
         await messageSender.startStreaming(ctx);
 
         const abortController = new AbortController();
@@ -153,10 +182,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
               messageSender.updateStream(ctx, progressText);
             },
             abortController,
+            telegramCtx: ctx,
           });
 
           await messageSender.finishStreaming(ctx, response.text);
-          await maybeSendVoiceReply(ctx, response.text);
+          await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
         } catch (error) {
           await messageSender.cancelStreaming(ctx);
           throw error;
@@ -167,9 +197,12 @@ export async function handleVoice(ctx: Context): Promise<void> {
         const abortController = new AbortController();
         setAbortController(sessionKey, abortController);
 
-        const response = await sendToAgent(sessionKey, transcript, { abortController });
+        const response = await sendToAgent(sessionKey, transcript, {
+          abortController,
+          telegramCtx: ctx,
+        });
         await messageSender.sendMessage(ctx, response.text);
-        await maybeSendVoiceReply(ctx, response.text);
+        await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
       }
     });
   } catch (error) {

@@ -9,6 +9,8 @@ import {
   renderStatusLine,
   extractToolDetail,
   TOOL_ICONS,
+  getAnimationEmoji,
+  getAnimationText,
 } from './terminal-renderer.js';
 import { getSessionKeyFromCtx } from '../utils/session-key.js';
 import * as fs from 'fs';
@@ -170,7 +172,7 @@ export class MessageSender {
     const { chatId, threadId, sessionKey } = keyInfo;
 
     const terminalMode = isTerminalUIEnabled(sessionKey);
-    const initialText = `${getSpinnerFrame(0)} ${TOOL_ICONS.thinking} Processing...`;
+    const initialText = `${getSpinnerFrame(0)} ${getAnimationEmoji()} ${getAnimationText()}`;
     const message = await ctx.reply(initialText, { parse_mode: undefined });
 
     // Start continuous typing indicator
@@ -312,7 +314,7 @@ export class MessageSender {
 
     // If nothing to show, show thinking indicator
     if (parts.length === 0) {
-      parts.push(`${getSpinnerFrame(state.spinnerIndex)} ${TOOL_ICONS.thinking} Thinking...`);
+      parts.push(`${getSpinnerFrame(state.spinnerIndex)} ${getAnimationEmoji()} ${getAnimationText()}`);
     }
 
     const displayContent = parts.join('\n');

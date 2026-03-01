@@ -271,7 +271,7 @@ export interface GenerateSpeechOptions {
  */
 export async function generateSpeech(text: string, voice?: string, options?: GenerateSpeechOptions): Promise<Buffer> {
   const language = options?.language;
-  const isNonEnglish = language && language !== 'en';
+  const isNonEnglish = language && language !== 'en' && language !== 'english';
 
   // Groq Orpheus is English-only — fall back to OpenAI for other languages
   if (config.TTS_PROVIDER === 'groq' && isNonEnglish && config.OPENAI_API_KEY) {

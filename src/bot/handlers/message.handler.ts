@@ -20,6 +20,7 @@ import { getStreamingMode, executeRedditFetch, executeMediumFetch, showExtractMe
 import { executeVReddit } from '../../reddit/vreddit.js';
 import { detectPlatform, isValidUrl } from '../../media/extract.js';
 import { maybeSendVoiceReply } from '../../tts/voice-reply.js';
+import { setVoiceFirstMode } from '../../tts/tts-settings.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
@@ -146,6 +147,9 @@ export async function handleMessage(ctx: Context): Promise<void> {
   if (!keyInfo || !text || !messageId || !messageDate) return;
   const { chatId, sessionKey } = keyInfo;
 
+  // Deactivate voice-first mode when user switches to typing
+  setVoiceFirstMode(sessionKey, false);
+
   // Filter stale messages (sent before bot started)
   if (isStaleMessage(messageDate)) {
     console.log(`[Message] Ignoring stale message ${messageId} from before bot start`);
@@ -247,23 +251,20 @@ export async function handleMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  // Auto-detect YouTube / TikTok / Instagram URLs sent as bare links → show extract menu
+  // Auto-detect disabled: YouTube/TikTok/Instagram URLs go to Claude as context.
+  // Use /extract command manually when extraction is needed.
   const trimmedText = text.trim();
-  if (config.EXTRACT_ENABLED && isValidUrl(trimmedText) && detectPlatform(trimmedText) !== 'unknown') {
-    await showExtractMenu(ctx, trimmedText);
-    return;
-  }
 
   // Skip if this is a Claude command (handled by command handler)
   if (isClaudeCommand(text)) {
     return;
   }
 
-  // Check for active session
-  const session = sessionManager.getSession(sessionKey);
+  // Check for active session — auto-resume from disk if bot restarted
+  const session = sessionManager.getOrResumeSession(sessionKey);
   if (!session) {
     await ctx.reply(
-      '⚠️ No project set\\.\n\nIf the bot restarted, use `/continue` or `/resume` to restore your last session\\.\nOr use `/project` to open a project first\\.',
+      '⚠️ No project set\\.\n\nUse `/project` to open a project first\\.',
       { parse_mode: 'MarkdownV2' }
     );
     return;
