@@ -5,6 +5,10 @@ import { preventSleep, allowSleep } from './utils/caffeinate.js';
 import { stopCleanup } from './telegram/deduplication.js';
 
 async function main() {
+  // Clear CLAUDECODE so claude subprocesses can start even when launched
+  // from inside a Claude Code session (e.g. VS Code with Claude Code extension).
+  delete process.env.CLAUDECODE;
+
   console.log('🤖 Starting Claudegram...');
   console.log(`📋 Allowed users: ${config.ALLOWED_USER_IDS.join(', ')}`);
   console.log(`📝 Mode: ${config.STREAMING_MODE}`);

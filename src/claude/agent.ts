@@ -71,7 +71,7 @@ const conversationHistory: Map<string, ConversationMessage[]> = new Map();
 // Track Claude Code session IDs per session for conversation continuity
 const chatSessionIds: Map<string, string> = new Map();
 
-// Track current model per session (default: opus)
+// Track current model per session (default: sonnet)
 const chatModels: Map<string, string> = new Map();
 
 // Cache latest usage per session for /context and /status commands
@@ -289,7 +289,7 @@ export async function sendToAgent(
 ): Promise<AgentResponse> {
   const { onProgress, onToolStart, onToolEnd, abortController, command, model } = options;
 
-  const session = sessionManager.getSession(sessionKey);
+  const session = sessionManager.getOrResumeSession(sessionKey);
 
   if (!session) {
     throw new Error('No active session. Use /project to set working directory.');
@@ -325,8 +325,8 @@ export async function sendToAgent(
   // Log in dangerous mode for security auditing
   logDangerousModeOperation(sessionKey, 'query', `prompt_length:${message.length} cwd:${session.workingDirectory}`);
 
-  // Determine model to use (default to 'opus' to match getModel() default)
-  const effectiveModel = model || chatModels.get(sessionKey) || 'opus';
+  // Determine model to use (default to 'sonnet'; use /model opus for heavy tasks)
+  const effectiveModel = model || chatModels.get(sessionKey) || 'sonnet';
 
   // Initialize timer for tracking query duration (watchdog created inside try with controller)
   const timer = createAgentTimer();
@@ -690,7 +690,7 @@ export async function sendLoopToAgent(
     onIterationComplete,
   } = options;
 
-  const session = sessionManager.getSession(sessionKey);
+  const session = sessionManager.getOrResumeSession(sessionKey);
 
   if (!session) {
     throw new Error('No active session. Use /project to set working directory.');
