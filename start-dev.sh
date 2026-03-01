@@ -24,8 +24,11 @@ echo "📋 Config: $CLAUDEGRAM_ENV_PATH"
 cleanup() { rm -f "$LOCK_FILE"; }
 trap cleanup EXIT
 
+# Write lock file BEFORE the loop — prevents race condition where a second
+# script passes the "already running" check during the 30s restart sleep.
+echo $$ > "$LOCK_FILE"
+
 while true; do
-    echo $$ > "$LOCK_FILE"
     node "$SCRIPT_DIR/dist/index.js"
     EXIT_CODE=$?
     echo "⚠️  Dev Bot exited with code $EXIT_CODE — restarting in 30s..."
