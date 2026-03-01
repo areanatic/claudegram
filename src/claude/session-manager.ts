@@ -43,6 +43,23 @@ class SessionManager {
     return this.sessions.get(sessionKey);
   }
 
+  /**
+   * Get session from memory, or auto-resume the last session from disk if none exists.
+   * This prevents "No project set" errors after bot restarts.
+   * The session data is always persisted in ~/.claudegram/sessions.json,
+   * so this simply restores what was already there.
+   */
+  getOrResumeSession(sessionKey: string): Session | undefined {
+    const existing = this.sessions.get(sessionKey);
+    if (existing) return existing;
+
+    const resumed = this.resumeLastSession(sessionKey);
+    if (resumed) {
+      console.log(`[AutoResume] Restored session for ${sessionKey}: ${resumed.workingDirectory}`);
+    }
+    return resumed;
+  }
+
   createSession(sessionKey: string, workingDirectory: string, conversationId?: string): Session {
     const resolved = resolveWorkingDirectory(workingDirectory);
     const session: Session = {

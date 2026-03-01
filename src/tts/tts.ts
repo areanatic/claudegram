@@ -263,7 +263,16 @@ async function generateSpeechGroq(text: string, voice?: string): Promise<Buffer>
  */
 export async function generateSpeech(text: string, voice?: string): Promise<Buffer> {
   if (config.TTS_PROVIDER === 'groq') {
-    return generateSpeechGroq(text, voice);
+    try {
+      return await generateSpeechGroq(text, voice);
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes('429') && config.OPENAI_API_KEY) {
+        console.log('[TTS] Groq rate limit (429) — falling back to OpenAI TTS');
+        return generateSpeechOpenAI(text, voice);
+      }
+      throw err;
+    }
   }
   return generateSpeechOpenAI(text, voice);
 }
