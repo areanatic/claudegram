@@ -18,9 +18,6 @@ if [ -f "$LOCK_FILE" ] && kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
   exit 0
 fi
 
-echo "🧪 Starting Claudegram DEV Bot (@AstronDevBot)..."
-echo "📋 Config: $CLAUDEGRAM_ENV_PATH"
-
 # Persistent log — survives reboots, auto-rotates at 10k lines
 LOG_DIR="$HOME/.claudegram/logs"
 LOG_FILE="$LOG_DIR/dev.log"
@@ -30,6 +27,8 @@ if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt 10000 ]; then
 fi
 exec >> "$LOG_FILE" 2>&1
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (PID $$) ==="
+echo "🧪 Starting Claudegram DEV Bot (@AstronDevBot)..."
+echo "📋 Config: $CLAUDEGRAM_ENV_PATH"
 
 cleanup() { rm -f "$LOCK_FILE"; }
 trap cleanup EXIT
