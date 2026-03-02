@@ -3254,3 +3254,110 @@ export async function executeExtract(ctx: Context, url: string, mode: ExtractMod
     }
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /handoff — save a structured session summary to 99_META/SESSIONS/ before
+//            context compaction or end of work session.
+// ─────────────────────────────────────────────────────────────────────────────
+export async function handleHandoff(ctx: Context): Promise<void> {
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (!keyInfo) return;
+  const { chatId, sessionKey } = keyInfo;
+
+  const session = sessionManager.getSession(sessionKey);
+  if (!session) {
+    await replyMd(
+      ctx,
+      '⚠️ No active session\\.\n\nStart a conversation first, then use `/handoff` to save a checkpoint\\.'
+    );
+    return;
+  }
+
+  const projectName = path.basename(session.workingDirectory);
+  const dateStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const timeStr = new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+
+  // Build context stats line if available
+  const cached = getCachedUsage(sessionKey);
+  const contextLine = cached
+    ? `- **Context:** ${Math.round(((cached.inputTokens + cached.outputTokens + cached.cacheReadTokens) / cached.contextWindow) * 100)}% used (${fmtTokens(cached.inputTokens + cached.outputTokens + cached.cacheReadTokens)} / ${fmtTokens(cached.contextWindow)})\n- **Model:** ${cached.model}\n- **Cost this session:** $${cached.totalCostUsd.toFixed(4)}`
+    : `- **Model:** ${getModel(sessionKey)}`;
+
+  const handoffPrompt =
+    `Please write a concise but complete handoff document for this session. ` +
+    `Format it in Markdown with these sections:\n\n` +
+    `# SESSION HANDOFF: ${projectName}\n` +
+    `**Date:** ${dateStr} ${timeStr}\n\n` +
+    `## What We Did\n` +
+    `(bullet list of completed work — be specific)\n\n` +
+    `## Key Decisions Made\n` +
+    `(architectural, technical, or strategic decisions)\n\n` +
+    `## Current State\n` +
+    `(exact state of the codebase/project right now)\n\n` +
+    `## Open Issues / Bugs\n` +
+    `(any known problems, errors, or incomplete items)\n\n` +
+    `## Next Steps\n` +
+    `(concrete next actions for the next session, in priority order)\n\n` +
+    `## Important File Paths\n` +
+    `(key files touched or relevant for next session)\n\n` +
+    `---\n` +
+    `*Generated via /handoff at ${dateStr} ${timeStr}*\n\n` +
+    `Keep it factual, practical, and dense. No fluff.`;
+
+  const ack = await ctx.reply('📝 Generating handoff document...', { parse_mode: undefined });
+
+  try {
+    await queueRequest(sessionKey, handoffPrompt, async () => {
+      const abortController = new AbortController();
+      setAbortController(sessionKey, abortController);
+
+      let handoffContent = '';
+      try {
+        const response = await sendToAgent(sessionKey, handoffPrompt, {
+          onProgress: () => {}, // silent generation
+          abortController,
+        });
+        handoffContent = response.text;
+      } catch (agentError) {
+        throw agentError;
+      }
+
+      if (!handoffContent || handoffContent.trim().length < 50) {
+        throw new Error('Claude returned an empty or too-short handoff document.');
+      }
+
+      // Determine save path: workspaceRoot/99_META/SESSIONS/
+      const workspaceRoot = getWorkspaceRoot();
+      const sessionsDir = path.join(workspaceRoot, '99_META', 'SESSIONS');
+      fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+
+      const safeName = projectName.replace(/[^a-zA-Z0-9_-]/g, '_').toUpperCase();
+      const fileName = `${dateStr}_${safeName}_HANDOFF.md`;
+      const filePath = path.join(sessionsDir, fileName);
+
+      fs.writeFileSync(filePath, handoffContent, { encoding: 'utf-8', mode: 0o600 });
+
+      // Delete ack message
+      try { await ctx.api.deleteMessage(chatId, ack.message_id); } catch { /* ignore */ }
+
+      const relPath = path.relative(workspaceRoot, filePath);
+      const statsLine = cached
+        ? `\n\n*Context at handoff: ${Math.round(((cached.inputTokens + cached.outputTokens + cached.cacheReadTokens) / cached.contextWindow) * 100)}% — use /clear after handoff to free context.*`
+        : '';
+
+      await messageSender.sendMessage(
+        ctx,
+        `✅ **Handoff saved**\n\n` +
+        `📄 \`${relPath}\`\n\n` +
+        `${contextLine}` +
+        statsLine +
+        `\n\n_Use /clear to start fresh, or keep chatting in the current session._`
+      );
+    });
+  } catch (error) {
+    try { await ctx.api.deleteMessage(chatId, ack.message_id); } catch { /* ignore */ }
+    if ((error as Error).message === 'Queue cleared') return;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    await replyMd(ctx, `❌ Handoff failed: ${esc(errorMessage)}`);
+  }
+}

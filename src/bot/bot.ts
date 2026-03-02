@@ -52,6 +52,7 @@ import {
   handleResetCallback,
   handleInbox,
   handleInboxCallback,
+  handleHandoff,
 } from './handlers/command.handler.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
@@ -124,6 +125,7 @@ export async function createBot(): Promise<Bot> {
     { command: 'mode', description: '⚙️ Toggle streaming mode' },
     { command: 'terminalui', description: '🖥️ Toggle terminal-style display' },
     { command: 'tts', description: '🔊 Toggle voice replies' },
+    { command: 'handoff', description: '🤝 Save session checkpoint before context reset' },
     { command: 'commands', description: '📜 List all commands' },
   ];
 
@@ -168,6 +170,7 @@ export async function createBot(): Promise<Bot> {
   bot.command('resume', handleResume);
   bot.command('continue', handleContinue);
   bot.command('sessions', handleSessions);
+  bot.command('handoff', handleHandoff);
 
   // Loop mode
   bot.command('loop', handleLoop);
