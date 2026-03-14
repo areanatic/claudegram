@@ -27,6 +27,7 @@ import {
   type AgentTimer,
 } from '../utils/agent-timer.js';
 import { recordTranscript } from './transcript-logger.js';
+import { buildNexusBridgePrompt } from '../nexus/bridge.js';
 
 export interface AgentUsage {
   inputTokens: number;
@@ -467,6 +468,8 @@ export async function sendToAgent(
       mcpServers['claudegram-tools'] = server;
     }
 
+    const nexusBridgePrompt = buildNexusBridgePrompt(cwd);
+
     const queryOptions: Parameters<typeof query>[0]['options'] = {
       cwd,
       tools: toolsOption,
@@ -476,7 +479,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT,
+        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${nexusBridgePrompt}`,
       },
       settingSources: ['project', 'user'] as SettingSource[],
       model: effectiveModel,

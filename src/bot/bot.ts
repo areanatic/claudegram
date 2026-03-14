@@ -9,6 +9,7 @@ import {
   handleClear,
   handleClearCallback,
   handleProject,
+  handleNexusProject,
   handleNewProject,
   handleProjectCallback,
   handleStatus,
@@ -50,10 +51,13 @@ import {
   handleRedditActionCallback,
   handleReset,
   handleResetCallback,
+  handleInbox,
+  handleInboxCallback,
 } from './handlers/command.handler.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
 import { handlePhoto, handleImageDocument } from './handlers/photo.handler.js';
+import { handleDocument } from './handlers/document.handler.js';
 
 // Resolve sequentialize constraint: same-chat updates are ordered,
 // but /cancel is registered BEFORE this middleware so it bypasses it.
@@ -68,14 +72,21 @@ function getSequentializeKey(ctx: Context): string | undefined {
 }
 
 export async function createBot(): Promise<Bot> {
-  const bot = new Bot(config.TELEGRAM_BOT_TOKEN, {
+  const botOptions: ConstructorParameters<typeof Bot>[1] = {
     client: {
       // Default is 500s which causes long hangs on network interruptions.
       // 60s is enough for long polling (30s) + file uploads while recovering
       // from stuck connections much faster.
       timeoutSeconds: 60,
+      // Local Telegram Bot API Server support (raises 20MB → 2GB file limit)
+      ...(config.TELEGRAM_API_SERVER_URL ? { apiRoot: config.TELEGRAM_API_SERVER_URL } : {}),
     },
-  });
+  };
+  const bot = new Bot(config.TELEGRAM_BOT_TOKEN, botOptions);
+
+  if (config.TELEGRAM_API_SERVER_URL) {
+    console.log(`📡 Using local Telegram API server: ${config.TELEGRAM_API_SERVER_URL}`);
+  }
 
   // Auto-retry on transient network errors (ECONNRESET, socket hang up, etc.)
   // Also handles 429 rate limits by respecting Telegram's retry_after
@@ -89,6 +100,7 @@ export async function createBot(): Promise<Bot> {
   const commandList = [
     { command: 'start', description: '🚀 Show help and getting started' },
     { command: 'project', description: '📁 Set working directory' },
+    { command: 'nexus', description: '🧠 Open the NEXUS repo in bridge mode' },
     { command: 'status', description: '📊 Show current session status' },
     { command: 'clear', description: '🗑️ Clear conversation history' },
     { command: 'cancel', description: '⏹️ Cancel current request' },
@@ -107,6 +119,7 @@ export async function createBot(): Promise<Bot> {
     ...(config.MEDIUM_ENABLED ? [{ command: 'medium', description: '📰 Fetch Medium articles' }] : []),
     ...(config.TRANSCRIBE_ENABLED ? [{ command: 'transcribe', description: '🎤 Transcribe audio to text' }] : []),
     ...(config.EXTRACT_ENABLED ? [{ command: 'extract', description: '📥 Extract text/audio/video from URL' }] : []),
+    ...(config.DOCUMENT_INBOX_ENABLED ? [{ command: 'inbox', description: '📬 View and manage document inbox' }] : []),
     { command: 'file', description: '📎 Download a file from project' },
     { command: 'telegraph', description: '📄 View markdown with Instant View' },
     { command: 'model', description: '🤖 Switch AI model' },
@@ -139,6 +152,7 @@ export async function createBot(): Promise<Bot> {
   bot.command('start', handleStart);
   bot.command('clear', handleClear);
   bot.command('project', handleProject);
+  bot.command('nexus', handleNexusProject);
   bot.command('newproject', handleNewProject);
   bot.command('status', handleStatus);
   bot.command('mode', handleMode);
@@ -167,6 +181,11 @@ export async function createBot(): Promise<Bot> {
   // File commands
   bot.command('file', handleFile);
   bot.command('telegraph', handleTelegraph);
+
+  // Document inbox
+  if (config.DOCUMENT_INBOX_ENABLED) {
+    bot.command('inbox', handleInbox);
+  }
 
   // Reddit
   if (config.REDDIT_ENABLED) {
@@ -219,6 +238,8 @@ export async function createBot(): Promise<Bot> {
       await handleRestartCallback(ctx);
     } else if (data.startsWith('reset:')) {
       await handleResetCallback(ctx);
+    } else if (data.startsWith('inbox:')) {
+      await handleInboxCallback(ctx);
     }
   });
 
@@ -231,11 +252,12 @@ export async function createBot(): Promise<Bot> {
   // Handle images
   bot.on('message:photo', handlePhoto);
 
-  // Handle documents: check for audio transcribe ForceReply first, then image documents
+  // Handle documents: audio transcribe → image documents → general documents (INBOX)
   bot.on('message:document', async (ctx) => {
-    // Try transcribe-document path first (audio MIME + reply to ForceReply)
     const replyTo = ctx.message?.reply_to_message;
     const doc = ctx.message?.document;
+
+    // 1. Audio transcribe ForceReply path
     if (replyTo && replyTo.from?.is_bot && doc?.mime_type?.startsWith('audio/')) {
       const replyText = (replyTo as { text?: string }).text || '';
       if (replyText.includes('Transcribe Audio')) {
@@ -243,8 +265,17 @@ export async function createBot(): Promise<Bot> {
         return;
       }
     }
-    // Fall through to image document handler
-    await handleImageDocument(ctx);
+
+    // 2. Image documents → existing photo handler
+    if (doc?.mime_type?.startsWith('image/')) {
+      await handleImageDocument(ctx);
+      return;
+    }
+
+    // 3. All other documents → INBOX handler
+    if (config.DOCUMENT_INBOX_ENABLED) {
+      await handleDocument(ctx);
+    }
   });
 
   // Handle regular text messages

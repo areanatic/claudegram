@@ -50,6 +50,7 @@ import { execFile, spawn } from 'child_process';
 import { sanitizeError, sanitizePath } from '../../utils/sanitize.js';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
+import { findDefaultNexusRoot } from '../../nexus/bridge.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -684,6 +685,29 @@ export async function handleProject(ctx: Context): Promise<void> {
   clearConversation(sessionKey);
 
   await replyMd(ctx, `✅ Project: *${esc(args)}*\n\nYou can now chat with Claude about this project\\!${projectStatusSuffix(sessionKey)}`);
+
+  const s = sessionManager.getSession(sessionKey);
+  if (s?.claudeSessionId) {
+    await replyMd(ctx, resumeCommandMessage(s.claudeSessionId));
+  }
+}
+
+export async function handleNexusProject(ctx: Context): Promise<void> {
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (!keyInfo) return;
+  const { sessionKey } = keyInfo;
+
+  const nexusRoot = findDefaultNexusRoot();
+  if (!nexusRoot || !fs.existsSync(nexusRoot) || !fs.statSync(nexusRoot).isDirectory()) {
+    await replyMd(ctx, '❌ No NEXUS root found automatically\. Use `/project /absolute/path/to/NEXUS` or set `NEXUS_ROOT` in the environment\.');
+    return;
+  }
+
+  sessionManager.setWorkingDirectory(sessionKey, nexusRoot);
+  clearConversation(sessionKey);
+
+  const label = path.basename(nexusRoot);
+  await replyMd(ctx, `🧠 NEXUS bridge active: *${esc(label)}*\n\nClaude will now use the local NEXUS repo plus the NEXUS instruction/agent context automatically\.${projectStatusSuffix(sessionKey)}`);
 
   const s = sessionManager.getSession(sessionKey);
   if (s?.claudeSessionId) {
@@ -1639,19 +1663,31 @@ export async function handleSessions(ctx: Context): Promise<void> {
     return;
   }
 
-  let message = '📋 *Sessions*\n\n';
+  // Count total sessions with Claude session IDs
+  const totalSessions = history.filter(e => e.claudeSessionId).length;
+  let message = `📋 *Sessions*${totalSessions > 0 ? ` \\(${totalSessions} total\\)` : ''}\n\n`;
 
   if (currentSession) {
-    message += `*Active:*\n• \`${esc(path.basename(currentSession.workingDirectory))}\` \\(${esc(formatTimeAgo(currentSession.lastActivity))}\\)\n\n`;
+    const activeEntry = history.find(e => e.conversationId === currentSession.conversationId);
+    const msgCount = activeEntry?.messageCount || 0;
+    const timeStr = formatTimeAgo(currentSession.lastActivity);
+    const preview = activeEntry?.lastMessagePreview ? `\n💬 "${esc(activeEntry.lastMessagePreview.substring(0, 50))}${activeEntry.lastMessagePreview.length > 50 ? '...' : ''}"` : '';
+
+    message += `🟢 *Active Session*\n`;
+    message += `\`${esc(path.basename(currentSession.workingDirectory))}\` · ${esc(timeStr)} · ${msgCount} msgs${preview}\n\n`;
   }
 
   if (history.length > 0) {
-    message += '*Recent:*\n';
+    message += '📚 *Recent Sessions*\n';
     for (const entry of history) {
       const isActive = currentSession && currentSession.conversationId === entry.conversationId;
-      const marker = isActive ? '→ ' : '• ';
+      if (isActive) continue; // Skip active session (already shown above)
+
       const date = new Date(entry.lastActivity);
-      message += `${marker}\`${esc(entry.projectName)}\` \\(${esc(formatTimeAgo(date))}\\)\n`;
+      const msgCount = entry.messageCount || 0;
+      const preview = entry.lastMessagePreview ? `\n💬 "${esc(entry.lastMessagePreview.substring(0, 50))}${entry.lastMessagePreview.length > 50 ? '...' : ''}"` : '';
+
+      message += `\`${esc(entry.projectName)}\` · ${esc(formatTimeAgo(date))} · ${msgCount} msgs${preview}\n`;
     }
   }
 
@@ -1697,18 +1733,78 @@ _Both Telegram and terminal can continue independently \\(forked session\\)\\._`
   await replyMd(ctx, message);
 }
 
-function formatTimeAgo(date: Date): string {
+function formatTimeAgo(date: Date | string): string {
+  // Handle both Date objects and ISO strings
+  const d = typeof date === 'string' ? new Date(date) : date;
   const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
+  const diffMs = now.getTime() - d.getTime();
+
+  // Calculate time units
+  const diffSecs = Math.floor(diffMs / 1000);
   const diffMins = Math.floor(diffMs / 60000);
   const diffHours = Math.floor(diffMs / 3600000);
   const diffDays = Math.floor(diffMs / 86400000);
 
-  if (diffMins < 1) return 'just now';
-  if (diffMins < 60) return `${diffMins}m ago`;
-  if (diffHours < 24) return `${diffHours}h ago`;
-  if (diffDays < 7) return `${diffDays}d ago`;
-  return date.toLocaleDateString();
+  // Less than 1 minute: "just now"
+  if (diffSecs < 60) {
+    return 'just now';
+  }
+
+  // Less than 10 minutes: show minutes AND seconds
+  // Example: "5m 23s ago"
+  if (diffMins < 10) {
+    const secs = diffSecs % 60;
+    return `${diffMins}m ${secs}s ago`;
+  }
+
+  // 10-59 minutes: show minutes only
+  // Example: "45m ago"
+  if (diffMins < 60) {
+    return `${diffMins}m ago`;
+  }
+
+  // 1-23 hours: show hours and minutes
+  // Example: "3h 15m ago" or "3h ago"
+  if (diffHours < 24) {
+    const mins = diffMins % 60;
+    return mins === 0 ? `${diffHours}h ago` : `${diffHours}h ${mins}m ago`;
+  }
+
+  // Calculate day boundaries for Today/Yesterday
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const dateDay = new Date(d);
+  dateDay.setHours(0, 0, 0, 0);
+  const daysDiff = Math.floor((today.getTime() - dateDay.getTime()) / 86400000);
+
+  // Format time as HH:MM
+  const timeStr = d.toLocaleTimeString('de-DE', {
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+
+  // Today: "Today at 14:32"
+  if (daysDiff === 0) {
+    return `Today at ${timeStr}`;
+  }
+
+  // Yesterday: "Yesterday at 14:32"
+  if (daysDiff === 1) {
+    return `Yesterday at ${timeStr}`;
+  }
+
+  // 2-6 days: "3d ago"
+  if (diffDays < 7) {
+    return `${diffDays}d ago`;
+  }
+
+  // 7+ days: full date
+  // Example: "28. Feb" or "28. Feb 25" if > 1 year
+  return d.toLocaleDateString('de-DE', {
+    day: '2-digit',
+    month: 'short',
+    year: diffDays > 365 ? '2-digit' : undefined
+  });
 }
 
 export async function handleFile(ctx: Context): Promise<void> {
@@ -2896,6 +2992,147 @@ export async function handleExtractCallback(ctx: Context): Promise<void> {
   }
 
   await executeExtract(ctx, url, mode);
+}
+
+// ── /inbox Command ────────────────────────────────────────────────────
+
+export async function handleInbox(ctx: Context): Promise<void> {
+  if (!config.DOCUMENT_INBOX_ENABLED) {
+    await replyFeatureDisabled(ctx, 'Document Inbox');
+    return;
+  }
+
+  const { listInbox, getInboxStats, formatFileSize, routeFile, getInboxDir } = await import('../../inbox/inbox.js');
+
+  const text = ctx.message?.text || '';
+  const args = text.split(' ').slice(1);
+  const subcommand = args[0]?.toLowerCase();
+
+  // /inbox route <index> <target_dir> — route a file
+  if (subcommand === 'route' && args.length >= 3) {
+    const index = parseInt(args[1], 10) - 1; // 1-based to 0-based
+    const targetDir = args.slice(2).join(' ');
+    const items = listInbox();
+
+    if (isNaN(index) || index < 0 || index >= items.length) {
+      await ctx.reply(`Invalid file number. Use /inbox to see the list (1-${items.length}).`, { parse_mode: undefined });
+      return;
+    }
+
+    const item = items[index];
+    const workspaceRoot = getWorkspaceRoot();
+    const resolvedTarget = path.isAbsolute(targetDir)
+      ? targetDir
+      : path.resolve(workspaceRoot, targetDir);
+
+    if (!isPathWithinRoot(workspaceRoot, resolvedTarget)) {
+      await ctx.reply(`Target must be within workspace: ${workspaceRoot}`, { parse_mode: undefined });
+      return;
+    }
+
+    try {
+      const { newPath } = routeFile(item.savedPath, resolvedTarget);
+      await messageSender.sendMessage(ctx, `Routed **${item.originalFilename}** to:\n\`${newPath}\``);
+    } catch (error) {
+      await ctx.reply(`Route failed: ${error instanceof Error ? error.message : String(error)}`, { parse_mode: undefined });
+    }
+    return;
+  }
+
+  // /inbox clear — clear all files from inbox
+  if (subcommand === 'clear') {
+    const items = listInbox();
+    if (items.length === 0) {
+      await ctx.reply('INBOX is already empty.', { parse_mode: undefined });
+      return;
+    }
+
+    await ctx.reply(
+      `Delete ${items.length} file(s) from INBOX?`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: 'Yes, clear all', callback_data: 'inbox:clear:confirm' },
+              { text: 'Cancel', callback_data: 'inbox:clear:cancel' },
+            ],
+          ],
+        },
+      }
+    );
+    return;
+  }
+
+  // /inbox (no args) — list files
+  const items = listInbox();
+  const stats = getInboxStats();
+
+  if (items.length === 0) {
+    await ctx.reply('INBOX is empty. Send me a document to get started.', { parse_mode: undefined });
+    return;
+  }
+
+  const lines = items.map((item, i) => {
+    const caption = item.caption ? ` — "${item.caption}"` : '';
+    const age = getRelativeTime(item.receivedAt);
+    return `${i + 1}. **${item.originalFilename}** (${formatFileSize(item.fileSize)})${caption}\n   ${item.mimeType || 'unknown'} | ${age}`;
+  });
+
+  const msg = [
+    `**INBOX** — ${stats.totalFiles} file(s), ${stats.totalSizeMB} MB`,
+    '',
+    ...lines,
+    '',
+    '**Commands:**',
+    '`/inbox route <#> <dir>` — move file to directory',
+    '`/inbox clear` — clear all files',
+  ].join('\n');
+
+  await messageSender.sendMessage(ctx, msg);
+}
+
+export async function handleInboxCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data;
+  if (!data) return;
+
+  if (data === 'inbox:clear:confirm') {
+    const { listInbox, getInboxDir } = await import('../../inbox/inbox.js');
+    const items = listInbox();
+    const inboxDir = getInboxDir();
+
+    let deleted = 0;
+    for (const item of items) {
+      try {
+        if (fs.existsSync(item.savedPath)) fs.unlinkSync(item.savedPath);
+        const metaPath = item.savedPath + '.meta.json';
+        if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+        deleted++;
+      } catch { /* skip */ }
+    }
+
+    await ctx.answerCallbackQuery({ text: `Cleared ${deleted} file(s)` });
+    try {
+      await ctx.editMessageText(`INBOX cleared. ${deleted} file(s) removed.`);
+    } catch {
+      await ctx.reply(`INBOX cleared. ${deleted} file(s) removed.`, { parse_mode: undefined });
+    }
+  } else if (data === 'inbox:clear:cancel') {
+    await ctx.answerCallbackQuery({ text: 'Cancelled' });
+    try {
+      await ctx.deleteMessage();
+    } catch { /* ignore */ }
+  }
+}
+
+function getRelativeTime(isoDate: string): string {
+  const diff = Date.now() - new Date(isoDate).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
 
 export async function executeExtract(ctx: Context, url: string, mode: ExtractMode, subtitleFormat?: SubtitleFormat): Promise<void> {
