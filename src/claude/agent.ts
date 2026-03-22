@@ -376,14 +376,37 @@ export async function sendToAgent(
       ? undefined
       : ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Task'];
 
-    // PreCompact hook always registered (logging only — notification sent from compact_boundary message)
+    // PreCompact hook: log + flush conversation context to daily transcript
     const preCompactHook: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
       PreCompact: [{
         hooks: [async (input) => {
+          const trigger = (input as Record<string, unknown>).trigger;
           logAt('basic', '[Hook] PreCompact — context is about to be compacted', {
-            trigger: (input as Record<string, unknown>).trigger,
+            trigger,
             customInstructions: (input as Record<string, unknown>).custom_instructions,
           });
+
+          // Flush recent conversation context to daily transcript before compaction
+          // This preserves what was discussed so the bot can recover context post-compaction
+          try {
+            const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+            const recentHistory = conversationHistory.get(sessionKey) || [];
+            const lastMessages = recentHistory.slice(-6); // last 3 exchanges (user+assistant)
+
+            let contextSummary = `**[COMPACTION]** ${timestamp} | trigger: ${trigger}\n`;
+            contextSummary += `Kontext wird komprimiert. Letzte ${lastMessages.length} Nachrichten gesichert:\n\n`;
+
+            for (const msg of lastMessages) {
+              const preview = msg.content.slice(0, 300);
+              const truncated = msg.content.length > 300 ? '…' : '';
+              contextSummary += `> **${msg.role}:** ${preview}${truncated}\n`;
+            }
+
+            recordTranscript(sessionKey, 'assistant', contextSummary);
+          } catch {
+            // Must never crash the bot
+          }
+
           return { continue: true };
         }],
       }],

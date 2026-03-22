@@ -9,6 +9,8 @@ import {
   renderStatusLine,
   extractToolDetail,
   TOOL_ICONS,
+  getAnimationEmoji,
+  getAnimationText,
 } from './terminal-renderer.js';
 import { getSessionKeyFromCtx } from '../utils/session-key.js';
 import * as fs from 'fs';
@@ -166,12 +168,17 @@ export class MessageSender {
 
   async startStreaming(ctx: Context): Promise<void> {
     const keyInfo = getSessionKeyFromCtx(ctx);
-    if (!keyInfo) return;
+    if (!keyInfo) {
+      console.error('[Stream] startStreaming: no keyInfo from ctx');
+      return;
+    }
     const { chatId, threadId, sessionKey } = keyInfo;
 
     const terminalMode = isTerminalUIEnabled(sessionKey);
-    const initialText = `${getSpinnerFrame(0)} ${TOOL_ICONS.thinking} Processing...`;
+    const initialText = `${getSpinnerFrame(0)} ${getAnimationEmoji()} ${getAnimationText()}`;
+    console.log(`[Stream] startStreaming: sending initial message to chat ${chatId}`);
     const message = await ctx.reply(initialText, { parse_mode: undefined });
+    console.log(`[Stream] startStreaming: got message_id ${message.message_id}`);
 
     // Start continuous typing indicator
     const typingInterval = this.startTypingIndicator(ctx.api, chatId, threadId);
@@ -312,7 +319,7 @@ export class MessageSender {
 
     // If nothing to show, show thinking indicator
     if (parts.length === 0) {
-      parts.push(`${getSpinnerFrame(state.spinnerIndex)} ${TOOL_ICONS.thinking} Thinking...`);
+      parts.push(`${getSpinnerFrame(state.spinnerIndex)} ${getAnimationEmoji()} ${getAnimationText()}`);
     }
 
     const displayContent = parts.join('\n');
@@ -375,8 +382,12 @@ export class MessageSender {
 
   async finishStreaming(ctx: Context, finalContent: string): Promise<void> {
     const keyInfo = getSessionKeyFromCtx(ctx);
-    if (!keyInfo) return;
+    if (!keyInfo) {
+      console.error('[Stream] finishStreaming: no keyInfo from ctx');
+      return;
+    }
     const { chatId, sessionKey } = keyInfo;
+    console.log(`[Stream] finishStreaming: chat=${chatId}, content length=${finalContent.length}`);
 
     const state = this.streamStates.get(sessionKey);
 

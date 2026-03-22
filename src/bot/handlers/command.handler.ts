@@ -322,7 +322,7 @@ export async function handleStart(ctx: Context): Promise<void> {
     ? '\n\n⚠️ *DANGEROUS MODE ENABLED* \\- All tool permissions auto\\-approved'
     : '';
 
-  const welcomeMessage = `👋 *Welcome to Claudegram\\!*
+  const welcomeMessage = `👋 *Welcome to Nexusgram\\!*
 
 I bridge your messages to Claude Code running on your local machine\\.
 

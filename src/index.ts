@@ -9,7 +9,7 @@ async function main() {
   // from inside a Claude Code session (e.g. VS Code with Claude Code extension).
   delete process.env.CLAUDECODE;
 
-  console.log('🤖 Starting Claudegram...');
+  console.log(`🤖 Starting ${config.BOT_NAME}...`);
   console.log(`📋 Allowed users: ${config.ALLOWED_USER_IDS.join(', ')}`);
   console.log(`📝 Mode: ${config.STREAMING_MODE}`);
 
@@ -27,6 +27,7 @@ async function main() {
   // with per-chat ordering enforced by the sequentialize middleware in bot.ts.
   // This lets /cancel bypass the per-chat queue and interrupt running queries.
   const runner = run(bot);
+  console.log('[Runner] Grammy runner started, polling for updates...');
 
   // Graceful shutdown (guarded against duplicate signals)
   let shuttingDown = false;

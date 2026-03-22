@@ -271,12 +271,25 @@ export interface GenerateSpeechOptions {
  */
 export async function generateSpeech(text: string, voice?: string, options?: GenerateSpeechOptions): Promise<Buffer> {
   const language = options?.language;
-  const isNonEnglish = language && language !== 'en';
 
-  // Groq Orpheus is English-only — fall back to OpenAI for other languages
-  if (config.TTS_PROVIDER === 'groq' && isNonEnglish && config.OPENAI_API_KEY) {
-    console.log(`[TTS] Non-English detected (${language}), using OpenAI TTS (Groq Orpheus is English-only)`);
-    return generateSpeechOpenAI(text, voice);
+  // Detect non-English text even when no language was explicitly provided (e.g. typed messages).
+  // Groq Orpheus is English-only and produces garbage for other languages.
+  const looksNonEnglish = language
+    ? language !== 'en'
+    : /[äöüßÄÖÜ]/.test(text) || /\b(ich|und|der|die|das|ist|ein|nicht|für|auf|mit|den|dem|wir|von|als|aber|oder|wie|kann|wird|sind|auch|noch|was|habe|hier|dein|mein|kein|nach|nur|über|sehr|wenn|alle|mehr)\b/i.test(text);
+
+  // Groq Orpheus is English-only — fall back to OpenAI for other languages.
+  // Map Groq voices to compatible OpenAI voices (Groq voices don't exist in OpenAI).
+  const GROQ_TO_OPENAI_VOICE: Record<string, string> = {
+    troy: 'onyx', austin: 'echo', daniel: 'ash',
+    autumn: 'nova', diana: 'shimmer', hannah: 'coral',
+  };
+
+  if (config.TTS_PROVIDER === 'groq' && looksNonEnglish && config.OPENAI_API_KEY) {
+    const detectedBy = language ? `language=${language}` : 'text heuristic';
+    const mappedVoice = voice ? (GROQ_TO_OPENAI_VOICE[voice] || 'onyx') : undefined;
+    console.log(`[TTS] Non-English detected (${detectedBy}), using OpenAI TTS (voice: ${voice} → ${mappedVoice})`);
+    return generateSpeechOpenAI(text, mappedVoice);
   }
 
   if (config.TTS_PROVIDER === 'groq') {
@@ -285,8 +298,9 @@ export async function generateSpeech(text: string, voice?: string, options?: Gen
     } catch (err) {
       const msg = String(err);
       if (msg.includes('429') && config.OPENAI_API_KEY) {
-        console.log('[TTS] Groq rate limit (429) — falling back to OpenAI TTS');
-        return generateSpeechOpenAI(text, voice);
+        const mappedVoice = voice ? (GROQ_TO_OPENAI_VOICE[voice] || 'onyx') : undefined;
+        console.log(`[TTS] Groq rate limit (429) — falling back to OpenAI TTS (voice: ${voice} → ${mappedVoice})`);
+        return generateSpeechOpenAI(text, mappedVoice);
       }
       throw err;
     }
