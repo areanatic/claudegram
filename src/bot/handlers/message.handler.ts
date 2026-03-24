@@ -25,6 +25,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
+import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
 
 async function replyFeatureDisabled(ctx: Context, feature: string): Promise<void> {
   await ctx.reply(`⚠️ ${feature} feature is disabled in configuration.`, { parse_mode: undefined });
@@ -162,6 +163,9 @@ export async function handleMessage(ctx: Context): Promise<void> {
     return;
   }
   markProcessed(messageId);
+
+  // Dismiss previous follow-up buttons
+  await dismissFollowUpButtons(ctx, sessionKey);
 
   // Check if this is a reply to a ForceReply prompt
   const replyTo = ctx.message?.reply_to_message;
@@ -474,6 +478,9 @@ async function handleAgentReply(
         await sendUsageFooter(ctx, response.usage);
         await sendCompactionNotification(ctx, response.compaction);
         await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
+
+        // Follow-up action buttons
+        await sendFollowUpButtons(ctx, sessionKey, response.text);
       } catch (error) {
         await messageSender.cancelStreaming(ctx);
         throw error;
@@ -586,6 +593,9 @@ async function handleStreamingResponse(
     await sendUsageFooter(ctx, response.usage);
     await sendCompactionNotification(ctx, response.compaction);
     await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
+
+    // Follow-up action buttons
+    await sendFollowUpButtons(ctx, sessionKey, response.text);
   } catch (error) {
     await messageSender.cancelStreaming(ctx);
     throw error;
@@ -616,6 +626,9 @@ async function handleWaitResponse(
     await sendUsageFooter(ctx, response.usage);
     await sendCompactionNotification(ctx, response.compaction);
     await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
+
+    // Follow-up action buttons
+    await sendFollowUpButtons(ctx, sessionKey, response.text);
   } catch (error) {
     messageSender.stopTypingInterval(typingInterval);
     throw error;

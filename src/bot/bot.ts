@@ -58,6 +58,7 @@ import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
 import { handlePhoto, handleImageDocument } from './handlers/photo.handler.js';
 import { handleDocument } from './handlers/document.handler.js';
+import { handleFollowUpCallback } from '../telegram/followup-buttons.js';
 
 // Resolve sequentialize constraint: same-chat updates are ordered,
 // but /cancel is registered BEFORE this middleware so it bypasses it.
@@ -249,6 +250,8 @@ export async function createBot(): Promise<Bot> {
       await handleResetCallback(ctx);
     } else if (data.startsWith('inbox:')) {
       await handleInboxCallback(ctx);
+    } else if (data.startsWith('followup:')) {
+      await handleFollowUpCallback(ctx);
     }
   });
 

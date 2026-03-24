@@ -23,6 +23,7 @@ import { sendTranscriptResult } from './command.handler.js';
 import { downloadFileSecure, getTelegramFileUrl } from '../../utils/download.js';
 import { sanitizeError, sanitizePath } from '../../utils/sanitize.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
+import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
 
 export async function handleVoice(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
@@ -43,6 +44,9 @@ export async function handleVoice(ctx: Context): Promise<void> {
     return;
   }
   markProcessed(messageId);
+
+  // Dismiss previous follow-up buttons
+  await dismissFollowUpButtons(ctx, sessionKey);
 
   // If this is a reply to the bot's "Transcribe Audio" ForceReply, route to transcribe-only flow
   const replyTo = ctx.message?.reply_to_message;
@@ -181,6 +185,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
         // Send text as secondary reference (shorter in voice mode)
         await messageSender.sendMessage(ctx, response.text);
+        await sendFollowUpButtons(ctx, sessionKey, response.text);
       } else if (getStreamingMode() === 'streaming') {
         await messageSender.startStreaming(ctx);
 
@@ -198,6 +203,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
           await messageSender.finishStreaming(ctx, response.text);
           await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
+          await sendFollowUpButtons(ctx, sessionKey, response.text);
         } catch (error) {
           await messageSender.cancelStreaming(ctx);
           throw error;
@@ -214,6 +220,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
         });
         await messageSender.sendMessage(ctx, response.text);
         await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
+        await sendFollowUpButtons(ctx, sessionKey, response.text);
       }
     });
   } catch (error) {

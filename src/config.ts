@@ -220,6 +220,8 @@ const envSchema = z.object({
   BOT_WELCOME_FILE: z.string().optional(),
   // Minimal command menu for Space-Bots (hides developer commands like /project, /explore, /plan)
   BOT_MINIMAL_COMMANDS: z.string().default('false').transform(toBool),
+  // Follow-up inline buttons after each agent response
+  FOLLOWUP_BUTTONS_ENABLED: z.string().default('true').transform(toBool),
   // Local Telegram Bot API Server (optional — raises file limit from 20MB to 2GB)
   TELEGRAM_API_SERVER_URL: z.string().optional(),
 });
