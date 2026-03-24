@@ -44,6 +44,7 @@ export interface AgentUsage {
 interface AgentResponse {
   text: string;
   toolsUsed: string[];
+  buttons?: string[];
   usage?: AgentUsage;
   compaction?: { trigger: 'manual' | 'auto'; preTokens: number };
   sessionInit?: { model: string; sessionId: string };
@@ -168,7 +169,25 @@ Instead of tables (which don't render well in Telegram), use bullet lists with b
 - **Age**: 30
 - **City**: NYC`;
 
-const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING);
+const FOLLOWUP_BUTTONS_INSTRUCTION = config.FOLLOWUP_BUTTONS_ENABLED ? `
+
+Telegram Quick-Reply Buttons:
+Du läufst in Telegram. Du kannst dem User interaktive Quick-Reply Buttons anbieten.
+
+Format — am ENDE deiner Antwort (nach dem letzten Absatz):
+[BUTTONS: Label 1 | Label 2 | Label 3]
+
+Regeln:
+- Nutze Buttons wenn du eine Frage stellst oder klare nächste Schritte anbietest
+- Max 4 Buttons, Labels kurz halten (max 25 Zeichen pro Button)
+- Emojis in Labels sind erlaubt und empfohlen (z.B. "✅ Ja, mach das" oder "📋 Plan zeigen")
+- NICHT bei jeder Antwort — nur wenn es dem User wirklich hilft, schneller zu antworten
+- Gute Beispiele: Ja/Nein-Entscheidungen, Optionsauswahl (A/B/C), nächste Schritte
+- Schlechte Beispiele: offene kreative Fragen, Konversation die freie Antwort braucht
+- Der [BUTTONS: ...] Block wird automatisch entfernt und als Telegram-Buttons angezeigt
+- Schreibe den Block IMMER in eine eigene Zeile am Ende` : '';
+
+const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING) + FOLLOWUP_BUTTONS_INSTRUCTION;
 
 const REDDIT_TOOL_PROMPT = `
 
@@ -246,6 +265,27 @@ Rules for voice responses:
 - Do NOT use emoji`;
 
 const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}${TOOL_PROMPTS}${config.CLAUDE_REASONING_SUMMARY ? REASONING_SUMMARY_INSTRUCTIONS : ''}`;
+
+/**
+ * Extract [BUTTONS: opt1 | opt2 | opt3] from response text.
+ * Returns cleaned text + button labels array.
+ */
+function extractButtons(text: string): { text: string; buttons: string[] } {
+  const match = text.match(/\n*\[BUTTONS:\s*([^\]]+)\]\s*$/);
+  if (!match) return { text, buttons: [] };
+
+  const buttons = match[1]
+    .split('|')
+    .map(b => b.trim())
+    .filter(Boolean)
+    .slice(0, 4)  // max 4 buttons
+    .map(b => b.length > 30 ? b.slice(0, 28) + '…' : b);  // truncate for Telegram
+
+  if (buttons.length < 2) return { text, buttons: [] };  // need at least 2 options
+
+  const cleanText = text.replace(/\n*\[BUTTONS:\s*[^\]]+\]\s*$/, '').trimEnd();
+  return { text: cleanText, buttons };
+}
 
 /**
  * Strip the "Reasoning Summary" section from the end of a response
@@ -736,9 +776,11 @@ export async function sendToAgent(
     chatUsageCache.set(sessionKey, resultUsage);
   }
 
+  const extracted = extractButtons(fullText);
   return {
-    text: stripReasoningSummary(fullText) || 'No response from Claude.',
+    text: stripReasoningSummary(extracted.text) || 'No response from Claude.',
     toolsUsed,
+    buttons: extracted.buttons.length > 0 ? extracted.buttons : undefined,
     usage: resultUsage,
     compaction: compactionEvent,
     sessionInit: initEvent,
@@ -826,9 +868,11 @@ IMPORTANT: When you have fully completed this task, respond with the word "DONE"
     }
   }
 
+  const loopExtracted = extractButtons(combinedText);
   return {
-    text: stripReasoningSummary(combinedText),
+    text: stripReasoningSummary(loopExtracted.text),
     toolsUsed: allToolsUsed,
+    buttons: loopExtracted.buttons.length > 0 ? loopExtracted.buttons : undefined,
   };
 }
 

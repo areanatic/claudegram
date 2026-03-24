@@ -480,7 +480,7 @@ async function handleAgentReply(
         await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
 
         // Follow-up action buttons
-        await sendFollowUpButtons(ctx, sessionKey, response.text);
+        await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
       } catch (error) {
         await messageSender.cancelStreaming(ctx);
         throw error;
@@ -595,7 +595,7 @@ async function handleStreamingResponse(
     await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
 
     // Follow-up action buttons
-    await sendFollowUpButtons(ctx, sessionKey, response.text);
+    await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
   } catch (error) {
     await messageSender.cancelStreaming(ctx);
     throw error;
@@ -628,7 +628,7 @@ async function handleWaitResponse(
     await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
 
     // Follow-up action buttons
-    await sendFollowUpButtons(ctx, sessionKey, response.text);
+    await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
   } catch (error) {
     messageSender.stopTypingInterval(typingInterval);
     throw error;

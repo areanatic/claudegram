@@ -185,7 +185,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
         // Send text as secondary reference (shorter in voice mode)
         await messageSender.sendMessage(ctx, response.text);
-        await sendFollowUpButtons(ctx, sessionKey, response.text);
+        await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
       } else if (getStreamingMode() === 'streaming') {
         await messageSender.startStreaming(ctx);
 
@@ -203,7 +203,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
           await messageSender.finishStreaming(ctx, response.text);
           await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
-          await sendFollowUpButtons(ctx, sessionKey, response.text);
+          await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
         } catch (error) {
           await messageSender.cancelStreaming(ctx);
           throw error;
@@ -220,7 +220,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
         });
         await messageSender.sendMessage(ctx, response.text);
         await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
-        await sendFollowUpButtons(ctx, sessionKey, response.text);
+        await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
       }
     });
   } catch (error) {
