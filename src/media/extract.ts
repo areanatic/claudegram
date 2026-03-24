@@ -442,7 +442,7 @@ export async function extractMedia(opts: ExtractOptions): Promise<ExtractResult>
   const platform = detectPlatform(url);
   const emoji = platformEmoji(platform);
 
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claudegram-extract-'));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexusgram-extract-'));
 
   const result: ExtractResult = {
     platform,
@@ -562,7 +562,7 @@ export function cleanupExtractResult(result: ExtractResult): void {
   for (const p of paths) {
     try {
       const dir = path.dirname(p);
-      if (dir.includes('claudegram-extract-')) {
+      if (dir.includes('nexusgram-extract-')) {
         fs.rmSync(dir, { recursive: true, force: true });
         return;
       }

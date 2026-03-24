@@ -154,7 +154,7 @@ async function concatAndConvertAudio(wavBuffers: Buffer[]): Promise<Buffer> {
     return convertWavToOgg(wavBuffers[0]);
   }
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claudegram-tts-'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexusgram-tts-'));
 
   try {
     // Write each WAV chunk
@@ -197,7 +197,7 @@ async function concatAndConvertAudio(wavBuffers: Buffer[]): Promise<Buffer> {
  * Convert a single WAV buffer to OGG/Opus.
  */
 async function convertWavToOgg(wavBuffer: Buffer): Promise<Buffer> {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claudegram-tts-'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexusgram-tts-'));
 
   try {
     const inputPath = path.join(tmpDir, 'input.wav');
@@ -276,7 +276,7 @@ export async function generateSpeech(text: string, voice?: string, options?: Gen
   // Groq Orpheus is English-only and produces garbage for other languages.
   const looksNonEnglish = language
     ? language !== 'en'
-    : /[äöüßÄÖÜ]/.test(text) || /\b(ich|und|der|die|das|ist|ein|nicht|für|auf|mit|den|dem|wir|von|als|aber|oder|wie|kann|wird|sind|auch|noch|was|habe|hier|dein|mein|kein|nach|nur|über|sehr|wenn|alle|mehr)\b/i.test(text);
+    : /[äöüßÄÖÜ]/.test(text) || /[а-яёА-ЯЁ]/.test(text) || /[\u0600-\u06FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(text) || /\b(ich|und|der|die|das|ist|ein|nicht|für|auf|mit|den|dem|wir|von|als|aber|oder|wie|kann|wird|sind|auch|noch|was|habe|hier|dein|mein|kein|nach|nur|über|sehr|wenn|alle|mehr)\b/i.test(text);
 
   // Groq Orpheus is English-only — fall back to OpenAI for other languages.
   // Map Groq voices to compatible OpenAI voices (Groq voices don't exist in OpenAI).

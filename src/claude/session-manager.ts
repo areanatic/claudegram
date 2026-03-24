@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import { sessionHistory, SessionHistoryEntry } from './session-history.js';
+import { config } from '../config.js';
 
 /**
  * Resolve a stored working directory to a valid path on this system.
@@ -46,7 +47,7 @@ class SessionManager {
   /**
    * Get session from memory, or auto-resume the last session from disk if none exists.
    * This prevents "No project set" errors after bot restarts.
-   * The session data is always persisted in ~/.claudegram/sessions.json,
+   * The session data is always persisted in <DATA_DIR>/sessions.json,
    * so this simply restores what was already there.
    */
   getOrResumeSession(sessionKey: string): Session | undefined {
@@ -56,8 +57,16 @@ class SessionManager {
     const resumed = this.resumeLastSession(sessionKey);
     if (resumed) {
       console.log(`[AutoResume] Restored session for ${sessionKey}: ${resumed.workingDirectory}`);
+      return resumed;
     }
-    return resumed;
+
+    // Auto-create session from WORKSPACE_DIR if configured (Space-Bots)
+    if (config.WORKSPACE_DIR && config.WORKSPACE_DIR !== (process.env.HOME || '.')) {
+      console.log(`[AutoProject] Creating session from WORKSPACE_DIR: ${config.WORKSPACE_DIR}`);
+      return this.createSession(sessionKey, config.WORKSPACE_DIR);
+    }
+
+    return undefined;
   }
 
   createSession(sessionKey: string, workingDirectory: string, conversationId?: string): Session {

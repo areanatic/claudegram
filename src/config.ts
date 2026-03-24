@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultEnvPath = path.resolve(__dirname, '..', '.env');
-const envPath = process.env.CLAUDEGRAM_ENV_PATH || defaultEnvPath;
+const envPath = process.env.NEXUSGRAM_ENV_PATH || process.env.CLAUDEGRAM_ENV_PATH || defaultEnvPath;
 loadEnv({ path: envPath });
 
 const toBool = (val: string) => val.toLowerCase() === 'true';
@@ -24,6 +24,7 @@ const envSchema = z.object({
   // OpenAI (TTS)
   OPENAI_API_KEY: z.string().optional(),
   WORKSPACE_DIR: z.string().default(process.env.HOME || '.'),
+  DATA_DIR: z.string().default(path.join(process.env.HOME || '.', '.nexusgram')),
   CLAUDE_EXECUTABLE_PATH: z.string().default('claude'),
   CLAUDE_USE_BUNDLED_EXECUTABLE: z
     .string()
@@ -38,7 +39,7 @@ const envSchema = z.object({
     .string()
     .default('true')
     .transform((val) => val.toLowerCase() === 'true'),
-  BOT_NAME: z.string().default('Claudegram'),
+  BOT_NAME: z.string().default('Nexusgram'),
   BOT_MODE: z.enum(['dev', 'prod']).default('dev'),
   STREAMING_MODE: z.enum(['streaming', 'wait']).default('streaming'),
   STREAMING_DEBOUNCE_MS: z
@@ -138,6 +139,8 @@ const envSchema = z.object({
     .default('19')
     .transform((val) => parseInt(val, 10)),
   VOICE_LANGUAGE: z.string().default('en'),
+  // Voice-first mode: auto-enable TTS when user sends voice messages
+  VOICE_FIRST_MODE_ENABLED: z.string().default('true').transform(toBool),
   VOICE_TIMEOUT_MS: z
     .string()
     .default('60000')
@@ -199,6 +202,26 @@ const envSchema = z.object({
     .string()
     .default('0')
     .transform((val) => parseInt(val, 10)), // 0 = disabled
+  // Document INBOX configuration
+  DOCUMENT_INBOX_ENABLED: z.string().default('true').transform(toBool),
+  DOCUMENT_MAX_FILE_SIZE_MB: z
+    .string()
+    .default('20')
+    .transform((val) => parseInt(val, 10)),
+  // NEXUS Memory: restrict memory queries to a specific project (empty = all)
+  BOT_MEMORY_PROJECT: z.string().optional(),
+  // Tools available to Claude (comma-separated). Master = all, Space-Bots = restricted.
+  BOT_TOOLS: z.string()
+    .default('Bash,Read,Write,Edit,Glob,Grep,Task')
+    .transform(val => val.split(',').map(s => s.trim())),
+  // Custom soul file per bot (overrides default NEXUS soul.md detection)
+  BOT_SOUL_FILE: z.string().optional(),
+  // Path to custom /start welcome message file (plain text/markdown). If set, replaces default welcome.
+  BOT_WELCOME_FILE: z.string().optional(),
+  // Minimal command menu for Space-Bots (hides developer commands like /project, /explore, /plan)
+  BOT_MINIMAL_COMMANDS: z.string().default('false').transform(toBool),
+  // Local Telegram Bot API Server (optional — raises file limit from 20MB to 2GB)
+  TELEGRAM_API_SERVER_URL: z.string().optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);

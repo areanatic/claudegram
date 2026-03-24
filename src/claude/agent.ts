@@ -17,7 +17,7 @@ import { setActiveQuery, clearActiveQuery, isCancelled } from './request-queue.j
 import type { Context } from 'grammy';
 import { config } from '../config.js';
 import { AgentWatchdog } from './agent-watchdog.js';
-import { createClaudegramMcpServer } from './mcp-tools.js';
+import { createNexusgramMcpServer } from './mcp-tools.js';
 import {
   createAgentTimer,
   recordMessage,
@@ -28,6 +28,7 @@ import {
 } from '../utils/agent-timer.js';
 import { recordTranscript } from './transcript-logger.js';
 import { buildNexusBridgePrompt } from '../nexus/bridge.js';
+import { injectContext, saveMemory } from '../memory/nexus-memory.js';
 
 export interface AgentUsage {
   inputTokens: number;
@@ -172,7 +173,7 @@ const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + (config.TELEGRAPH_ENABLED ? TELEGRA
 const REDDIT_TOOL_PROMPT = `
 
 Reddit Tool:
-You have a claudegram_fetch_reddit MCP tool that fetches Reddit content directly (subreddits, posts with comments, user profiles).
+You have a nexusgram_fetch_reddit MCP tool that fetches Reddit content directly (subreddits, posts with comments, user profiles).
 Use it when the user asks about Reddit content — no need to tell them to use a command.
 The tool accepts a target (r/<subreddit>, u/<username>, post URL, post ID) and optional sort/time/limit/depth parameters.
 
@@ -192,19 +193,19 @@ const REDDIT_VIDEO_TOOL_PROMPT = `
 Reddit Video Tool:
 The user can download Reddit-hosted videos via the /vreddit Telegram command.
 If the user wants a video file, tell them to use /vreddit with the post URL.
-The claudegram_fetch_reddit tool is for text/comments only, not media downloads.`;
+The nexusgram_fetch_reddit tool is for text/comments only, not media downloads.`;
 
 const MEDIUM_TOOL_PROMPT = `
 
 Medium Tool:
-You have a claudegram_fetch_medium MCP tool that fetches Medium articles (bypasses paywall via Freedium).
+You have a nexusgram_fetch_medium MCP tool that fetches Medium articles (bypasses paywall via Freedium).
 Use it when the user shares a Medium URL or asks to read an article — no need to tell them to use a command.
 The user also has a /medium Telegram command for direct use.`;
 
 const EXTRACT_TOOL_PROMPT = `
 
 Media Extract Tool:
-You have a claudegram_extract_media MCP tool that extracts content from YouTube, Instagram, and TikTok URLs.
+You have a nexusgram_extract_media MCP tool that extracts content from YouTube, Instagram, and TikTok URLs.
 Use mode "text" to transcribe videos, "audio" for MP3, "video" for MP4, "all" for everything.
 Audio/video files are sent directly to the user via Telegram as a side effect.
 Use it when the user asks to transcribe, download, or extract media from a URL — no need to tell them to use a command.
@@ -370,11 +371,11 @@ export async function sendToAgent(
 
     const toolsOption = config.DANGEROUS_MODE
       ? { type: 'preset' as const, preset: 'claude_code' as const }
-      : ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Task'];
+      : config.BOT_TOOLS;
 
     const allowedToolsOption = config.DANGEROUS_MODE
       ? undefined
-      : ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Task'];
+      : config.BOT_TOOLS;
 
     // PreCompact hook: log + flush conversation context to daily transcript
     const preCompactHook: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
@@ -396,6 +397,12 @@ export async function sendToAgent(
             let contextSummary = `**[COMPACTION]** ${timestamp} | trigger: ${trigger}\n`;
             contextSummary += `Kontext wird komprimiert. Letzte ${lastMessages.length} Nachrichten gesichert:\n\n`;
 
+            // Extract user message topics for memory (first 50 chars each)
+            const userTopics = lastMessages
+              .filter(m => m.role === 'user')
+              .map(m => m.content.slice(0, 50).replace(/\n/g, ' '))
+              .join(', ');
+
             for (const msg of lastMessages) {
               const preview = msg.content.slice(0, 300);
               const truncated = msg.content.length > 300 ? '…' : '';
@@ -403,6 +410,16 @@ export async function sendToAgent(
             }
 
             recordTranscript(sessionKey, 'assistant', contextSummary);
+
+            // Save topic summary to SQLite memory (episodic, fast, no AI call)
+            if (userTopics) {
+              saveMemory(
+                `[NexusGram PreCompact] ${timestamp} Topics: ${userTopics}`,
+                'episodic',
+                config.BOT_MEMORY_PROJECT || 'nexus',
+                'precompact,telegram',
+              );
+            }
           } catch {
             // Must never crash the bot
           }
@@ -481,17 +498,18 @@ export async function sendToAgent(
       cwd = process.env.HOME || process.cwd();
     }
 
-    // Create MCP server for Claudegram tools (if telegramCtx is available)
+    // Create MCP server for Nexusgram tools (if telegramCtx is available)
     const mcpServers: Record<string, McpServerConfig> = {};
     if (options.telegramCtx) {
-      const server = createClaudegramMcpServer({
+      const server = createNexusgramMcpServer({
         telegramCtx: options.telegramCtx,
         sessionKey,
       });
-      mcpServers['claudegram-tools'] = server;
+      mcpServers['nexusgram-tools'] = server;
     }
 
     const nexusBridgePrompt = buildNexusBridgePrompt(cwd);
+    const memoryContext = injectContext(prompt, config.BOT_MEMORY_PROJECT);
 
     const queryOptions: Parameters<typeof query>[0]['options'] = {
       cwd,
@@ -502,7 +520,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${nexusBridgePrompt}`,
+        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}`,
       },
       settingSources: ['project', 'user'] as SettingSource[],
       model: effectiveModel,

@@ -1,9 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { sessionManager } from './session-manager.js';
+import { config } from '../config.js';
 
-const TRANSCRIPT_DIR = path.join(os.homedir(), '.claudegram', 'transcripts');
+const TRANSCRIPT_DIR = path.join(config.DATA_DIR, 'transcripts');
 
 function ensureDir(dir: string): void {
   if (!fs.existsSync(dir)) {
@@ -27,7 +27,7 @@ function transcriptPath(userId: string): string {
 
 /**
  * Record a single message (user or assistant) to the daily transcript file.
- * Appends to ~/.claudegram/transcripts/YYYY-MM-DD/<userId>.md
+ * Appends to <DATA_DIR>/transcripts/YYYY-MM-DD/<userId>.md
  */
 export function recordTranscript(
   sessionKey: string,

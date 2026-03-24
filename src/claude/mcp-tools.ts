@@ -1,5 +1,5 @@
 /**
- * MCP Tools — In-process MCP server factory for Claudegram.
+ * MCP Tools — In-process MCP server factory for Nexusgram.
  *
  * Wraps existing standalone functions (reddit, medium, extract, telegraph,
  * project management) as MCP tools so Claude can invoke them automatically
@@ -16,6 +16,10 @@ import { sessionManager } from './session-manager.js';
 import { getWorkspaceRoot, isPathWithinRoot } from '../utils/workspace-guard.js';
 
 // Lazy imports to avoid circular deps and unnecessary module loading
+async function importInbox() {
+  return import('../inbox/inbox.js');
+}
+
 async function importReddit() {
   return import('../reddit/redditfetch.js');
 }
@@ -45,13 +49,13 @@ const REDDIT_MAX_CHARS = 50_000;
 
 // ── Factory ──────────────────────────────────────────────────────────
 
-export function createClaudegramMcpServer(
+export function createNexusgramMcpServer(
   toolsCtx: McpToolsContext
 ): McpSdkServerConfigWithInstance {
   const tools = buildToolList(toolsCtx);
 
   return createSdkMcpServer({
-    name: 'claudegram-tools',
+    name: 'nexusgram-tools',
     version: '1.0.0',
     tools,
   });
@@ -80,6 +84,13 @@ function buildToolList(toolsCtx: McpToolsContext) {
     tools.push(publishTelegraphTool(toolsCtx));
   }
 
+  if (config.DOCUMENT_INBOX_ENABLED) {
+    tools.push(inboxListTool(toolsCtx));
+    tools.push(inboxRouteTool(toolsCtx));
+  }
+
+  tools.push(sendFileTool(toolsCtx));
+
   return tools;
 }
 
@@ -87,7 +98,7 @@ function buildToolList(toolsCtx: McpToolsContext) {
 
 function listProjectsTool(_toolsCtx: McpToolsContext) {
   return tool(
-    'claudegram_list_projects',
+    'nexusgram_list_projects',
     'List all available projects in the workspace directory. Use this to see what projects the user can switch to.',
     {},
     async () => {
@@ -116,8 +127,8 @@ function listProjectsTool(_toolsCtx: McpToolsContext) {
 
 function switchProjectTool(toolsCtx: McpToolsContext) {
   return tool(
-    'claudegram_switch_project',
-    'Switch the working directory to a different project. The change takes effect on the next query. Use claudegram_list_projects first to see available projects.',
+    'nexusgram_switch_project',
+    'Switch the working directory to a different project. The change takes effect on the next query. Use nexusgram_list_projects first to see available projects.',
     { project_name: z.string().describe('Name of the project directory to switch to') },
     async ({ project_name }) => {
       try {
@@ -158,7 +169,7 @@ function switchProjectTool(toolsCtx: McpToolsContext) {
 
 function fetchRedditTool(_toolsCtx: McpToolsContext) {
   return tool(
-    'claudegram_fetch_reddit',
+    'nexusgram_fetch_reddit',
     'Fetch Reddit content: subreddit listings, post threads with comments, or user profiles. Supports sort/time filters for subreddits. Returns markdown-formatted results.',
     {
       target: z.string().describe('Reddit target: r/<subreddit>, u/<username>, post URL, post ID, or share link'),
@@ -197,7 +208,7 @@ function fetchRedditTool(_toolsCtx: McpToolsContext) {
 
 function fetchMediumTool(_toolsCtx: McpToolsContext) {
   return tool(
-    'claudegram_fetch_medium',
+    'nexusgram_fetch_medium',
     'Fetch a Medium article via Freedium (bypasses paywall). Returns the article title, author, and full markdown content.',
     {
       url: z.string().describe('Medium article URL (medium.com, towardsdatascience.com, etc.)'),
@@ -233,7 +244,7 @@ function fetchMediumTool(_toolsCtx: McpToolsContext) {
 
 function extractMediaTool(toolsCtx: McpToolsContext) {
   return tool(
-    'claudegram_extract_media',
+    'nexusgram_extract_media',
     'Extract text transcripts, audio, or video from YouTube, Instagram, and TikTok URLs. Audio/video files are sent directly to the user via Telegram. Transcripts are returned as text.',
     {
       url: z.string().describe('URL of the video (YouTube, Instagram, or TikTok)'),
@@ -303,7 +314,7 @@ function extractMediaTool(toolsCtx: McpToolsContext) {
 
 function publishTelegraphTool(_toolsCtx: McpToolsContext) {
   return tool(
-    'claudegram_publish_telegraph',
+    'nexusgram_publish_telegraph',
     'Publish markdown content as a Telegraph (telegra.ph) Instant View page. Returns the URL. Useful for sharing long-form content as a readable link.',
     {
       title: z.string().describe('Page title'),
@@ -327,6 +338,158 @@ function publishTelegraphTool(_toolsCtx: McpToolsContext) {
       } catch (error) {
         return {
           content: [{ type: 'text' as const, text: `Telegraph error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+// ── Inbox Tools ───────────────────────────────────────────────────────
+
+function inboxListTool(_toolsCtx: McpToolsContext) {
+  return tool(
+    'nexusgram_inbox_list',
+    'List all files currently in the INBOX (unrouted documents received via Telegram). Shows filename, size, MIME type, date, and caption for each file.',
+    {},
+    async () => {
+      try {
+        const { listInbox, getInboxStats, formatFileSize } = await importInbox();
+        const items = listInbox();
+        const stats = getInboxStats();
+
+        if (items.length === 0) {
+          return {
+            content: [{ type: 'text' as const, text: 'INBOX is empty — no unrouted documents.' }],
+          };
+        }
+
+        const lines = items.map((item, i) => {
+          const caption = item.caption ? ` — "${item.caption}"` : '';
+          return `${i + 1}. ${item.originalFilename} (${formatFileSize(item.fileSize)}, ${item.mimeType || 'unknown'})${caption}\n   Saved: ${item.savedFilename} | Received: ${item.receivedAt}`;
+        });
+
+        const summary = `INBOX: ${stats.totalFiles} file(s), ${stats.totalSizeMB} MB total\n\n${lines.join('\n\n')}`;
+
+        return {
+          content: [{ type: 'text' as const, text: summary }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Inbox list error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+function inboxRouteTool(_toolsCtx: McpToolsContext) {
+  return tool(
+    'nexusgram_inbox_route',
+    'Route (move) a file from the INBOX to a target directory within the workspace. Use nexusgram_inbox_list first to see available files.',
+    {
+      filename: z.string().describe('The saved filename in the INBOX (from nexusgram_inbox_list)'),
+      target_dir: z.string().describe('Target directory path (relative to workspace root or absolute)'),
+      new_name: z.string().optional().describe('Optional new filename after routing'),
+    },
+    async ({ filename, target_dir, new_name }) => {
+      try {
+        const { getInboxDir, routeFile } = await importInbox();
+        const inboxDir = getInboxDir();
+        const filePath = path.join(inboxDir, filename);
+
+        if (!fs.existsSync(filePath)) {
+          return {
+            content: [{ type: 'text' as const, text: `File not found in INBOX: ${filename}` }],
+            isError: true,
+          };
+        }
+
+        // Resolve target directory
+        const workspaceRoot = getWorkspaceRoot();
+        const resolvedTarget = path.isAbsolute(target_dir)
+          ? target_dir
+          : path.resolve(workspaceRoot, target_dir);
+
+        if (!isPathWithinRoot(workspaceRoot, resolvedTarget)) {
+          return {
+            content: [{ type: 'text' as const, text: `Error: Target must be within workspace root: ${workspaceRoot}` }],
+            isError: true,
+          };
+        }
+
+        const { newPath } = routeFile(filePath, resolvedTarget, new_name);
+
+        return {
+          content: [{ type: 'text' as const, text: `File routed: ${filename} → ${newPath}` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Inbox route error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+// ── Send File Tool ────────────────────────────────────────────────────
+
+function sendFileTool(toolsCtx: McpToolsContext) {
+  return tool(
+    'nexusgram_send_file',
+    'Send a file from the workspace to the user via Telegram. The file must be within the workspace root. Use this to share project files, generated reports, or any file the user requests.',
+    {
+      file_path: z.string().describe('Path to the file (relative to workspace root or absolute)'),
+      caption: z.string().optional().describe('Optional caption to send with the file'),
+    },
+    async ({ file_path, caption }) => {
+      try {
+        const workspaceRoot = getWorkspaceRoot();
+        const resolvedPath = path.isAbsolute(file_path)
+          ? file_path
+          : path.resolve(workspaceRoot, file_path);
+
+        if (!isPathWithinRoot(workspaceRoot, resolvedPath)) {
+          return {
+            content: [{ type: 'text' as const, text: `Error: File must be within workspace root: ${workspaceRoot}` }],
+            isError: true,
+          };
+        }
+
+        if (!fs.existsSync(resolvedPath) || !fs.statSync(resolvedPath).isFile()) {
+          return {
+            content: [{ type: 'text' as const, text: `File not found: ${file_path}` }],
+            isError: true,
+          };
+        }
+
+        const stats = fs.statSync(resolvedPath);
+        const sizeMB = stats.size / (1024 * 1024);
+
+        // Standard API: 50MB send limit. Local API server: 2GB.
+        const maxSendMB = config.TELEGRAM_API_SERVER_URL ? 2000 : 50;
+        if (sizeMB > maxSendMB) {
+          return {
+            content: [{ type: 'text' as const, text: `File too large (${sizeMB.toFixed(1)} MB). Limit is ${maxSendMB} MB.` }],
+            isError: true,
+          };
+        }
+
+        const ctx = toolsCtx.telegramCtx;
+        const filename = path.basename(resolvedPath);
+
+        await ctx.replyWithDocument(new InputFile(resolvedPath, filename), {
+          caption: caption || undefined,
+        });
+
+        return {
+          content: [{ type: 'text' as const, text: `File sent to user: ${filename} (${sizeMB < 1 ? `${(stats.size / 1024).toFixed(1)} KB` : `${sizeMB.toFixed(1)} MB`})` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Send file error: ${error instanceof Error ? error.message : String(error)}` }],
           isError: true,
         };
       }

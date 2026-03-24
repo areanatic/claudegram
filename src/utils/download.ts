@@ -20,8 +20,10 @@ function isValidCurlUrl(url: string): boolean {
  * Download a file from a URL using curl.
  * Uses execFile with explicit URL argument (safe from shell injection).
  * Validates URL to prevent curl-specific injection attacks.
+ *
+ * @param timeoutSeconds Max transfer time in seconds (default 30, increase for large files)
  */
-export function downloadFileSecure(fileUrl: string, destPath: string): Promise<void> {
+export function downloadFileSecure(fileUrl: string, destPath: string, timeoutSeconds = 30): Promise<void> {
   return new Promise((resolve, reject) => {
     if (!isValidCurlUrl(fileUrl)) {
       reject(new Error('Invalid URL for download'));
@@ -35,8 +37,9 @@ export function downloadFileSecure(fileUrl: string, destPath: string): Promise<v
       [
         '-sS',
         '-f',
+        '-L',  // Follow redirects (some CDNs redirect file downloads)
         '--connect-timeout', '10',
-        '--max-time', '30',
+        '--max-time', String(timeoutSeconds),
         '--retry', '3',
         '--retry-delay', '2',
         '--retry-all-errors',
@@ -44,7 +47,7 @@ export function downloadFileSecure(fileUrl: string, destPath: string): Promise<v
         '--', // End of options marker
         fileUrl, // URL as positional argument
       ],
-      { timeout: 60_000 },
+      { timeout: (timeoutSeconds + 30) * 1000 }, // Node timeout = curl timeout + 30s buffer
       (error, _stdout, stderr) => {
         if (error) {
           const msg = (stderr || '').trim() || error.message;
@@ -59,7 +62,11 @@ export function downloadFileSecure(fileUrl: string, destPath: string): Promise<v
 
 /**
  * Build a Telegram file download URL from the bot token and file path.
+ * Automatically uses local API server URL when TELEGRAM_API_SERVER_URL is configured.
+ * The apiRoot parameter is optional and overrides the env-based default.
  */
-export function getTelegramFileUrl(botToken: string, filePath: string): string {
-  return `https://api.telegram.org/file/bot${botToken}/${filePath}`;
+export function getTelegramFileUrl(botToken: string, filePath: string, apiRoot?: string): string {
+  // Auto-detect from environment if not explicitly provided
+  const base = apiRoot || process.env.TELEGRAM_API_SERVER_URL || 'https://api.telegram.org';
+  return `${base}/file/bot${botToken}/${filePath}`;
 }

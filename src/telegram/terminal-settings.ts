@@ -6,7 +6,6 @@
 import { config } from '../config.js';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { z } from 'zod';
 
 // Zod schema for terminal UI settings
@@ -23,7 +22,7 @@ export interface TerminalUISettings {
   enabled: boolean;
 }
 
-const SETTINGS_DIR = path.join(os.homedir(), '.claudegram');
+const SETTINGS_DIR = config.DATA_DIR;
 const SETTINGS_FILE = path.join(SETTINGS_DIR, 'terminal-ui-settings.json');
 const chatTerminalSettings: Map<string, TerminalUISettings> = new Map();
 

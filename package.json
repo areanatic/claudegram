@@ -1,7 +1,7 @@
 {
-  "name": "claudegram",
-  "version": "1.0.0",
-  "description": "Telegram bot that bridges messages to Claude Code with full agent capabilities",
+  "name": "nexusgram",
+  "version": "0.1.0-sandbox",
+  "description": "Experimental sandbox for testing Nexus multi-model routing and features",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -15,7 +15,10 @@
     "claude",
     "bot",
     "ai",
-    "agent"
+    "agent",
+    "nexus",
+    "sandbox",
+    "experimental"
   ],
   "author": "",
   "license": "MIT",
@@ -24,6 +27,7 @@
     "@grammyjs/auto-retry": "^2.0.2",
     "@grammyjs/runner": "^2.0.3",
     "@types/turndown": "^5.0.6",
+    "better-sqlite3": "^12.8.0",
     "cheerio": "^1.2.0",
     "dotenv": "^16.4.7",
     "grammy": "^1.31.3",
@@ -33,6 +37,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.17.14",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"

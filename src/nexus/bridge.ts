@@ -6,6 +6,7 @@ type NexusAgent = {
   description?: string;
   trigger_keywords?: string[];
   specializes_in?: string[];
+  type?: string; // 'core' | 'utility'
 };
 
 type NexusRegistry = {
@@ -72,26 +73,38 @@ export function detectNexusRoot(cwd: string): string | null {
   return findAncestorWithMarkers(cwd);
 }
 
+/** Get today's date as YYYY-MM-DD */
+function todayDateStr(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 export function buildNexusBridgePrompt(cwd: string): string {
   const nexusRoot = detectNexusRoot(cwd);
   if (!nexusRoot) return '';
 
+  // --- Canonical sources (derived, not hardcoded) ---
   const registry = readJsonSafe<NexusRegistry>(path.join(nexusRoot, '00_NEXUS_CORE', 'agent_registry.json'));
-  const context = readJsonSafe<Record<string, unknown>>(path.join(nexusRoot, '99_META', 'nexus_context_LIVE.json'));
+  const soulMd = config.BOT_SOUL_FILE
+    ? readTextSafe(config.BOT_SOUL_FILE, 2000)
+    : readTextSafe(path.join(nexusRoot, 'soul.md'), 2000);
+  const dailyLog = readTextSafe(path.join(nexusRoot, '.nexus-memory', 'daily', `${todayDateStr()}.md`), 800);
   const chatInstruction = readTextSafe(path.join(nexusRoot, '99_META', 'CLAUDE_CHAT_INSTRUCTION_v2.4.md'), 2200);
   const claudeMd = readTextSafe(path.join(nexusRoot, 'CLAUDE.md'), 2600);
 
-  const agentSummaries = Object.entries(registry?.agents || {})
-    .slice(0, 9)
+  // Derive agent counts from registry (single source of truth)
+  const agents = Object.entries(registry?.agents || {});
+  const totalAgents = agents.length;
+  const coreAgents = agents.filter(([, a]) => a.type === 'core').length;
+  const utilityAgents = agents.filter(([, a]) => a.type === 'utility').length;
+
+  // Show ALL agents, not just first 9
+  const agentSummaries = agents
     .map(([name, agent]) => {
       const triggers = (agent.trigger_keywords || []).slice(0, 4).join(', ');
-      const specialties = (agent.specializes_in || []).slice(0, 2).join(', ');
-      return `- ${name}: ${agent.description || 'No description'} | triggers: ${triggers || 'n/a'} | focus: ${specialties || 'n/a'}`;
+      return `- ${name} [${agent.type || '?'}]: ${agent.description || 'No description'} | triggers: ${triggers || 'n/a'}`;
     })
     .join('\n');
-
-  const currentPhase = typeof context?.current_phase === 'string' ? context.current_phase : 'unknown';
-  const sessionCount = typeof context?.session_count === 'number' ? context.session_count : 'unknown';
 
   return `
 
@@ -109,12 +122,14 @@ Bridging goals:
 - Do not claim production-readiness unless verified by actual files/tests.
 - Keep a strict distinction between implemented systems vs plans/docs.
 
-NEXUS current state:
-- current_phase: ${String(currentPhase)}
-- session_count: ${String(sessionCount)}
+NEXUS agents (${totalAgents} total: ${coreAgents} core + ${utilityAgents} utility):
+${agentSummaries || '- No agent registry available'}
 
-NEXUS agent registry summary:
-${agentSummaries || '- No agent registry summary available'}
+NEXUS identity (soul.md):
+${soulMd || '[missing]'}
+
+Today's log:
+${dailyLog || '[no daily log yet]'}
 
 NEXUS chat instruction excerpt:
 ${chatInstruction || '[missing]'}

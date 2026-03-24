@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { z } from 'zod';
+import { config } from '../config.js';
 
 // Zod schema for session history entry
 const sessionHistoryEntrySchema = z.object({
@@ -10,6 +10,7 @@ const sessionHistoryEntrySchema = z.object({
   projectPath: z.string(),
   projectName: z.string(),
   lastMessagePreview: z.string(),
+  messageCount: z.number().optional().default(0),
   createdAt: z.string(),
   lastActivity: z.string(),
 });
@@ -25,7 +26,7 @@ interface SessionHistoryData {
   sessions: Record<string, SessionHistoryEntry[]>; // sessionKey -> history entries
 }
 
-const HISTORY_DIR = path.join(os.homedir(), '.claudegram');
+const HISTORY_DIR = config.DATA_DIR;
 const HISTORY_FILE = path.join(HISTORY_DIR, 'sessions.json');
 const MAX_HISTORY_PER_CHAT = 20;
 
@@ -55,7 +56,12 @@ class SessionHistory {
           // Keep string keys as-is (supports both "12345" and "12345:42" formats)
           this.data = { sessions: {} };
           for (const [key, value] of Object.entries(result.data.sessions)) {
-            this.data.sessions[key] = value;
+            // Migrate old entries without messageCount
+            const migratedSessions = value.map((session: any) => ({
+              ...session,
+              messageCount: session.messageCount ?? 0
+            }));
+            this.data.sessions[key] = migratedSessions;
           }
         } else {
           console.warn('[SessionHistory] Invalid data format, starting fresh:', result.error.message);
@@ -81,7 +87,8 @@ class SessionHistory {
     conversationId: string,
     projectPath: string,
     lastMessagePreview: string = '',
-    claudeSessionId?: string
+    claudeSessionId?: string,
+    incrementMessageCount: boolean = true
   ): void {
     if (!this.data.sessions[sessionKey]) {
       this.data.sessions[sessionKey] = [];
@@ -96,12 +103,19 @@ class SessionHistory {
     );
 
     const existingEntry = existingIndex >= 0 ? history[existingIndex] : undefined;
+
+    // Calculate new message count
+    const newMessageCount = existingEntry
+      ? (existingEntry.messageCount || 0) + (incrementMessageCount ? 1 : 0)
+      : 1; // First message = count 1
+
     const entry: SessionHistoryEntry = {
       conversationId,
       claudeSessionId: claudeSessionId ?? existingEntry?.claudeSessionId,
       projectPath,
       projectName,
       lastMessagePreview: lastMessagePreview.substring(0, 100),
+      messageCount: newMessageCount,
       createdAt:
         existingIndex >= 0
           ? history[existingIndex].createdAt
@@ -161,6 +175,8 @@ class SessionHistory {
     if (entry) {
       entry.lastMessagePreview = preview.substring(0, 100);
       entry.lastActivity = new Date().toISOString();
+      // Increment message count
+      entry.messageCount = (entry.messageCount || 0) + 1;
       this.save();
     }
   }

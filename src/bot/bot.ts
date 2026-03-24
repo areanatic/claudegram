@@ -97,7 +97,16 @@ export async function createBot(): Promise<Bot> {
   }));
 
   // Register command menu for autocomplete (non-blocking)
-  const commandList = [
+  // Minimal mode: Space-Bots only show user-relevant commands
+  const commandList = config.BOT_MINIMAL_COMMANDS ? [
+    { command: 'start', description: '👋 Hilfe und Übersicht' },
+    { command: 'clear', description: '🗑️ Neues Gespräch starten' },
+    { command: 'cancel', description: '⏹️ Aktuelle Anfrage abbrechen' },
+    { command: 'tts', description: '🔊 Sprachantworten an/aus' },
+    ...(config.DOCUMENT_INBOX_ENABLED ? [{ command: 'inbox', description: '📬 Empfangene Dokumente anzeigen' }] : []),
+    ...(config.TRANSCRIBE_ENABLED ? [{ command: 'transcribe', description: '🎤 Audio in Text umwandeln' }] : []),
+    { command: 'status', description: '📊 Session-Status' },
+  ] : [
     { command: 'start', description: '🚀 Show help and getting started' },
     { command: 'project', description: '📁 Set working directory' },
     { command: 'nexus', description: '🧠 Open the NEXUS repo in bridge mode' },

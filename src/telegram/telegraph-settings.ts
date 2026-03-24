@@ -1,7 +1,6 @@
 import { config } from '../config.js';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { z } from 'zod';
 
 // Zod schema for Telegraph settings
@@ -18,7 +17,7 @@ export interface TelegraphSettings {
   enabled: boolean;
 }
 
-const SETTINGS_DIR = path.join(os.homedir(), '.claudegram');
+const SETTINGS_DIR = config.DATA_DIR;
 const SETTINGS_FILE = path.join(SETTINGS_DIR, 'telegraph-settings.json');
 const chatTelegraphSettings: Map<string, TelegraphSettings> = new Map();
 

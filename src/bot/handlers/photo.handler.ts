@@ -21,7 +21,7 @@ import { isValidImageFile, getFileType } from '../../utils/file-type.js';
 import { type PhotoSize } from 'grammy/types';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 
-const UPLOADS_DIR = '.claudegram/uploads';
+const UPLOADS_DIR = '.nexusgram/uploads';
 
 function sanitizeFileName(name: string): string {
   return path.basename(name).replace(/[^a-zA-Z0-9._-]/g, '_');

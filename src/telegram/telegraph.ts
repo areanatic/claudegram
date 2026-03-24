@@ -54,7 +54,7 @@ export async function initTelegraph(): Promise<void> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        short_name: 'Claudegram',
+        short_name: 'Nexusgram',
         author_name: 'Claude Agent',
         author_url: 'https://github.com/anthropics/claude-code'
       })
@@ -77,7 +77,7 @@ export async function initTelegraph(): Promise<void> {
     telegraphAccount = {
       access_token: json.result.access_token,
       auth_url: json.result.auth_url,
-      short_name: json.result.short_name || 'Claudegram'
+      short_name: json.result.short_name || 'Nexusgram'
     };
 
     // Save for future use

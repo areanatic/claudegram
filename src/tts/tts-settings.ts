@@ -1,7 +1,6 @@
 import { config } from '../config.js';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { z } from 'zod';
 
 // Zod schema for TTS settings
@@ -9,6 +8,8 @@ const ttsSettingsSchema = z.object({
   enabled: z.boolean().optional(),
   voice: z.string().optional(),
   autoplay: z.boolean().optional(),
+  voiceFirstMode: z.boolean().optional(),
+  detectedLanguage: z.string().nullable().optional(),
 });
 
 // Zod schema for the full TTS settings file
@@ -20,9 +21,13 @@ export interface TTSSettings {
   enabled: boolean;
   voice: string;
   autoplay: boolean;
+  /** Auto-enabled when user sends voice message, auto-disabled when they type text */
+  voiceFirstMode: boolean;
+  /** Last detected language code from STT (e.g. "de", "en") */
+  detectedLanguage: string | null;
 }
 
-const SETTINGS_DIR = path.join(os.homedir(), '.claudegram');
+const SETTINGS_DIR = config.DATA_DIR;
 const SETTINGS_FILE = path.join(SETTINGS_DIR, 'tts-settings.json');
 const chatTTSSettings: Map<string, TTSSettings> = new Map();
 
@@ -59,9 +64,11 @@ function normalizeSettings(settings?: Partial<TTSSettings>): TTSSettings {
     : getDefaultVoice();
 
   return {
-    enabled: typeof settings?.enabled === 'boolean' ? settings.enabled : false,
+    enabled: typeof settings?.enabled === 'boolean' ? settings.enabled : config.TTS_ENABLED,
     voice: isValidVoiceForProvider(voice) ? voice : getDefaultVoice(),
     autoplay: typeof settings?.autoplay === 'boolean' ? settings.autoplay : true,
+    voiceFirstMode: typeof settings?.voiceFirstMode === 'boolean' ? settings.voiceFirstMode : false,
+    detectedLanguage: typeof settings?.detectedLanguage === 'string' ? settings.detectedLanguage : null,
   };
 }
 
@@ -134,4 +141,25 @@ export function setTTSAutoplay(sessionKey: string, autoplay: boolean): void {
 
 export function isTTSEnabled(sessionKey: string): boolean {
   return getTTSSettings(sessionKey).enabled;
+}
+
+/** Returns true if TTS is explicitly enabled OR voice-first mode is active */
+export function isVoiceActive(sessionKey: string): boolean {
+  const settings = getTTSSettings(sessionKey);
+  return settings.enabled || settings.voiceFirstMode;
+}
+
+export function setVoiceFirstMode(sessionKey: string, enabled: boolean): void {
+  const settings = getTTSSettings(sessionKey);
+  settings.voiceFirstMode = enabled;
+  // Don't persist voiceFirstMode to disk — it's session-transient
+}
+
+export function setDetectedLanguage(sessionKey: string, language: string | null): void {
+  const settings = getTTSSettings(sessionKey);
+  settings.detectedLanguage = language;
+}
+
+export function getDetectedLanguage(sessionKey: string): string | null {
+  return getTTSSettings(sessionKey).detectedLanguage;
 }

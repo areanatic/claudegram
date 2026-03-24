@@ -1,16 +1,16 @@
 #!/bin/bash
-# Start Claudegram Dev Bot (@AstronDevBot)
+# Start Nexusgram Dev Bot (@AstronDevBot)
 # Lock file prevents multiple instances; restart loop recovers from crashes.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PATH="/opt/homebrew/Cellar/node@22/22.22.0_1/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 export HOME="/Users/ashtron"
-export CLAUDEGRAM_ENV_PATH="$SCRIPT_DIR/.env.dev"
+export NEXUSGRAM_ENV_PATH="$SCRIPT_DIR/.env.dev"
 
 # Unset CLAUDECODE to allow Claude Code subprocesses from the bot
 unset CLAUDECODE
 
-LOCK_FILE="/tmp/claudegram-dev.lock"
+LOCK_FILE="/tmp/nexusgram-dev.lock"
 
 # Exit immediately if another instance is already running
 if [ -f "$LOCK_FILE" ] && kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
@@ -18,7 +18,7 @@ if [ -f "$LOCK_FILE" ] && kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
   exit 0
 fi
 
-echo "🧪 Starting Claudegram DEV Bot (@AstronDevBot)..."
+echo "🧪 Starting Nexusgram DEV Bot (@AstronDevBot)..."
 echo "📋 Config: $CLAUDEGRAM_ENV_PATH"
 
 cleanup() { rm -f "$LOCK_FILE"; }
