@@ -65,7 +65,7 @@ export async function maybeSendVoiceReply(ctx: Context, text: string, options?: 
   if (looksLikeError(text)) return;
 
   const cleaned = stripMarkdown(text);
-  if (cleaned.length < 5) return;
+  if (cleaned.length < 200) return;
 
   const safeText = truncateToMax(cleaned, config.TTS_MAX_CHARS);
   if (!safeText) return;

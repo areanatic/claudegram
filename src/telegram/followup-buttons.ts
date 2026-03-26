@@ -11,20 +11,23 @@ const activeButtons = new Map<string, { chatId: number; messageId: number }>();
 
 /**
  * Build inline keyboard from Claude-provided button labels.
- * Buttons are laid out in a single row (up to 4 buttons).
+ * Buttons are laid out in rows of 2 (2x2 for 4 buttons, etc.).
  */
 function buildFollowUpKeyboard(buttons: string[]) {
   if (!config.FOLLOWUP_BUTTONS_ENABLED) return undefined;
   if (!buttons || buttons.length < 2) return undefined;
 
-  return {
-    inline_keyboard: [
-      buttons.map((label, i) => ({
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) {
+    rows.push(
+      buttons.slice(i, i + 2).map((label, j) => ({
         text: label,
-        callback_data: `followup:${i}:${label.slice(0, 30)}`,
-      })),
-    ],
-  };
+        callback_data: `followup:${i + j}:${label.slice(0, 30)}`,
+      }))
+    );
+  }
+
+  return { inline_keyboard: rows };
 }
 
 /**
@@ -96,7 +99,10 @@ export async function handleFollowUpCallback(ctx: Context): Promise<void> {
   const parts = data.split(':');
   const label = parts.slice(2).join(':') || 'OK';
 
-  // Remove the buttons message immediately
+  // Answer callback IMMEDIATELY to stop the pulsing indicator (Telegram 10s timeout)
+  await ctx.answerCallbackQuery({ text: label.slice(0, 30) });
+
+  // Remove the buttons message
   try {
     const msg = ctx.callbackQuery?.message;
     if (msg) {
@@ -104,8 +110,6 @@ export async function handleFollowUpCallback(ctx: Context): Promise<void> {
       activeButtons.delete(sessionKey);
     }
   } catch { /* ignore */ }
-
-  await ctx.answerCallbackQuery({ text: label.slice(0, 30) });
 
   // Send the button label as user message to Claude
   await queueRequest(sessionKey, label, async () => {

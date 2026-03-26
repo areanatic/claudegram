@@ -39,7 +39,30 @@ async function main() {
   // Start concurrent runner — updates are processed in parallel,
   // with per-chat ordering enforced by the sequentialize middleware in bot.ts.
   // This lets /cancel bypass the per-chat queue and interrupt running queries.
-  const runner = run(bot);
+  // Explicitly set allowed_updates so Telegram doesn't use a stale cached list
+  // that might exclude callback_query (inline button presses).
+  const runner = run(bot, {
+    runner: {
+      fetch: {
+        allowed_updates: [
+          'message',
+          'edited_message',
+          'callback_query',
+          'inline_query',
+          'chosen_inline_result',
+          'channel_post',
+          'edited_channel_post',
+          'my_chat_member',
+          'chat_member',
+          'chat_join_request',
+          'poll',
+          'poll_answer',
+          'shipping_query',
+          'pre_checkout_query',
+        ],
+      },
+    },
+  });
   console.log('[Runner] Grammy runner started, polling for updates...');
 
   // Graceful shutdown (guarded against duplicate signals)
