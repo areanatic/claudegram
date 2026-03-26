@@ -40,7 +40,7 @@ async function generateSpeechOpenAI(text: string, voice?: string): Promise<Buffe
   return Buffer.from(await response.arrayBuffer());
 }
 
-// ── Groq Orpheus provider ──────────────────────────────────────────
+// ── Groq TTS provider ─────────────────────────────────────────────
 
 const GROQ_TTS_ENDPOINT = 'https://api.groq.com/openai/v1/audio/speech';
 const GROQ_TTS_MODEL = 'canopylabs/orpheus-v1-english';
