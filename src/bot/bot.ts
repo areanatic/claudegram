@@ -252,6 +252,14 @@ export async function createBot(): Promise<Bot> {
       await handleInboxCallback(ctx);
     } else if (data.startsWith('followup:')) {
       await handleFollowUpCallback(ctx);
+    } else if (data.startsWith('etime:')) {
+      await ctx.answerCallbackQuery();
+      try { await ctx.deleteMessage(); } catch { /* ignore */ }
+      if (data === 'etime:done') {
+        await ctx.reply('✅ Super, eingetragen! Bis nächste Woche.');
+      } else {
+        await ctx.reply('⏰ Ok, vergiss es nicht — Buchungsschluss kommt schnell!');
+      }
     }
   });
 

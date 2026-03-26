@@ -143,10 +143,12 @@ export function isTTSEnabled(sessionKey: string): boolean {
   return getTTSSettings(sessionKey).enabled;
 }
 
-/** Returns true if TTS is explicitly enabled OR voice-first mode is active */
+/** Returns true only if TTS is enabled AND voice-first mode is active.
+ * enabled=false is a hard-off — voiceFirstMode cannot override it. */
 export function isVoiceActive(sessionKey: string): boolean {
   const settings = getTTSSettings(sessionKey);
-  return settings.enabled || settings.voiceFirstMode;
+  if (!settings.enabled) return false;
+  return settings.voiceFirstMode;
 }
 
 export function setVoiceFirstMode(sessionKey: string, enabled: boolean): void {
