@@ -20,10 +20,10 @@ export function shouldNotifyStale(sessionKey: string): boolean {
   return true;
 }
 
-/** How many minutes ago the message was sent relative to bot start. */
+/** How many minutes ago the message was sent (relative to now, not bot start). */
 export function getStaleAgeMinutes(messageDate: number): number {
   const messageDateMs = messageDate * 1000;
-  return Math.max(1, Math.round((BOT_START_TIME - messageDateMs) / 60_000));
+  return Math.max(1, Math.round((Date.now() - messageDateMs) / 60_000));
 }
 
 export function getUptimeSeconds(): number {

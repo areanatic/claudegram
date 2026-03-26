@@ -242,8 +242,8 @@ async function sendSingleFileConfirmation(
     `Saved as: \`${metadata.savedFilename}\``,
   ].join('\n');
 
-  // Check if we have an active session to ask for routing
-  const session = sessionManager.getSession(sessionKey);
+  // Check if we have an active session to ask for routing (auto-resumes after restart)
+  const session = sessionManager.getOrResumeSession(sessionKey);
   if (session && metadata.caption) {
     // Feed to agent for intelligent routing suggestion
     const agentPrompt = [

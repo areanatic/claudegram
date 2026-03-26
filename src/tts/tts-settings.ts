@@ -67,7 +67,7 @@ function normalizeSettings(settings?: Partial<TTSSettings>): TTSSettings {
     enabled: typeof settings?.enabled === 'boolean' ? settings.enabled : config.TTS_ENABLED,
     voice: isValidVoiceForProvider(voice) ? voice : getDefaultVoice(),
     autoplay: typeof settings?.autoplay === 'boolean' ? settings.autoplay : true,
-    voiceFirstMode: typeof settings?.voiceFirstMode === 'boolean' ? settings.voiceFirstMode : false,
+    voiceFirstMode: false, // Always session-transient — never restored from disk
     detectedLanguage: typeof settings?.detectedLanguage === 'string' ? settings.detectedLanguage : null,
   };
 }
@@ -97,9 +97,12 @@ function loadSettings(): void {
 
 function saveSettings(): void {
   ensureDirectory();
-  const settings: Record<string, TTSSettings> = {};
-  for (const [key, value] of chatTTSSettings.entries()) {
-    settings[key] = value;
+  // voiceFirstMode is session-transient — strip it before writing to disk.
+  // Otherwise a saveSettings() call from setTTSEnabled/setTTSVoice would accidentally
+  // persist the current in-memory voiceFirstMode and resurrect it after the next restart.
+  const settings: Record<string, Omit<TTSSettings, 'voiceFirstMode'>> = {};
+  for (const [key, { voiceFirstMode: _transient, ...persistable }] of chatTTSSettings.entries()) {
+    settings[key] = persistable;
   }
 
   try {

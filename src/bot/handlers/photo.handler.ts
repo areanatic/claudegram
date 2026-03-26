@@ -140,7 +140,7 @@ export async function handlePhoto(ctx: Context): Promise<void> {
   }
   markProcessed(messageId);
 
-  const session = sessionManager.getSession(sessionKey);
+  const session = sessionManager.getOrResumeSession(sessionKey);
   if (!session) {
     await ctx.reply(
       '⚠️ No project set\\.\n\nIf the bot restarted, use `/continue` or `/resume` to restore your last session\\.\nOr use `/project` to open a project first\\.',
@@ -238,7 +238,7 @@ export async function handleImageDocument(ctx: Context): Promise<void> {
   }
   markProcessed(messageId);
 
-  const session = sessionManager.getSession(sessionKey);
+  const session = sessionManager.getOrResumeSession(sessionKey);
   if (!session) {
     await ctx.reply(
       '⚠️ No project set\\.\n\nIf the bot restarted, use `/continue` or `/resume` to restore your last session\\.\nOr use `/project` to open a project first\\.',
