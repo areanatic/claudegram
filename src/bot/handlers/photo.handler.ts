@@ -6,7 +6,7 @@ import { sendToAgent } from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
-import { isStaleMessage } from '../middleware/stale-filter.js';
+import { isStaleMessage, shouldNotifyStale, getStaleAgeMinutes } from '../middleware/stale-filter.js';
 import {
   queueRequest,
   isProcessing,
@@ -126,6 +126,12 @@ export async function handlePhoto(ctx: Context): Promise<void> {
 
   if (isStaleMessage(messageDate)) {
     console.log(`[Photo] Ignoring stale photo message ${messageId}`);
+    if (shouldNotifyStale(sessionKey)) {
+      const mins = getStaleAgeMinutes(messageDate);
+      try {
+        await ctx.reply(`⚡ Ich war kurz offline. Deine Nachricht von vor ~${mins} Minute${mins === 1 ? '' : 'n'} habe ich leider verpasst — bitte schick sie nochmal!`);
+      } catch { /* ignore — notification is best-effort */ }
+    }
     return;
   }
   if (isDuplicate(messageId)) {
@@ -218,6 +224,12 @@ export async function handleImageDocument(ctx: Context): Promise<void> {
 
   if (isStaleMessage(messageDate)) {
     console.log(`[ImageDoc] Ignoring stale document ${messageId}`);
+    if (shouldNotifyStale(sessionKey)) {
+      const mins = getStaleAgeMinutes(messageDate);
+      try {
+        await ctx.reply(`⚡ Ich war kurz offline. Deine Nachricht von vor ~${mins} Minute${mins === 1 ? '' : 'n'} habe ich leider verpasst — bitte schick sie nochmal!`);
+      } catch { /* ignore — notification is best-effort */ }
+    }
     return;
   }
   if (isDuplicate(messageId)) {

@@ -1,12 +1,29 @@
 const BOT_START_TIME = Date.now();
-const STALE_THRESHOLD = 30000; // 30 seconds
+const STALE_THRESHOLD_MS = 180_000; // 3 minutes — covers Claude response time (30–120s)
+
+/** Sessions already notified about offline gap this boot cycle. One notify per session. */
+const notifiedSessions = new Set<string>();
 
 export function isStaleMessage(messageDate: number): boolean {
   // messageDate is Unix timestamp in seconds, convert to ms
   const messageDateMs = messageDate * 1000;
+  return messageDateMs < BOT_START_TIME - STALE_THRESHOLD_MS;
+}
 
-  // Ignore messages sent before bot started (minus threshold)
-  return messageDateMs < BOT_START_TIME - STALE_THRESHOLD;
+/**
+ * Returns true (and marks session) if we should send an "I was offline" notification.
+ * Only fires once per session per bot restart to prevent spam.
+ */
+export function shouldNotifyStale(sessionKey: string): boolean {
+  if (notifiedSessions.has(sessionKey)) return false;
+  notifiedSessions.add(sessionKey);
+  return true;
+}
+
+/** How many minutes ago the message was sent relative to bot start. */
+export function getStaleAgeMinutes(messageDate: number): number {
+  const messageDateMs = messageDate * 1000;
+  return Math.max(1, Math.round((BOT_START_TIME - messageDateMs) / 60_000));
 }
 
 export function getUptimeSeconds(): number {

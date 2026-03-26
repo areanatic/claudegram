@@ -7,7 +7,7 @@ import { sendToAgent } from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
-import { isStaleMessage } from '../middleware/stale-filter.js';
+import { isStaleMessage, shouldNotifyStale, getStaleAgeMinutes } from '../middleware/stale-filter.js';
 import {
   queueRequest,
   isProcessing,
@@ -37,6 +37,12 @@ export async function handleVoice(ctx: Context): Promise<void> {
   // Stale/duplicate filters
   if (isStaleMessage(messageDate)) {
     console.log(`[Voice] Ignoring stale voice message ${messageId}`);
+    if (shouldNotifyStale(sessionKey)) {
+      const mins = getStaleAgeMinutes(messageDate);
+      try {
+        await ctx.reply(`⚡ Ich war kurz offline. Deine Nachricht von vor ~${mins} Minute${mins === 1 ? '' : 'n'} habe ich leider verpasst — bitte schick sie nochmal!`);
+      } catch { /* ignore — notification is best-effort */ }
+    }
     return;
   }
   if (isDuplicate(messageId)) {
