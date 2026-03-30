@@ -172,7 +172,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
     // Feed transcript into agent
     await queueRequest(sessionKey, transcript, async () => {
-      if (voiceActive) {
+      if (isVoiceActive(sessionKey)) {
         // Voice-first mode: skip streaming display, just show typing indicator
         // This reduces latency by avoiding message creation/editing overhead
         await ctx.replyWithChatAction('typing');

@@ -6,6 +6,8 @@ import { preventSleep, allowSleep } from './utils/caffeinate.js';
 import { stopCleanup } from './telegram/deduplication.js';
 import { closeMemoryDb } from './memory/nexus-memory.js';
 import { acquireLock, releaseLock } from './utils/pid-lock.js';
+import { cancelAllRequests, getActiveSessionKeys } from './claude/request-queue.js';
+import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
 
 const MAX_409_RETRIES = 5;
 const BASE_409_DELAY_MS = 5000; // 5s, 10s, 20s, 40s, 80s
@@ -67,20 +69,57 @@ async function main() {
 
   // Graceful shutdown (guarded against duplicate signals)
   let shuttingDown = false;
+
+  const forceShutdown = () => {
+    console.error('[Shutdown] Force exit after timeout — some requests may have been lost.');
+    process.exit(1);
+  };
+
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log('\n👋 Shutting down...');
+    console.log('\n[Shutdown] Graceful shutdown initiated...');
+
+    // 1. Stop polling — no new updates accepted
+    const stopPromise = runner.stop();
+
+    // 2. Clear document batch timers before cancelling requests
+    clearAllBatchTimers();
+
+    // 3. Notify active users and cancel their requests
+    const activeKeys = getActiveSessionKeys();
+    if (activeKeys.length > 0) {
+      console.log(`[Shutdown] Notifying ${activeKeys.length} active session(s)...`);
+      for (const sessionKey of activeKeys) {
+        try {
+          const chatId = Number(sessionKey.split(':')[0]);
+          if (!isNaN(chatId)) {
+            // 5s send timeout — don't let a slow Telegram API block the shutdown
+            await Promise.race([
+              bot.api.sendMessage(chatId, '🔄 Bot restarting — your request was cancelled. Please send your message again in a moment.'),
+              new Promise<never>((_, reject) => setTimeout(() => reject(new Error('send timeout')), 5000)),
+            ]);
+          }
+        } catch { /* best-effort — shutdown continues regardless */ }
+      }
+      await cancelAllRequests();
+    }
+
+    // 4. Wait for runner to finish
+    try { await stopPromise; } catch { /* ignore */ }
+
+    // 5. Cleanup
     releaseLock(config.BOT_NAME);
     allowSleep();
     stopCleanup();
     closeMemoryDb();
-    await runner.stop();
+
+    console.log('[Shutdown] Done. Exiting.');
     process.exit(0);
   };
 
-  process.on('SIGINT', () => { shutdown(); });
-  process.on('SIGTERM', () => { shutdown(); });
+  process.on('SIGINT', () => { shutdown(); setTimeout(forceShutdown, 15_000).unref(); });
+  process.on('SIGTERM', () => { shutdown(); setTimeout(forceShutdown, 15_000).unref(); });
 
   // Keep alive until the runner stops (crash or explicit stop)
   await runner.task();

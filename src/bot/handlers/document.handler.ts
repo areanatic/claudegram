@@ -207,18 +207,20 @@ async function handleBatchOrImmediate(
   }
 
   // Set new timer — wait for more files or process after delay
-  batch.timer = setTimeout(async () => {
+  batch.timer = setTimeout(() => {
     const currentBatch = batchStates.get(sessionKey);
     if (!currentBatch || currentBatch.files.length === 0) return;
 
     const files = [...currentBatch.files];
     batchStates.delete(sessionKey);
 
-    if (files.length === 1) {
-      await sendSingleFileConfirmation(ctx, sessionKey, files[0]);
-    } else {
-      await sendBatchConfirmation(ctx, sessionKey, files);
-    }
+    const task = files.length === 1
+      ? sendSingleFileConfirmation(ctx, sessionKey, files[0])
+      : sendBatchConfirmation(ctx, sessionKey, files);
+
+    task.catch((error) => {
+      console.error('[Document] Batch confirmation error:', sanitizeError(error));
+    });
   }, BATCH_DELAY_MS);
 }
 
@@ -316,4 +318,12 @@ async function sendBatchConfirmation(
   ].join('\n');
 
   await messageSender.sendMessage(ctx, confirmMsg);
+}
+
+/** Clear all pending batch timers — called during graceful shutdown. */
+export function clearAllBatchTimers(): void {
+  for (const [, batch] of batchStates) {
+    if (batch.timer) clearTimeout(batch.timer);
+  }
+  batchStates.clear();
 }

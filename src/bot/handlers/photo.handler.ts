@@ -84,35 +84,46 @@ async function handleSavedImage(
     await ctx.reply(`⏳ Queued \(position ${position}\)`, { parse_mode: 'MarkdownV2' });
   }
 
-  await queueRequest(sessionKey, agentPrompt, async () => {
-    if (getStreamingMode() === 'streaming') {
-      await messageSender.startStreaming(ctx);
+  try {
+    await queueRequest(sessionKey, agentPrompt, async () => {
+      if (getStreamingMode() === 'streaming') {
+        await messageSender.startStreaming(ctx);
 
-      const abortController = new AbortController();
-      setAbortController(sessionKey, abortController);
+        const abortController = new AbortController();
+        setAbortController(sessionKey, abortController);
 
-      try {
+        try {
+          const response = await sendToAgent(sessionKey, agentPrompt, {
+            onProgress: (progressText) => {
+              messageSender.updateStream(ctx, progressText);
+            },
+            abortController,
+            telegramCtx: ctx,
+          });
+
+          await messageSender.finishStreaming(ctx, response.text);
+        } catch (error) {
+          await messageSender.cancelStreaming(ctx);
+          throw error;
+        }
+      } else {
+        await ctx.replyWithChatAction('typing');
+        const abortController = new AbortController();
+        setAbortController(sessionKey, abortController);
+
         const response = await sendToAgent(sessionKey, agentPrompt, {
-          onProgress: (progressText) => {
-            messageSender.updateStream(ctx, progressText);
-          },
           abortController,
+          telegramCtx: ctx,
         });
-
-        await messageSender.finishStreaming(ctx, response.text);
-      } catch (error) {
-        await messageSender.cancelStreaming(ctx);
-        throw error;
+        await messageSender.sendMessage(ctx, response.text);
       }
-    } else {
-      await ctx.replyWithChatAction('typing');
-      const abortController = new AbortController();
-      setAbortController(sessionKey, abortController);
-
-      const response = await sendToAgent(sessionKey, agentPrompt, { abortController });
-      await messageSender.sendMessage(ctx, response.text);
-    }
-  });
+    });
+  } catch (error) {
+    if ((error as Error).message === 'Queue cleared') return;
+    const errorMessage = sanitizeError(error);
+    console.error('[Photo] Agent error:', errorMessage);
+    await ctx.reply(`Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+  }
 }
 
 export async function handlePhoto(ctx: Context): Promise<void> {

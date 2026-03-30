@@ -1,10 +1,12 @@
 import { Context } from 'grammy';
 import { config } from '../config.js';
 import { getSessionKeyFromCtx } from '../utils/session-key.js';
-import { queueRequest } from '../claude/request-queue.js';
+import { queueRequest, setAbortController } from '../claude/request-queue.js';
 import { sendToAgent } from '../claude/agent.js';
 import { messageSender } from './message-sender.js';
 import { maybeSendVoiceReply } from '../tts/voice-reply.js';
+import { sanitizeError } from '../utils/sanitize.js';
+import { escapeMarkdownV2 as esc } from './markdown.js';
 
 // Track active follow-up button messages so we can dismiss them
 const activeButtons = new Map<string, { chatId: number; messageId: number }>();
@@ -112,19 +114,31 @@ export async function handleFollowUpCallback(ctx: Context): Promise<void> {
   } catch { /* ignore */ }
 
   // Send the button label as user message to Claude
-  await queueRequest(sessionKey, label, async () => {
-    await messageSender.startStreaming(ctx);
+  try {
+    await queueRequest(sessionKey, label, async () => {
+      await messageSender.startStreaming(ctx);
+      const abortController = new AbortController();
+      setAbortController(sessionKey, abortController);
+      try {
+        const response = await sendToAgent(sessionKey, label, {
+          onProgress: (text) => { messageSender.updateStream(ctx, text); },
+          abortController,
+          telegramCtx: ctx,
+        });
+        await messageSender.finishStreaming(ctx, response.text);
+        await maybeSendVoiceReply(ctx, response.text);
+        await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
+      } catch (error) {
+        await messageSender.cancelStreaming(ctx);
+        throw error;
+      }
+    });
+  } catch (error) {
+    if ((error as Error).message === 'Queue cleared') return;
+    const errorMessage = sanitizeError(error);
+    console.error('[FollowUp] Callback error:', errorMessage);
     try {
-      const response = await sendToAgent(sessionKey, label, {
-        onProgress: (text) => { messageSender.updateStream(ctx, text); },
-        telegramCtx: ctx,
-      });
-      await messageSender.finishStreaming(ctx, response.text);
-      await maybeSendVoiceReply(ctx, response.text);
-      await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
-    } catch (error) {
-      await messageSender.cancelStreaming(ctx);
-      throw error;
-    }
-  });
+      await ctx.reply(`⚠️ ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+    } catch { /* best-effort */ }
+  }
 }

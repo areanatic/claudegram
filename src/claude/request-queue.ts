@@ -47,6 +47,58 @@ export function isProcessing(sessionKey: string): boolean {
   return processingFlags.get(sessionKey) === true;
 }
 
+/** Returns true if any session is currently processing a request. */
+export function isAnyProcessing(): boolean {
+  for (const [, flag] of processingFlags) {
+    if (flag) return true;
+  }
+  return false;
+}
+
+/** Returns session keys with an active query or processing flag. */
+export function getActiveSessionKeys(): string[] {
+  const keys = new Set<string>();
+  for (const [key] of activeQueries) keys.add(key);
+  for (const [key, flag] of processingFlags) {
+    if (flag) keys.add(key);
+  }
+  return [...keys];
+}
+
+/**
+ * Cancel all active requests across all sessions.
+ * Pending queue items are rejected with 'Queue cleared' (consistent with clearQueue).
+ * Used during graceful shutdown.
+ */
+export async function cancelAllRequests(): Promise<void> {
+  // Interrupt all active SDK queries
+  for (const [sessionKey, q] of activeQueries) {
+    cancelledChats.add(sessionKey);
+    try {
+      await q.interrupt();
+    } catch (err) {
+      console.debug('[cancelAllRequests] interrupt() threw for', sessionKey, err);
+    }
+  }
+  activeQueries.clear();
+
+  // Abort any remaining controllers
+  for (const [sessionKey, controller] of activeAbortControllers) {
+    cancelledChats.add(sessionKey);
+    controller.abort();
+  }
+  activeAbortControllers.clear();
+
+  // Reject all pending queue items — 'Queue cleared' is handled silently by all handlers
+  for (const [, queue] of pendingQueues) {
+    for (const request of queue) {
+      request.reject(new Error('Queue cleared'));
+    }
+    queue.length = 0;
+  }
+  pendingQueues.clear();
+}
+
 export function getQueuePosition(sessionKey: string): number {
   const queue = pendingQueues.get(sessionKey);
   return queue ? queue.length : 0;
