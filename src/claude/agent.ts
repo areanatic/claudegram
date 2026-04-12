@@ -443,12 +443,6 @@ export async function sendToAgent(
             let contextSummary = `**[COMPACTION]** ${timestamp} | trigger: ${trigger}\n`;
             contextSummary += `Kontext wird komprimiert. Letzte ${lastMessages.length} Nachrichten gesichert:\n\n`;
 
-            // Extract user message topics for memory (first 50 chars each)
-            const userTopics = lastMessages
-              .filter(m => m.role === 'user')
-              .map(m => m.content.slice(0, 50).replace(/\n/g, ' '))
-              .join(', ');
-
             for (const msg of lastMessages) {
               const preview = msg.content.slice(0, 300);
               const truncated = msg.content.length > 300 ? '…' : '';
@@ -457,11 +451,28 @@ export async function sendToAgent(
 
             recordTranscript(sessionKey, 'assistant', contextSummary);
 
-            // Save topic summary to SQLite memory (episodic, fast, no AI call)
-            if (userTopics) {
+            // Semantic synthesis (3-5 sentences, no AI call, decay=0 = stays forever)
+            // Replaces 50-char episodic snippets with rich searchable memory
+            const userMsgs = lastMessages.filter(m => m.role === 'user');
+            const assistantMsgs = lastMessages.filter(m => m.role === 'assistant');
+
+            if (userMsgs.length > 0) {
+              const topics = userMsgs
+                .map(m => m.content.slice(0, 120).replace(/\n/g, ' ').trim())
+                .join(' | ');
+              const assistantPreview = assistantMsgs.length > 0
+                ? assistantMsgs[assistantMsgs.length - 1].content.slice(0, 200).replace(/\n/g, ' ').trim()
+                : '';
+
+              const synthesis = [
+                `[NexusGram PreCompact] ${timestamp}`,
+                `Topics: ${topics}`,
+                assistantPreview ? `Claude antwortete: ${assistantPreview}` : '',
+              ].filter(Boolean).join(' — ');
+
               saveMemory(
-                `[NexusGram PreCompact] ${timestamp} Topics: ${userTopics}`,
-                'episodic',
+                synthesis,
+                'semantic',
                 config.BOT_MEMORY_PROJECT || 'nexus',
                 'precompact,telegram',
               );

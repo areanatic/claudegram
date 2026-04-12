@@ -127,7 +127,7 @@ export function injectContext(query?: string, project?: string): string {
 
   let block = '\n\nNEXUS Memory Context:\n';
   let charCount = block.length;
-  const maxChars = 800;
+  const maxChars = 1500;
 
   for (const mem of allResults) {
     const preview = mem.content.length > 120 ? mem.content.slice(0, 120) + '...' : mem.content;

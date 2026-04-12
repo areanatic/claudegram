@@ -81,6 +81,29 @@ function todayDateStr(): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+/**
+ * Load L1 wiki truth-files from shared-memory/nexus/wiki/.
+ * These are authoritative, always loaded, never auto-overwritten.
+ */
+function loadWikiTruthFiles(): string {
+  const wikiDir = '/Volumes/AstronOne/shared-memory/nexus/wiki';
+  if (!fs.existsSync(wikiDir)) return '';
+  try {
+    const files = fs.readdirSync(wikiDir)
+      .filter(f => f.endsWith('.md'))
+      .sort(); // deterministic order
+    if (files.length === 0) return '';
+    let block = '\n\nNEXUS L1 Wiki (Autoritäre Wahrheit — immer im Kontext):\n';
+    for (const file of files) {
+      const content = readTextSafe(`${wikiDir}/${file}`, 1200);
+      if (content) block += `\n### ${file}\n${content}\n`;
+    }
+    return block;
+  } catch {
+    return '';
+  }
+}
+
 export function buildNexusBridgePrompt(cwd: string): string {
   const nexusRoot = detectNexusRoot(cwd);
   if (!nexusRoot) return '';
@@ -110,7 +133,11 @@ export function buildNexusBridgePrompt(cwd: string): string {
     })
     .join('\n');
 
+  // L1: Wiki truth-files (always loaded first — override any RAG/episodic context)
+  const wikiContext = loadWikiTruthFiles();
+
   return `
+${wikiContext}
 
 NEXUS Bridge Mode:
 You are working inside a NEXUS repository. Treat the local NEXUS instruction files as project-specific operating context.
