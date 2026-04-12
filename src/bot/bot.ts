@@ -99,14 +99,22 @@ export async function createBot(): Promise<Bot> {
 
   // Register command menu for autocomplete (non-blocking)
   // Minimal mode: Space-Bots only show user-relevant commands
+  const minimalCommands: Record<string, { start: string; clear: string; cancel: string; tts: string; inbox: string; transcribe: string; status: string }> = {
+    de: { start: '👋 Hilfe und Übersicht', clear: '🗑️ Neues Gespräch starten', cancel: '⏹️ Aktuelle Anfrage abbrechen', tts: '🔊 Sprachantworten an/aus', inbox: '📬 Empfangene Dokumente anzeigen', transcribe: '🎤 Audio in Text umwandeln', status: '📊 Session-Status' },
+    ru: { start: '👋 Помощь и обзор', clear: '🗑️ Начать новый разговор', cancel: '⏹️ Отменить текущий запрос', tts: '🔊 Голосовые ответы вкл/выкл', inbox: '📬 Входящие документы', transcribe: '🎤 Преобразовать аудио в текст', status: '📊 Статус сессии' },
+    fa: { start: '👋 راهنما و خلاصه', clear: '🗑️ شروع مکالمه جدید', cancel: '⏹️ لغو درخواست فعلی', tts: '🔊 پاسخ صوتی روشن/خاموش', inbox: '📬 مشاهده اسناد دریافتی', transcribe: '🎤 تبدیل صدا به متن', status: '📊 وضعیت جلسه' },
+    en: { start: '👋 Help and overview', clear: '🗑️ Start new conversation', cancel: '⏹️ Cancel current request', tts: '🔊 Toggle voice replies', inbox: '📬 View incoming documents', transcribe: '🎤 Transcribe audio to text', status: '📊 Session status' },
+  };
+  const lang = minimalCommands[config.BOT_COMMAND_LANGUAGE] ? config.BOT_COMMAND_LANGUAGE : 'de';
+  const t = minimalCommands[lang];
   const commandList = config.BOT_MINIMAL_COMMANDS ? [
-    { command: 'start', description: '👋 Hilfe und Übersicht' },
-    { command: 'clear', description: '🗑️ Neues Gespräch starten' },
-    { command: 'cancel', description: '⏹️ Aktuelle Anfrage abbrechen' },
-    { command: 'tts', description: '🔊 Sprachantworten an/aus' },
-    ...(config.DOCUMENT_INBOX_ENABLED ? [{ command: 'inbox', description: '📬 Empfangene Dokumente anzeigen' }] : []),
-    ...(config.TRANSCRIBE_ENABLED ? [{ command: 'transcribe', description: '🎤 Audio in Text umwandeln' }] : []),
-    { command: 'status', description: '📊 Session-Status' },
+    { command: 'start', description: t.start },
+    { command: 'clear', description: t.clear },
+    { command: 'cancel', description: t.cancel },
+    { command: 'tts', description: t.tts },
+    ...(config.DOCUMENT_INBOX_ENABLED ? [{ command: 'inbox', description: t.inbox }] : []),
+    ...(config.TRANSCRIBE_ENABLED ? [{ command: 'transcribe', description: t.transcribe }] : []),
+    { command: 'status', description: t.status },
   ] : [
     { command: 'start', description: '🚀 Show help and getting started' },
     { command: 'project', description: '📁 Set working directory' },

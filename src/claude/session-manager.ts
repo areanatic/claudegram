@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as os from 'os';
+import * as path from 'path';
 import { sessionHistory, SessionHistoryEntry } from './session-history.js';
 import { config } from '../config.js';
 
@@ -45,17 +46,74 @@ class SessionManager {
   }
 
   /**
+   * Check if the Claude session JSONL exceeds 20 MB (115MB incident prevention).
+   * Searches ~/.claude/projects/ for the session file by claudeSessionId.
+   */
+  private isOversized(session: Session): boolean {
+    if (!session.claudeSessionId) return false;
+    const MB20 = 20 * 1024 * 1024;
+    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+    if (!fs.existsSync(claudeProjectsDir)) return false;
+    try {
+      const projectDirs = fs.readdirSync(claudeProjectsDir);
+      for (const dir of projectDirs) {
+        const sessionFile = path.join(claudeProjectsDir, dir, `${session.claudeSessionId}.jsonl`);
+        if (fs.existsSync(sessionFile)) {
+          const { size } = fs.statSync(sessionFile);
+          if (size > MB20) {
+            console.log(`[SessionRotation] JSONL oversized: ${Math.round(size / 1024 / 1024)}MB`);
+            return true;
+          }
+          return false;
+        }
+      }
+    } catch { /* ignore */ }
+    return false;
+  }
+
+  /**
+   * Check if a session belongs to a previous day (German time).
+   */
+  private isNewDay(session: Session): boolean {
+    const todayDE = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Berlin' });
+    const lastDE = session.lastActivity.toLocaleDateString('en-CA', { timeZone: 'Europe/Berlin' });
+    return todayDE !== lastDE;
+  }
+
+  /**
    * Get session from memory, or auto-resume the last session from disk if none exists.
    * This prevents "No project set" errors after bot restarts.
    * The session data is always persisted in <DATA_DIR>/sessions.json,
    * so this simply restores what was already there.
+   *
+   * Auto-rotates sessions on day change (German timezone).
    */
   getOrResumeSession(sessionKey: string): Session | undefined {
     const existing = this.sessions.get(sessionKey);
-    if (existing) return existing;
+    if (existing) {
+      if (this.isNewDay(existing)) {
+        console.log(`[SessionRotation] New day detected for ${sessionKey}, starting fresh session`);
+        const workDir = existing.workingDirectory;
+        this.sessions.delete(sessionKey);
+        return this.createSession(sessionKey, workDir);
+      }
+      if (this.isOversized(existing)) {
+        console.log(`[SessionRotation] Session oversized for ${sessionKey}, starting fresh session`);
+        const workDir = existing.workingDirectory;
+        this.sessions.delete(sessionKey);
+        return this.createSession(sessionKey, workDir);
+      }
+      return existing;
+    }
 
     const resumed = this.resumeLastSession(sessionKey);
     if (resumed) {
+      if (this.isNewDay(resumed)) {
+        console.log(`[SessionRotation] Resumed session from previous day for ${sessionKey}, starting fresh`);
+        const workDir = resumed.workingDirectory;
+        this.sessions.delete(sessionKey);
+        return this.createSession(sessionKey, workDir);
+      }
       console.log(`[AutoResume] Restored session for ${sessionKey}: ${resumed.workingDirectory}`);
       return resumed;
     }

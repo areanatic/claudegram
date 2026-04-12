@@ -26,7 +26,7 @@ import {
   getTimingReport,
   type AgentTimer,
 } from '../utils/agent-timer.js';
-import { recordTranscript } from './transcript-logger.js';
+import { recordTranscript, loadPreviousDayTranscript } from './transcript-logger.js';
 import { buildNexusBridgePrompt } from '../nexus/bridge.js';
 import { injectContext, saveMemory } from '../memory/nexus-memory.js';
 
@@ -358,6 +358,12 @@ export async function sendToAgent(
     throw new Error('No active session. Use /project to set working directory.');
   }
 
+  // If session was rotated (new day), clear stale in-memory Claude session ID
+  if (!session.claudeSessionId && chatSessionIds.has(sessionKey)) {
+    logAt('basic', `[SessionRotation] Clearing stale chatSessionId for ${sessionKey}`);
+    chatSessionIds.delete(sessionKey);
+  }
+
   sessionManager.updateActivity(sessionKey, message);
 
   // Get or initialize conversation history
@@ -550,6 +556,8 @@ export async function sendToAgent(
 
     const nexusBridgePrompt = buildNexusBridgePrompt(cwd);
     const memoryContext = injectContext(prompt, config.BOT_MEMORY_PROJECT);
+    // Load previous day's transcript for context continuity (only on fresh sessions)
+    const previousDayContext = existingSessionId ? '' : loadPreviousDayTranscript(sessionKey);
 
     const queryOptions: Parameters<typeof query>[0]['options'] = {
       cwd,
@@ -560,7 +568,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}`,
+        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${previousDayContext}`,
       },
       settingSources: ['project', 'user'] as SettingSource[],
       model: effectiveModel,
@@ -594,7 +602,12 @@ export async function sendToAgent(
             logAt('basic', `[Claude] WATCHDOG: No messages for ${formatDuration(sinceMsg)} (total: ${formatDuration(total)}), session:${sessionKey}`);
           },
           onTimeout: () => {
-            logAt('basic', `[Claude] WATCHDOG: Query timeout reached, aborting session:${sessionKey}`);
+            logAt('basic', `[Claude] WATCHDOG: Query timeout reached, clearing stale session and aborting: ${sessionKey}`);
+            chatSessionIds.delete(sessionKey);
+            const staleSession = sessionManager.getSession(sessionKey);
+            if (staleSession) {
+              staleSession.claudeSessionId = undefined;
+            }
             controller.abort();
           },
         })
@@ -803,6 +816,12 @@ export async function sendLoopToAgent(
 
   if (!session) {
     throw new Error('No active session. Use /project to set working directory.');
+  }
+
+  // If session was rotated (new day), clear stale in-memory Claude session ID
+  if (!session.claudeSessionId && chatSessionIds.has(sessionKey)) {
+    logAt('basic', `[SessionRotation] Clearing stale chatSessionId for ${sessionKey}`);
+    chatSessionIds.delete(sessionKey);
   }
 
   // Wrap the prompt with loop instructions

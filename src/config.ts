@@ -214,12 +214,25 @@ const envSchema = z.object({
   BOT_TOOLS: z.string()
     .default('Bash,Read,Write,Edit,Glob,Grep,Task')
     .transform(val => val.split(',').map(s => s.trim())),
+  // Product Development Agents
+  BOT_PD_ENABLED: z.string().default('false').transform(v => v === 'true'),
+  BOT_PD_DEXMASTER_MODE: z.enum(['suggest', 'auto']).default('suggest'),
+  BOT_PD_CATEGORIES: z.string().default('').transform(v => v ? v.split(',').map(s => s.trim()).filter(Boolean) : []),
+  BOT_PD_AGENTS: z.string().default('').transform(v => v ? v.split(',').map(s => s.trim()).filter(Boolean) : []),
+  BOT_PD_CONSOLE_ENABLED: z.string().default('false').transform(v => v === 'true'),
+  BOT_PD_SPARRING_ENABLED: z.string().default('true').transform(v => v === 'true'),
+  BOT_PD_COUNCIL_MAX: z.coerce.number().int().min(1).max(5).default(3),
+  BOT_PD_MAX_PARALLEL: z.coerce.number().int().min(1).max(4).default(2),
+  BOT_PD_OUTCOMES_DIR: z.string().default('/Volumes/AstronOne/shared-memory/nexus/pd-outcomes/'),
+  BOT_PD_OUTCOME_FORMAT: z.enum(['markdown', 'simple']).default('markdown'),
   // Custom soul file per bot (overrides default NEXUS soul.md detection)
   BOT_SOUL_FILE: z.string().optional(),
   // Path to custom /start welcome message file (plain text/markdown). If set, replaces default welcome.
   BOT_WELCOME_FILE: z.string().optional(),
   // Minimal command menu for Space-Bots (hides developer commands like /project, /explore, /plan)
   BOT_MINIMAL_COMMANDS: z.string().default('false').transform(toBool),
+  // Language for minimal command menu descriptions: 'de' | 'ru' | 'en'
+  BOT_COMMAND_LANGUAGE: z.string().default('de'),
   // Follow-up inline buttons after each agent response
   FOLLOWUP_BUTTONS_ENABLED: z.string().default('true').transform(toBool),
   // Local Telegram Bot API Server (optional — raises file limit from 20MB to 2GB)

@@ -3146,6 +3146,93 @@ function getRelativeTime(isoDate: string): string {
   return `${days}d ago`;
 }
 
+export async function handlePd(ctx: Context): Promise<void> {
+  if (!config.BOT_PD_ENABLED) {
+    await ctx.reply('pd-Workspace ist für diesen Bot nicht aktiviert.', { parse_mode: undefined });
+    return;
+  }
+
+  const text = ctx.message?.text || '';
+  const args = text.split(' ').slice(1);
+  const subcommand = args[0]?.toLowerCase();
+
+  if (!subcommand || subcommand === 'help') {
+    await ctx.reply(
+      'pd-Workspace — Product Development Agents\n\n' +
+      '/pd session — Aktive pd-Sessions anzeigen\n' +
+      '/pd council — Council Mode starten (mehrere Agent-Perspektiven)\n' +
+      '/pd outcome — Letztes gespeichertes Outcome anzeigen\n' +
+      '/pd help — Diese Hilfe\n\n' +
+      'Oder schreibe einfach deine Frage — pd-dexmaster erkennt den Intent automatisch.',
+      { parse_mode: undefined }
+    );
+    return;
+  }
+
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (!keyInfo) return;
+  const { sessionKey } = keyInfo;
+
+  if (subcommand === 'session') {
+    await sendToAgent(sessionKey, '/pd session — zeige aktive pd-Sessions', {
+      onProgress: (progressText) => {
+        messageSender.updateStream(ctx, progressText);
+      },
+      command: 'pd',
+    }).then(async (response) => {
+      await messageSender.sendMessage(ctx, response.text);
+    }).catch(async (error) => {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      await ctx.reply(`Fehler: ${errorMessage}`, { parse_mode: undefined });
+    });
+    return;
+  }
+
+  if (subcommand === 'council') {
+    await sendToAgent(sessionKey, '/pd council — starte Council Mode', {
+      onProgress: (progressText) => {
+        messageSender.updateStream(ctx, progressText);
+      },
+      command: 'pd',
+    }).then(async (response) => {
+      await messageSender.sendMessage(ctx, response.text);
+    }).catch(async (error) => {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      await ctx.reply(`Fehler: ${errorMessage}`, { parse_mode: undefined });
+    });
+    return;
+  }
+
+  if (subcommand === 'outcome') {
+    await sendToAgent(sessionKey, '/pd outcome — zeige letztes gespeichertes Outcome', {
+      onProgress: (progressText) => {
+        messageSender.updateStream(ctx, progressText);
+      },
+      command: 'pd',
+    }).then(async (response) => {
+      await messageSender.sendMessage(ctx, response.text);
+    }).catch(async (error) => {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      await ctx.reply(`Fehler: ${errorMessage}`, { parse_mode: undefined });
+    });
+    return;
+  }
+
+  // Unknown subcommand — forward to agent as-is
+  const userInput = args.join(' ');
+  await sendToAgent(sessionKey, `/pd ${userInput}`, {
+    onProgress: (progressText) => {
+      messageSender.updateStream(ctx, progressText);
+    },
+    command: 'pd',
+  }).then(async (response) => {
+    await messageSender.sendMessage(ctx, response.text);
+  }).catch(async (error) => {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    await ctx.reply(`Fehler: ${errorMessage}`, { parse_mode: undefined });
+  });
+}
+
 export async function executeExtract(ctx: Context, url: string, mode: ExtractMode, subtitleFormat?: SubtitleFormat): Promise<void> {
   if (!config.EXTRACT_ENABLED) {
     await replyFeatureDisabled(ctx, 'Extract');

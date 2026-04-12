@@ -12,7 +12,13 @@ function ensureDir(dir: string): void {
 }
 
 function todayStr(): string {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Berlin' }); // YYYY-MM-DD German time
+}
+
+function yesterdayStr(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return d.toLocaleDateString('en-CA', { timeZone: 'Europe/Berlin' });
 }
 
 function timestampStr(): string {
@@ -23,6 +29,25 @@ function transcriptPath(userId: string): string {
   const dir = path.join(TRANSCRIPT_DIR, todayStr());
   ensureDir(dir);
   return path.join(dir, `${userId}.md`);
+}
+
+/**
+ * Load yesterday's transcript for context continuity on day change.
+ * Returns the last ~4000 chars or empty string if none exists.
+ */
+export function loadPreviousDayTranscript(sessionKey: string): string {
+  try {
+    const filePath = path.join(TRANSCRIPT_DIR, yesterdayStr(), `${sessionKey}.md`);
+    if (!fs.existsSync(filePath)) return '';
+
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const maxChars = 4000;
+    const trimmed = content.length > maxChars ? content.slice(-maxChars) : content;
+
+    return `\n\n<previous-day-context>\nDies ist ein Auszug aus dem gestrigen Gespräch zur Kontextwahrung:\n${trimmed}\n</previous-day-context>`;
+  } catch {
+    return '';
+  }
 }
 
 /**

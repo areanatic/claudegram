@@ -42,9 +42,11 @@ function findAncestorWithMarkers(startDir: string): string | null {
   let current = path.resolve(startDir);
   while (true) {
     const hasClaude = exists(path.join(current, 'CLAUDE.md'));
-    const hasRegistry = exists(path.join(current, '00_NEXUS_CORE', 'agent_registry.json'));
-    const hasContext = exists(path.join(current, '99_META', 'nexus_context_LIVE.json'));
-    if (hasClaude && hasRegistry && hasContext) return current;
+    const hasSoul = exists(path.join(current, 'soul.md'));
+    const hasPdRegistry = exists(path.join(current, '.claude', 'agents', 'pd', '_registry.json'));
+    // Legacy markers (v2.x — may not exist in v3)
+    const hasLegacyRegistry = exists(path.join(current, '00_NEXUS_CORE', 'agent_registry.json'));
+    if (hasClaude && hasSoul && (hasPdRegistry || hasLegacyRegistry)) return current;
     const parent = path.dirname(current);
     if (parent === current) break;
     current = parent;
@@ -84,7 +86,9 @@ export function buildNexusBridgePrompt(cwd: string): string {
   if (!nexusRoot) return '';
 
   // --- Canonical sources (derived, not hardcoded) ---
-  const registry = readJsonSafe<NexusRegistry>(path.join(nexusRoot, '00_NEXUS_CORE', 'agent_registry.json'));
+  // v3: pd-registry is the source of truth. Legacy path fallback for compatibility.
+  const registry = readJsonSafe<NexusRegistry>(path.join(nexusRoot, '.claude', 'agents', 'pd', '_registry.json'))
+    ?? readJsonSafe<NexusRegistry>(path.join(nexusRoot, '00_NEXUS_CORE', 'agent_registry.json'));
   const soulMd = config.BOT_SOUL_FILE
     ? readTextSafe(config.BOT_SOUL_FILE, 2000)
     : readTextSafe(path.join(nexusRoot, 'soul.md'), 2000);
@@ -136,5 +140,11 @@ ${chatInstruction || '[missing]'}
 
 NEXUS CLAUDE.md excerpt:
 ${claudeMd || '[missing]'}
+${
+  // pd-System verfügbar (wenn aktiviert)
+  process.env.BOT_PD_ENABLED === 'true'
+    ? '\n\n## pd-Agents verfügbar\nFür Product Development: pd-dexmaster ist aktiv. Trigger: "challenge", "council", "sparring", "@pd:"'
+    : ''
+}
 `;
 }
