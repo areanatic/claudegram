@@ -3233,6 +3233,81 @@ export async function handlePd(ctx: Context): Promise<void> {
   });
 }
 
+export async function handleWiki(ctx: Context): Promise<void> {
+  const text = ctx.message?.text || '';
+  const subcommand = text.split(' ')[1]?.toLowerCase();
+  const nexusRoot = findDefaultNexusRoot();
+  const SYNTHESIZER = nexusRoot ? path.join(nexusRoot, '.nexus-memory', 'nexus-wiki-synthesizer.sh') : null;
+  const OMI_DIR = '/Volumes/AstronOne/shared-memory/omi/projects';
+  const WIKI_DRAFTS = '/Volumes/AstronOne/shared-memory/nexus/wiki/drafts';
+  const STATE_FILE = nexusRoot ? path.join(nexusRoot, '.nexus-memory', 'wiki-synthesizer-state.txt') : null;
+  const WHITELIST = ['nexus', 'dexhub', 'ai-gilde'];
+
+  if (!subcommand || subcommand === 'status') {
+    // Count unprocessed transcripts
+    let totalTranscripts = 0;
+    let processedCount = 0;
+    const processedFiles = new Set<string>();
+    if (STATE_FILE && fs.existsSync(STATE_FILE)) {
+      fs.readFileSync(STATE_FILE, 'utf8').split('\n').filter(Boolean).forEach(f => processedFiles.add(f));
+    }
+    for (const project of WHITELIST) {
+      const dir = path.join(OMI_DIR, project);
+      if (!fs.existsSync(dir)) continue;
+      const files = fs.readdirSync(dir).filter(f => f.endsWith('.md'));
+      totalTranscripts += files.length;
+      files.forEach(f => { if (processedFiles.has(path.join(dir, f))) processedCount++; });
+    }
+    const unprocessed = totalTranscripts - processedCount;
+
+    // Count drafts
+    let draftCount = 0;
+    let oldestDraft = '';
+    if (fs.existsSync(WIKI_DRAFTS)) {
+      const drafts = fs.readdirSync(WIKI_DRAFTS).filter(f => f.endsWith('.md')).sort();
+      draftCount = drafts.length;
+      if (drafts.length > 0) oldestDraft = drafts[0];
+    }
+
+    const lines = [
+      '📚 Wiki Synthesizer Status',
+      '',
+      `📝 OMI Transkripte (Whitelist): ${totalTranscripts} total, ${unprocessed} unverarbeitet`,
+      `📋 Drafts pending Review: ${draftCount}`,
+      oldestDraft ? `   Ältester: ${oldestDraft.replace('.md', '')}` : '',
+      '',
+      '/wiki update — jetzt synthetisieren',
+    ].filter(l => l !== '');
+
+    await ctx.reply(lines.join('\n'), { parse_mode: undefined });
+    return;
+  }
+
+  if (subcommand === 'update') {
+    if (!SYNTHESIZER || !fs.existsSync(SYNTHESIZER)) {
+      await ctx.reply('❌ Synthesizer nicht gefunden: ' + (SYNTHESIZER || 'unknown path'), { parse_mode: undefined });
+      return;
+    }
+
+    await ctx.reply('🔄 Wiki Synthesizer gestartet... (läuft im Hintergrund)', { parse_mode: undefined });
+
+    // Run synthesizer asynchronously, cap output
+    const child = spawn(SYNTHESIZER, [], { detached: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    child.stdout.on('data', (data: Buffer) => { output += data.toString(); });
+    child.stderr.on('data', (data: Buffer) => { output += data.toString(); });
+
+    child.on('close', async (code) => {
+      const preview = output.slice(-1000);
+      const status = code === 0 ? '✅ Fertig' : `⚠️ Exit ${code}`;
+      await ctx.reply(`${status}\n\n${preview || '(kein Output)'}`, { parse_mode: undefined }).catch(() => {});
+    });
+    return;
+  }
+
+  await ctx.reply('/wiki status — Übersicht\n/wiki update — Synthesizer jetzt starten', { parse_mode: undefined });
+}
+
 export async function executeExtract(ctx: Context, url: string, mode: ExtractMode, subtitleFormat?: SubtitleFormat): Promise<void> {
   if (!config.EXTRACT_ENABLED) {
     await replyFeatureDisabled(ctx, 'Extract');

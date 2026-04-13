@@ -53,6 +53,7 @@ import {
   handleResetCallback,
   handleInbox,
   handleInboxCallback,
+  handleWiki,
 } from './handlers/command.handler.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
@@ -225,6 +226,7 @@ export async function createBot(): Promise<Bot> {
   if (config.EXTRACT_ENABLED) {
     bot.command('extract', handleExtract);
   }
+  bot.command('wiki', handleWiki);
 
   // Callback query handler for inline keyboards
   bot.on('callback_query:data', async (ctx) => {
