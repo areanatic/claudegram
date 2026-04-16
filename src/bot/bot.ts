@@ -157,10 +157,11 @@ export async function createBot(): Promise<Bot> {
   // Apply auth middleware to all updates
   bot.use(authMiddleware);
 
-  // /cancel, /reset, and /ping fire BEFORE sequentialize so they bypass per-chat ordering.
+  // /cancel, /reset, /softreset, and /ping fire BEFORE sequentialize so they bypass per-chat ordering.
   // This lets them interrupt a running query without waiting for it to finish.
   bot.command('cancel', handleCancel);
   bot.command('softreset', handleReset);
+  bot.command('reset', handleReset); // alias for /softreset
   bot.command('ping', handlePing);
 
   // Sequentialize: same-chat updates are processed in order.
@@ -287,13 +288,10 @@ export async function createBot(): Promise<Bot> {
     const replyTo = ctx.message?.reply_to_message;
     const doc = ctx.message?.document;
 
-    // 1. Audio transcribe ForceReply path
-    if (replyTo && replyTo.from?.is_bot && doc?.mime_type?.startsWith('audio/')) {
-      const replyText = (replyTo as { text?: string }).text || '';
-      if (replyText.includes('Transcribe Audio')) {
-        await handleTranscribeDocument(ctx);
-        return;
-      }
+    // 1. Audio documents → auto-transcribe (no ForceReply required)
+    if (doc?.mime_type?.startsWith('audio/')) {
+      await handleTranscribeDocument(ctx);
+      return;
     }
 
     // 2. Image documents → existing photo handler

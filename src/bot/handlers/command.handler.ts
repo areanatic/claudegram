@@ -2628,19 +2628,36 @@ async function transcribeAndSend(
   }
 
   const chatId = ctx.chat?.id;
-  if (!chatId) return;
+  if (!chatId) {
+    console.warn('[transcribeAndSend] No chatId — aborting');
+    return;
+  }
 
-  const ackMsg = await ctx.reply('🎤 Transcribing...', { parse_mode: undefined });
+  let ackMsg: Awaited<ReturnType<typeof ctx.reply>>;
+  try {
+    ackMsg = await ctx.reply('🎤 Transcribing...', { parse_mode: undefined });
+  } catch (ackErr) {
+    console.error('[transcribeAndSend] Failed to send ack:', ackErr);
+    return;
+  }
   let tempFilePath: string | null = null;
 
   try {
     const file = await ctx.api.getFile(fileId);
     if (!file.file_path) throw new Error('Telegram did not return file_path.');
 
-    const ext = mimeHint?.includes('ogg') ? '.ogg'
+    // Prefer actual extension from Telegram's file_path (most reliable),
+    // fall back to MIME hint detection.
+    const KNOWN_AUDIO_EXTS = ['.ogg', '.oga', '.mp3', '.mp4', '.m4a', '.wav', '.webm', '.opus', '.flac'];
+    const telegramExt = path.extname(file.file_path).toLowerCase();
+    console.log(`[transcribeAndSend] file_path=${file.file_path} telegramExt=${telegramExt} mimeHint=${mimeHint}`);
+    const ext = KNOWN_AUDIO_EXTS.includes(telegramExt) ? telegramExt
+      : mimeHint?.includes('ogg') ? '.ogg'
       : mimeHint?.includes('mp3') ? '.mp3'
       : mimeHint?.includes('wav') ? '.wav'
-      : mimeHint?.includes('mp4') ? '.m4a'
+      : mimeHint?.includes('mp4') || mimeHint?.includes('m4a') ? '.m4a'
+      : mimeHint?.includes('opus') ? '.opus'
+      : mimeHint?.includes('flac') ? '.flac'
       : '.oga';
     tempFilePath = path.join(os.tmpdir(), `nexusgram_transcribe_${Date.now()}${ext}`);
 
@@ -2725,14 +2742,13 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
     return;
   }
 
-  const replyTo = ctx.message?.reply_to_message;
-  if (!replyTo || !replyTo.from?.is_bot) return;
-  const replyText = (replyTo as { text?: string }).text || '';
-  if (!replyText.includes('Transcribe Audio')) return;
-
   const audio = ctx.message?.audio;
-  if (!audio) return;
+  if (!audio) {
+    console.warn('[TranscribeAudio] Handler fired but ctx.message.audio is undefined');
+    return;
+  }
 
+  console.log(`[TranscribeAudio] file_id=${audio.file_id} mime=${audio.mime_type} size=${audio.file_size}`);
   await transcribeAndSend(ctx, audio.file_id, audio.mime_type);
 }
 
@@ -2744,11 +2760,6 @@ export async function handleTranscribeDocument(ctx: Context): Promise<void> {
     await replyFeatureDisabled(ctx, 'Transcribe');
     return;
   }
-
-  const replyTo = ctx.message?.reply_to_message;
-  if (!replyTo || !replyTo.from?.is_bot) return;
-  const replyText = (replyTo as { text?: string }).text || '';
-  if (!replyText.includes('Transcribe Audio')) return;
 
   const doc = ctx.message?.document;
   if (!doc || !doc.mime_type?.startsWith('audio/')) return;

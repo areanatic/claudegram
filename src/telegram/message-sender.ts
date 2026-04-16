@@ -39,6 +39,31 @@ interface StreamState {
   rateLimitedUntil: number;
 }
 
+/**
+ * Split text on [SPLIT] markers, but only outside of code blocks (``` ... ```).
+ * Returns the original single-element array if no valid split points found.
+ */
+function splitOnSplitMarker(text: string): string[] {
+  const lines = text.split('\n');
+  const parts: string[] = [];
+  let current = '';
+  let inCodeBlock = false;
+
+  for (const line of lines) {
+    if (line.trim().startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+      current += line + '\n';
+    } else if (!inCodeBlock && line.trim() === '[SPLIT]') {
+      if (current.trim()) parts.push(current.trim());
+      current = '';
+    } else {
+      current += line + '\n';
+    }
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts.filter(p => p.length > 0);
+}
+
 const TYPING_INTERVAL_MS = 4000; // Send typing every 4 seconds
 const MIN_EDIT_INTERVAL_MS = 10000; // Minimum time between message edits (~5 edits/min safe zone)
 
@@ -51,6 +76,18 @@ export class MessageSender {
    * - Long content or tables: Telegraph page link
    */
   async sendMessage(ctx: Context, text: string): Promise<void> {
+    // Handle [SPLIT] marker — send each part as a separate Telegram message bubble
+    // Code-block-aware: [SPLIT] inside ``` blocks is ignored
+    if (text.includes('[SPLIT]')) {
+      const parts = splitOnSplitMarker(text);
+      if (parts.length > 1) {
+        for (const part of parts) {
+          await this.sendMessage(ctx, part);
+        }
+        return;
+      }
+    }
+
     const keyInfo = getSessionKeyFromCtx(ctx);
     // Check if we should use Telegraph for this content
     if (shouldUseTelegraph(text, keyInfo?.sessionKey)) {
@@ -390,6 +427,26 @@ export class MessageSender {
     console.log(`[Stream] finishStreaming: chat=${chatId}, content length=${finalContent.length}`);
 
     const state = this.streamStates.get(sessionKey);
+
+    // Handle [SPLIT] — delete streaming placeholder, send each part as a separate bubble
+    // Code-block-aware: [SPLIT] inside ``` blocks is ignored
+    if (finalContent.includes('[SPLIT]')) {
+      const splitParts = splitOnSplitMarker(finalContent);
+      if (splitParts.length > 1) {
+        if (state) {
+          this.stopTypingIndicator(state);
+          this.stopSpinnerAnimation(state);
+          if (state.messageId) {
+            try { await ctx.api.deleteMessage(chatId, state.messageId); } catch { /* ignore */ }
+          }
+          this.streamStates.delete(sessionKey);
+        }
+        for (const part of splitParts) {
+          await this.sendMessage(ctx, part);
+        }
+        return;
+      }
+    }
 
     if (state) {
       // Stop typing indicator and spinner

@@ -187,7 +187,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
         });
 
         // Send voice reply FIRST (primary output in voice mode)
-        await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
+        await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage, voiceMode: true });
 
         // Send text as secondary reference (shorter in voice mode)
         await messageSender.sendMessage(ctx, response.text);

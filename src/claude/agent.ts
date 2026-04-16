@@ -29,6 +29,7 @@ import {
 import { recordTranscript, loadPreviousDayTranscript } from './transcript-logger.js';
 import { buildNexusBridgePrompt } from '../nexus/bridge.js';
 import { injectContext, saveMemory } from '../memory/nexus-memory.js';
+import { logConversationTurn } from '../memory/conversation-logger.js';
 
 export interface AgentUsage {
   inputTokens: number;
@@ -92,7 +93,19 @@ const CORE_GUIDELINES = `You are ${config.BOT_NAME}, an AI assistant helping via
 Guidelines:
 - Show relevant code snippets when helpful, but keep them short
 - If a task requires multiple steps, execute them and summarize what you did
-- When you can't do something, explain why briefly`;
+- When you can't do something, explain why briefly
+
+Copy-Ready Content Rule:
+ONLY use [SPLIT] when the user EXPLICITLY asks for a text to copy — e.g. "write me a WhatsApp message", "give me an email", "what should I text", "gib mir einen Text zum Kopieren".
+- Send context/explanation first, then [SPLIT], then the copyable text in a code block (Telegram shows a one-tap Copy button)
+- NEVER use [SPLIT] for normal responses, summaries, analyses, lists or structured answers — those stay as ONE message with headings and bullet points
+
+Example (only for explicit copy requests):
+Hier ist die WhatsApp-Nachricht an Ben:
+[SPLIT]
+\`\`\`
+Hey Ben, kurze Frage wegen der Besichtigung...
+\`\`\``;
 
 const TELEGRAPH_FORMATTING = `
 
@@ -791,6 +804,9 @@ export async function sendToAgent(
       content: fullText,
     });
     recordTranscript(sessionKey, 'assistant', fullText);
+
+    // Log conversation turn to daily file for nightly Ollama synthesis → L2 Memory
+    logConversationTurn(config.BOT_NAME, prompt, fullText);
   }
 
   conversationHistory.set(sessionKey, history);

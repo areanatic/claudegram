@@ -52,6 +52,8 @@ function truncateToMax(text: string, maxChars: number): string {
 export interface VoiceReplyOptions {
   /** Override detected language for TTS (ISO 639-1 code, e.g. "de") */
   language?: string;
+  /** When true (voice-first mode), skip the min-length check — voice replies are intentionally short */
+  voiceMode?: boolean;
 }
 
 export async function maybeSendVoiceReply(ctx: Context, text: string, options?: VoiceReplyOptions): Promise<void> {
@@ -65,7 +67,8 @@ export async function maybeSendVoiceReply(ctx: Context, text: string, options?: 
   if (looksLikeError(text)) return;
 
   const cleaned = stripMarkdown(text);
-  if (cleaned.length < 200) return;
+  const minChars = options?.voiceMode ? 10 : 200;
+  if (cleaned.length < minChars) return;
 
   const safeText = truncateToMax(cleaned, config.TTS_MAX_CHARS);
   if (!safeText) return;

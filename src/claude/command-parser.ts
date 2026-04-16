@@ -62,7 +62,8 @@ export function getAvailableCommands(): string {
         '• `/continue` \\- Resume most recent session',
         '• `/sessions` \\- List all sessions',
         '• `/teleport` \\- Move session to terminal \\(forked\\)',
-        '• `/clear` \\- Clear session and start fresh',
+        '• `/clear` \\- Clear session and start fresh \\(with confirmation\\)',
+        '• `/softreset` or `/reset` \\- Instant reset \\(cancel \\+ clear, no confirmation\\)',
         '• `/status` \\- Show current session info',
       ],
     },
@@ -71,6 +72,7 @@ export function getAvailableCommands(): string {
       commands: [
         '• `/file <path>` \\- Download a file from project',
         '• `/telegraph <path>` \\- View markdown with Instant View',
+        ...(config.DOCUMENT_INBOX_ENABLED ? ['• `/inbox` \\- View and manage document inbox'] : []),
       ],
     },
   ];
@@ -115,6 +117,7 @@ export function getAvailableCommands(): string {
       '• `/cancel` \\- Cancel current request',
       '• `/mode` \\- Toggle streaming mode',
       '• `/terminalui` \\- Toggle terminal\\-style display',
+      '• `/wiki` \\- Wiki synthesizer status and update',
     ],
   });
 

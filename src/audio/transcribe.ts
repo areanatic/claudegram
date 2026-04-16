@@ -1,9 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import OpenAI, { toFile } from 'openai';
 import { config } from '../config.js';
 import { downloadFileSecure, getTelegramFileUrl } from '../utils/download.js';
 
-const GROQ_WHISPER_ENDPOINT = 'https://api.groq.com/openai/v1/audio/transcriptions';
 const GROQ_WHISPER_MODEL = 'whisper-large-v3-turbo';
 
 export interface TranscribeOptions {
@@ -35,41 +35,33 @@ const LANGUAGE_NAME_TO_CODE: Record<string, string> = {
   lithuanian: 'lt', latvian: 'lv', estonian: 'et',
 };
 
+function getGroqClient(): OpenAI {
+  if (!config.GROQ_API_KEY) {
+    throw new Error('GROQ_API_KEY not configured. Set it in .env to enable voice transcription.');
+  }
+  return new OpenAI({
+    apiKey: config.GROQ_API_KEY,
+    baseURL: 'https://api.groq.com/openai/v1',
+  });
+}
+
 /**
  * Transcribe an audio file with auto-detected language using verbose_json format.
  * Returns transcript text, detected language name, and ISO 639-1 code.
  */
 export async function transcribeFileWithLanguage(filePath: string, options?: TranscribeOptions): Promise<TranscribeResult> {
-  if (!config.GROQ_API_KEY) {
-    throw new Error('GROQ_API_KEY not configured. Set it in .env to enable voice transcription.');
-  }
-
-  const timeoutMs = options?.timeoutMs ?? config.VOICE_TIMEOUT_MS;
-  const fileBuffer = fs.readFileSync(filePath);
+  const groq = getGroqClient();
   const fileName = path.basename(filePath);
+  const fileStream = fs.createReadStream(filePath);
 
-  const mimeType = fileName.endsWith('.oga') ? 'audio/ogg' : 'audio/ogg';
-  const formData = new FormData();
-  formData.append('file', new Blob([fileBuffer], { type: mimeType }), fileName);
-  formData.append('model', GROQ_WHISPER_MODEL);
-  formData.append('response_format', 'verbose_json');
-  // Omit 'language' parameter to enable auto-detection
+  console.log(`[transcribeFileWithLanguage] fileName=${fileName} size=${fs.statSync(filePath).size}`);
 
-  const response = await fetch(GROQ_WHISPER_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${config.GROQ_API_KEY}`,
-    },
-    body: formData,
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  const result = await groq.audio.transcriptions.create({
+    file: await toFile(fileStream, fileName),
+    model: GROQ_WHISPER_MODEL,
+    response_format: 'verbose_json',
+  }) as { text?: string; language?: string };
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`Groq Whisper API error ${response.status}: ${body.slice(0, 300)}`);
-  }
-
-  const result = (await response.json()) as { text?: string; language?: string };
   const transcript = (result.text || '').trim();
 
   if (!transcript && !options?.allowEmpty) {
@@ -83,41 +75,23 @@ export async function transcribeFileWithLanguage(filePath: string, options?: Tra
 }
 
 /**
- * Transcribe an audio file using the Groq Whisper API directly via fetch.
- * No Python subprocess - much faster, especially on first call.
+ * Transcribe an audio file using the Groq Whisper API via OpenAI SDK.
  * Uses fixed language from config (backward-compatible).
  */
 export async function transcribeFile(filePath: string, options?: TranscribeOptions): Promise<string> {
-  if (!config.GROQ_API_KEY) {
-    throw new Error('GROQ_API_KEY not configured. Set it in .env to enable voice transcription.');
-  }
-
-  const timeoutMs = options?.timeoutMs ?? config.VOICE_TIMEOUT_MS;
-  const fileBuffer = fs.readFileSync(filePath);
+  const groq = getGroqClient();
   const fileName = path.basename(filePath);
+  const fileStream = fs.createReadStream(filePath);
 
-  const mimeType = fileName.endsWith('.oga') ? 'audio/ogg' : 'audio/ogg';
-  const formData = new FormData();
-  formData.append('file', new Blob([fileBuffer], { type: mimeType }), fileName);
-  formData.append('model', GROQ_WHISPER_MODEL);
-  formData.append('language', config.VOICE_LANGUAGE);
-  formData.append('response_format', 'json');
+  console.log(`[transcribeFile] fileName=${fileName} size=${fs.statSync(filePath).size}`);
 
-  const response = await fetch(GROQ_WHISPER_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${config.GROQ_API_KEY}`,
-    },
-    body: formData,
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  const result = await groq.audio.transcriptions.create({
+    file: await toFile(fileStream, fileName),
+    model: GROQ_WHISPER_MODEL,
+    language: config.VOICE_LANGUAGE,
+    response_format: 'json',
+  }) as { text?: string };
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`Groq Whisper API error ${response.status}: ${body.slice(0, 300)}`);
-  }
-
-  const result = (await response.json()) as { text?: string };
   const transcript = (result.text || '').trim();
 
   if (!transcript && !options?.allowEmpty) {

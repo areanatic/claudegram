@@ -161,8 +161,10 @@ class SessionManager {
     if (existing) {
       existing.workingDirectory = directory;
       existing.lastActivity = new Date();
-      // Save updated session
-      sessionHistory.saveSession(sessionKey, existing.conversationId, directory, '', existing.claudeSessionId);
+      // Clear claudeSessionId on project switch — old session ID must not carry over to new project context
+      existing.claudeSessionId = undefined;
+      // Save updated session (claudeSessionId intentionally undefined)
+      sessionHistory.saveSession(sessionKey, existing.conversationId, directory, '', undefined);
       return existing;
     }
     return this.createSession(sessionKey, directory);
