@@ -30,6 +30,22 @@ import { recordTranscript, loadPreviousDayTranscript } from './transcript-logger
 import { buildNexusBridgePrompt } from '../nexus/bridge.js';
 import { injectContext, saveMemory } from '../memory/nexus-memory.js';
 import { logConversationTurn } from '../memory/conversation-logger.js';
+import { isPrivate } from '../memory/privacy-state.js';
+
+/**
+ * Privacy Mode Phase 1 — neutralizing system-prompt suffix.
+ * Appended to the system prompt when the current sessionKey is in private mode.
+ * Concept: shared-memory/nexus/concept_privacy_mode_2026-04-19.md
+ */
+const PRIVACY_MODE_PROMPT = `
+
+PRIVACY MODE ACTIVE (Phase 1):
+- Do NOT reference personal memory (no "wie du in Session X sagtest…", no names of family members, no DHL-specific details, no project code-names from stored memory).
+- Do NOT use casual/nicknamed address ("Ash"); stay neutral and professional.
+- Do NOT surface examples from the user's personal ecosystem unless the user explicitly reintroduces them in THIS turn.
+- Do NOT emit follow-up buttons that would trigger personal follow-up actions.
+- Treat this conversation as if it were a fresh, unpersonalized session. The user has toggled /private on because this topic should not bleed into persistent memory or public artefacts.
+`;
 
 export interface AgentUsage {
   inputTokens: number;
@@ -488,6 +504,8 @@ export async function sendToAgent(
                 'semantic',
                 config.BOT_MEMORY_PROJECT || 'nexus',
                 'precompact,telegram',
+                'nexusgram',
+                isPrivate(sessionKey) ? 'private' : 'public',
               );
             }
           } catch {
@@ -579,7 +597,11 @@ export async function sendToAgent(
     }
 
     const nexusBridgePrompt = buildNexusBridgePrompt(cwd);
-    const memoryContext = injectContext(prompt, config.BOT_MEMORY_PROJECT);
+    const sessionIsPrivate = isPrivate(sessionKey);
+    // In private mode we still allow the bot to see private memories the user
+    // has stored in this same session, but we exclude them from retrieval when
+    // the session is public. The tone-neutralizer below further prevents leakage.
+    const memoryContext = injectContext(prompt, config.BOT_MEMORY_PROJECT, sessionIsPrivate);
     // Load previous day's transcript for context continuity (only on fresh sessions)
     const previousDayContext = existingSessionId ? '' : loadPreviousDayTranscript(sessionKey);
 
@@ -592,7 +614,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${previousDayContext}`,
+        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${previousDayContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
       },
       settingSources: ['project', 'user'] as SettingSource[],
       model: effectiveModel,
@@ -805,8 +827,15 @@ export async function sendToAgent(
     });
     recordTranscript(sessionKey, 'assistant', fullText);
 
-    // Log conversation turn to daily file for nightly Ollama synthesis → L2 Memory
-    logConversationTurn(config.BOT_NAME, prompt, fullText);
+    // Log conversation turn to daily file for nightly Ollama synthesis → L2 Memory.
+    // In private mode the turn is split into a *.private.log file which the
+    // synthesizer never consumes (see maintenance.sh glob pattern).
+    logConversationTurn(
+      config.BOT_NAME,
+      prompt,
+      fullText,
+      isPrivate(sessionKey) ? 'private' : 'public',
+    );
   }
 
   conversationHistory.set(sessionKey, history);

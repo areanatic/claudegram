@@ -22,11 +22,21 @@ const MAX_BOT_CHARS = 800;
 /**
  * Append one conversation turn (user + bot) to the daily log file.
  * Never throws — must not crash the bot.
+ *
+ * When `privacy === 'private'`:
+ *   - a split file `{date}_{bot}.private.log` is used (never consumed by the
+ *     nightly synthesizer) so private content is never fed to Ollama,
+ *   - each entry is prefixed with `[PRIVACY=PRIVATE]` for easy grep/audit.
+ *
+ * maintenance.sh only globs `${YESTERDAY}_*.log`, so `*.private.log` files
+ * are skipped automatically. The marker line provides defense-in-depth if
+ * the globbing pattern ever changes.
  */
 export function logConversationTurn(
   botName: string,
   userMessage: string,
-  botResponse: string
+  botResponse: string,
+  privacy: 'public' | 'private' = 'public',
 ): void {
   // Fire-and-forget async write — never blocks event loop, never crashes bot
   setImmediate(() => {
@@ -36,15 +46,17 @@ export function logConversationTurn(
       const now = new Date();
       const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`; // YYYY-MM-DD local time
       const safeName = botName.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
-      const logPath = path.join(LOG_DIR, `${today}_${safeName}.log`);
+      const suffix = privacy === 'private' ? '.private.log' : '.log';
+      const logPath = path.join(LOG_DIR, `${today}_${safeName}${suffix}`);
 
       const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
       const userPreview = userMessage.slice(0, MAX_USER_CHARS).replace(/\n/g, ' ').trim();
       const botPreview = botResponse.slice(0, MAX_BOT_CHARS).replace(/\n/g, ' ').trim();
 
+      const marker = privacy === 'private' ? '[PRIVACY=PRIVATE] ' : '';
       const entry = [
-        `[${timestamp}] User: ${userPreview}`,
-        `[${timestamp}] Bot: ${botPreview}`,
+        `[${timestamp}] ${marker}User: ${userPreview}`,
+        `[${timestamp}] ${marker}Bot: ${botPreview}`,
         '---',
         '',
       ].join('\n');

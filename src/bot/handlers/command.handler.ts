@@ -51,6 +51,7 @@ import { sanitizeError, sanitizePath } from '../../utils/sanitize.js';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { findDefaultNexusRoot } from '../../nexus/bridge.js';
+import { isPrivate, setPrivate, setPublic, getStatus } from '../../memory/privacy-state.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -3462,3 +3463,77 @@ export async function executeExtract(ctx: Context, url: string, mode: ExtractMod
     }
   }
 }
+
+/**
+ * /private on | off | status — Privacy Mode Phase 1
+ *
+ * Per-chat (and per-forum-topic) toggle. When `on`:
+ *   - new memories saved via this session are tagged privacy='private',
+ *   - retrieval / memory-context skips private rows unless the session itself
+ *     is currently private,
+ *   - the conversation log is written to a *.private.log file that the
+ *     nightly Ollama synthesizer does NOT consume,
+ *   - the system prompt gets a neutralizing suffix that tells the model to
+ *     avoid personal references.
+ *
+ * Concept doc: shared-memory/nexus/concept_privacy_mode_2026-04-19.md
+ */
+export async function handlePrivate(ctx: Context): Promise<void> {
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (!keyInfo) return;
+  const { sessionKey } = keyInfo;
+
+  const raw = (ctx.message?.text || '').trim();
+  // Strip leading "/private" (and optional @botname suffix) + args
+  const afterCmd = raw.replace(/^\/private(@\S+)?\s*/i, '').trim().toLowerCase();
+  const arg = afterCmd.split(/\s+/)[0] || 'status';
+
+  if (arg === 'on') {
+    const rec = setPrivate(sessionKey);
+    await replyMd(
+      ctx,
+      `🔒 *Privacy Mode: ON*\n\n` +
+      `This chat is now private since ${esc(rec.since)}\\.\n\n` +
+      `• new memories will be tagged \`private\` and stay out of the wiki\n` +
+      `• conversation log goes to a \\.private\\.log file \\(skipped by synthesizer\\)\n` +
+      `• the bot will avoid personal references in replies\n\n` +
+      `Send /private off to return to public mode\\.`,
+    );
+    return;
+  }
+
+  if (arg === 'off') {
+    const was = getStatus(sessionKey);
+    setPublic(sessionKey);
+    const sinceNote = was ? ` \\(was private since ${esc(was.since)}\\)` : '';
+    await replyMd(
+      ctx,
+      `🔓 *Privacy Mode: OFF*${sinceNote}\n\n` +
+      `This chat is public again\\. New turns are logged normally and eligible for wiki synthesis\\.\n\n` +
+      `⚠️ Turns captured during private mode stay tagged private — they are NOT retroactively published\\.`,
+    );
+    return;
+  }
+
+  // status (default)
+  const rec = getStatus(sessionKey);
+  if (rec?.mode === 'private') {
+    await replyMd(
+      ctx,
+      `🔒 *Privacy Mode: ON*\n\n` +
+      `Active since ${esc(rec.since)}\\.\n\n` +
+      `Use /private off to return to public mode\\.`,
+    );
+  } else {
+    await replyMd(
+      ctx,
+      `🔓 *Privacy Mode: OFF* \\(default\\)\n\n` +
+      `Use /private on to temporarily isolate this chat from memory / wiki / personal tone\\.`,
+    );
+  }
+}
+
+// Re-export the state helpers so other modules (message handler, agent, etc.)
+// can import a single symbol via the barrel if they prefer. isPrivate is the
+// stable public contract.
+export { isPrivate };

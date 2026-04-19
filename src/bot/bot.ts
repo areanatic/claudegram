@@ -54,6 +54,7 @@ import {
   handleInbox,
   handleInboxCallback,
   handleWiki,
+  handlePrivate,
 } from './handlers/command.handler.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
@@ -228,6 +229,7 @@ export async function createBot(): Promise<Bot> {
     bot.command('extract', handleExtract);
   }
   bot.command('wiki', handleWiki);
+  bot.command('private', handlePrivate);
 
   // Callback query handler for inline keyboards
   bot.on('callback_query:data', async (ctx) => {
