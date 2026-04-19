@@ -60,9 +60,28 @@ export async function transcribeFileWithLanguage(filePath: string, options?: Tra
     file: await toFile(fileStream, fileName),
     model: GROQ_WHISPER_MODEL,
     response_format: 'verbose_json',
-  }) as { text?: string; language?: string };
+  }) as { text?: string; language?: string; duration?: number; segments?: Array<{ no_speech_prob?: number; avg_logprob?: number }> };
 
   const transcript = (result.text || '').trim();
+
+  // Diagnostic log: capture Whisper confidence signals so we can detect
+  // hallucinated transcripts (e.g. from corrupt OGG headers) in the future.
+  // Low avg_logprob (< -1.0) or high no_speech_prob (> 0.6) strongly suggests
+  // the audio had no real speech content and Whisper is hallucinating.
+  const firstSeg = result.segments?.[0];
+  const avgLogprob = firstSeg?.avg_logprob;
+  const noSpeechProb = firstSeg?.no_speech_prob;
+  console.log(
+    `[transcribeFileWithLanguage] result: lang=${result.language} duration=${result.duration}s ` +
+    `len=${transcript.length} avg_logprob=${avgLogprob?.toFixed(3) ?? 'n/a'} ` +
+    `no_speech_prob=${noSpeechProb?.toFixed(3) ?? 'n/a'}`
+  );
+  if (typeof avgLogprob === 'number' && avgLogprob < -1.0) {
+    console.warn(`[transcribeFileWithLanguage] LOW CONFIDENCE transcript (avg_logprob=${avgLogprob.toFixed(3)}) — likely hallucination. Preview: "${transcript.slice(0, 80)}"`);
+  }
+  if (typeof noSpeechProb === 'number' && noSpeechProb > 0.6) {
+    console.warn(`[transcribeFileWithLanguage] HIGH NO-SPEECH probability (${noSpeechProb.toFixed(3)}) — audio likely contains no speech. Preview: "${transcript.slice(0, 80)}"`);
+  }
 
   if (!transcript && !options?.allowEmpty) {
     throw new Error('Empty transcription result');

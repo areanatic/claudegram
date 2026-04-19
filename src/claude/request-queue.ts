@@ -23,7 +23,14 @@ export function setAbortController(sessionKey: string, controller: AbortControll
   activeAbortControllers.set(sessionKey, controller);
 }
 
-export function clearAbortController(sessionKey: string): void {
+export function clearAbortController(sessionKey: string, expected?: AbortController): void {
+  if (expected) {
+    const current = activeAbortControllers.get(sessionKey);
+    if (current && current !== expected) {
+      // A newer controller owns this slot — do not clear it.
+      return;
+    }
+  }
   activeAbortControllers.delete(sessionKey);
 }
 
@@ -141,6 +148,12 @@ async function processQueue(sessionKey: string): Promise<void> {
   processingFlags.set(sessionKey, true);
   const request = queue.shift()!;
 
+  // Defense-in-depth: ensure no stale cancel flag leaks from the previous
+  // request onto this fresh handler execution. finally also clears it, but
+  // clearing here guarantees a clean slate even if the previous finally
+  // ran out of order or was bypassed by an uncaught error upstream.
+  clearCancelled(sessionKey);
+
   try {
     const result = await request.handler();
     request.resolve(result);
@@ -176,12 +189,16 @@ export async function cancelRequest(sessionKey: string): Promise<boolean> {
     return true;
   }
 
-  // Fallback to AbortController if no query stored
+  // Fallback to AbortController if no query stored.
+  // NOTE: this branch is the race-window case (handler set a controller but
+  // hasn't yet called setActiveQuery). Logging explicitly so we can tell
+  // later whether a "Request cancelled" came from /cancel vs. elsewhere.
   const controller = activeAbortControllers.get(sessionKey);
   if (controller) {
+    console.log(`[cancelRequest] Fallback abort (no active query yet) for ${sessionKey}`);
     cancelledChats.add(sessionKey);
     controller.abort();
-    clearAbortController(sessionKey);
+    clearAbortController(sessionKey, controller);
     return true;
   }
 
