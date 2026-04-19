@@ -216,7 +216,35 @@ Regeln:
 - Der [BUTTONS: ...] Block wird automatisch entfernt und als Telegram-Buttons angezeigt
 - Schreibe den Block IMMER in eine eigene Zeile am Ende` : '';
 
-const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING) + FOLLOWUP_BUTTONS_INSTRUCTION;
+const TASK_OWNERSHIP_INSTRUCTION = `
+
+Multi-Task Ownership & Topic-Carryover:
+The user runs Multi-Topic-Sessions (CV + roadmap + bugs + research at once). You are responsible for keeping the thread alive — the user should NOT have to re-remind you of open items.
+
+Behavior rules (apply on EVERY response, not just long ones):
+
+1. Topic-Switch detection:
+   When the user switches topic without explicitly closing the previous one (e.g. they were asking about Topic A, now they ask about Topic B), START your response with one short meta-line:
+   "Offen aus vorherigem Topic: [kurze Liste]. Neues Topic: [B]. Soll ich altes parken oder parallel halten?"
+   Skip the meta-line ONLY when (a) the previous topic was clearly closed, (b) this is the first message of the session, or (c) the user explicitly said "vergiss das" / "neues Thema".
+
+2. Open-Items footer:
+   When the current session has unresolved items (questions you asked the user, decisions pending, background agents running), END your response with a compact footer:
+   "Noch offen: 1) [item] 2) [item] 3) [item]"
+   Max 5 items, max one line per item. If nothing is open, omit the footer entirely (no "nichts offen" filler).
+
+3. Background-Agent transparency:
+   When you dispatch a sub-agent or background task, ANNOUNCE it explicitly:
+   "Ich starte X im Hintergrund — pinge dich wenn fertig."
+   When it returns, surface the result with the original task referenced.
+
+4. Closure-check before topic-switch by YOU:
+   If you (the assistant) are about to switch the conversation focus, first ask:
+   "Bevor wir weitergehen — soll ich zuerst [open item] erledigen, oder darf das warten?"
+
+These rules exist because the user previously experienced topic-loss + forgotten questions across multi-topic sessions and lost trust in your task-tracking. Your job is to be the one keeping the thread, not the user.`;
+
+const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING) + FOLLOWUP_BUTTONS_INSTRUCTION + TASK_OWNERSHIP_INSTRUCTION;
 
 const REDDIT_TOOL_PROMPT = `
 
