@@ -192,7 +192,7 @@ const envSchema = z.object({
   AGENT_WATCHDOG_ENABLED: z.string().default('true').transform(toBool),
   AGENT_WATCHDOG_WARN_SECONDS: z
     .string()
-    .default('30')
+    .default('18')
     .transform((val) => parseInt(val, 10)),
   AGENT_WATCHDOG_LOG_SECONDS: z
     .string()
@@ -202,6 +202,13 @@ const envSchema = z.object({
     .string()
     .default('0')
     .transform((val) => parseInt(val, 10)), // 0 = disabled
+  // Send a single user-facing "still working" message via Telegram when the
+  // watchdog warning fires. One ping per query, configurable so deployments
+  // can opt out or change the wording.
+  AGENT_WATCHDOG_USER_NOTIFY: z.string().default('true').transform(toBool),
+  AGENT_WATCHDOG_USER_NOTIFY_MESSAGE: z
+    .string()
+    .default('🔄 Bin dran, brauche noch einen Moment…'),
   // Document INBOX configuration
   DOCUMENT_INBOX_ENABLED: z.string().default('true').transform(toBool),
   DOCUMENT_MAX_FILE_SIZE_MB: z

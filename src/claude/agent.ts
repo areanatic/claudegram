@@ -430,6 +430,8 @@ export async function sendToAgent(
   // Initialize timer for tracking query duration (watchdog created inside try with controller)
   const timer = createAgentTimer();
   let watchdog: AgentWatchdog | null = null;
+  // One Telegram heartbeat per query — set once when watchdog warning first fires.
+  let watchdogUserWarningSent = false;
 
   try {
     const controller = abortController || new AbortController();
@@ -646,6 +648,29 @@ export async function sendToAgent(
           timeoutMs: config.AGENT_QUERY_TIMEOUT_MS > 0 ? config.AGENT_QUERY_TIMEOUT_MS : undefined,
           onWarning: (sinceMsg, total) => {
             logAt('basic', `[Claude] WATCHDOG: No messages for ${formatDuration(sinceMsg)} (total: ${formatDuration(total)}), session:${sessionKey}`);
+            if (
+              !watchdogUserWarningSent &&
+              config.AGENT_WATCHDOG_USER_NOTIFY &&
+              options.telegramCtx
+            ) {
+              watchdogUserWarningSent = true;
+              const ctx = options.telegramCtx;
+              const chatId = ctx.chat?.id;
+              const threadId = ctx.message?.message_thread_id;
+              if (chatId !== undefined) {
+                const sendOpts = threadId !== undefined
+                  ? { message_thread_id: threadId }
+                  : {};
+                ctx.api
+                  .sendMessage(chatId, config.AGENT_WATCHDOG_USER_NOTIFY_MESSAGE, sendOpts)
+                  .catch((err: unknown) => {
+                    logAt(
+                      'basic',
+                      `[Watchdog] Failed to notify user via Telegram: ${err instanceof Error ? err.message : String(err)}`
+                    );
+                  });
+              }
+            }
           },
           onTimeout: () => {
             logAt('basic', `[Claude] WATCHDOG: Query timeout reached, clearing stale session and aborting: ${sessionKey}`);
