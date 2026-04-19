@@ -20,6 +20,7 @@ import { sanitizeError } from '../../utils/sanitize.js';
 import { isValidImageFile, getFileType } from '../../utils/file-type.js';
 import { type PhotoSize } from 'grammy/types';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
+import { recordUpload } from '../../memory/recent-uploads.js';
 
 const UPLOADS_DIR = '.nexusgram/uploads';
 
@@ -66,6 +67,12 @@ async function handleSavedImage(
   if (!session) return;
 
   const relativePath = path.relative(session.workingDirectory, savedPath);
+
+  // Record in sidecar so we can recover the path after context compaction.
+  recordUpload(session.workingDirectory, {
+    path: savedPath,
+    caption: caption || '',
+  });
 
   const captionText = caption?.trim();
   const noteLines = [

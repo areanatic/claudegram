@@ -31,6 +31,7 @@ import { buildNexusBridgePrompt } from '../nexus/bridge.js';
 import { injectContext, saveMemory } from '../memory/nexus-memory.js';
 import { logConversationTurn } from '../memory/conversation-logger.js';
 import { isPrivate } from '../memory/privacy-state.js';
+import { buildRecentUploadsContext } from '../memory/recent-uploads.js';
 
 /**
  * Privacy Mode Phase 1 — neutralizing system-prompt suffix.
@@ -634,6 +635,8 @@ export async function sendToAgent(
     const memoryContext = injectContext(prompt, config.BOT_MEMORY_PROJECT, sessionIsPrivate);
     // Load previous day's transcript for context continuity (only on fresh sessions)
     const previousDayContext = existingSessionId ? '' : loadPreviousDayTranscript(sessionKey);
+    // Recent image uploads — survives compaction so the bot can recover paths.
+    const recentUploadsContext = buildRecentUploadsContext(cwd);
 
     const queryOptions: Parameters<typeof query>[0]['options'] = {
       cwd,
@@ -644,7 +647,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${previousDayContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
+        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${previousDayContext}${recentUploadsContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
       },
       settingSources: ['project', 'user'] as SettingSource[],
       model: effectiveModel,
