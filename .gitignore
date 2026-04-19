@@ -6,6 +6,7 @@ dist/
 .telegraph-account.json
 .claude/
 .claudegram/
+.nexusgram/
 __pycache__/
 storage_state.json
 output/
