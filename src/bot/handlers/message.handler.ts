@@ -19,6 +19,7 @@ import { createTelegraphFromFile } from '../../telegram/telegraph.js';
 import { getStreamingMode, executeRedditFetch, executeMediumFetch, showExtractMenu, projectStatusSuffix, resumeCommandMessage } from './command.handler.js';
 import { executeVReddit } from '../../reddit/vreddit.js';
 import { detectPlatform, isValidUrl } from '../../media/extract.js';
+import { detectInboxUrl, processLinkInbox } from '../../media/link-inbox.js';
 import { maybeSendVoiceReply } from '../../tts/voice-reply.js';
 import { setVoiceFirstMode } from '../../tts/tts-settings.js';
 import * as fs from 'fs';
@@ -261,9 +262,16 @@ export async function handleMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  // Auto-detect disabled: YouTube/TikTok/Instagram URLs go to Claude as context.
-  // Use /extract command manually when extraction is needed.
   const trimmedText = text.trim();
+
+  // Auto Link-Inbox: solo YouTube/TikTok/Instagram URLs → transcript + save (no Claude)
+  if (config.EXTRACT_ENABLED) {
+    const inboxUrl = detectInboxUrl(trimmedText);
+    if (inboxUrl) {
+      await processLinkInbox(ctx, inboxUrl, sessionKey);
+      return;
+    }
+  }
 
   // Skip if this is a Claude command (handled by command handler)
   if (isClaudeCommand(text)) {
@@ -567,6 +575,9 @@ async function handleTelegraphReply(ctx: Context, sessionKey: string, filePath: 
   }
 }
 
+/** Max time to wait for a single Claude response before aborting. */
+const AGENT_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
 async function handleStreamingResponse(
   ctx: Context,
   sessionKey: string,
@@ -577,22 +588,32 @@ async function handleStreamingResponse(
   const abortController = new AbortController();
   setAbortController(sessionKey, abortController);
 
+  let streamingFinished = false;
   try {
-    const response = await sendToAgent(sessionKey, message, {
-      onProgress: (progressText) => {
-        messageSender.updateStream(ctx, progressText);
-      },
-      onToolStart: (toolName, input) => {
-        messageSender.updateToolOperation(sessionKey, toolName, input, ctx);
-      },
-      onToolEnd: () => {
-        messageSender.clearToolOperation(sessionKey);
-      },
-      abortController,
-      telegramCtx: ctx,
-    });
+    const response = await Promise.race([
+      sendToAgent(sessionKey, message, {
+        onProgress: (progressText) => {
+          messageSender.updateStream(ctx, progressText);
+        },
+        onToolStart: (toolName, input) => {
+          messageSender.updateToolOperation(sessionKey, toolName, input, ctx);
+        },
+        onToolEnd: () => {
+          messageSender.clearToolOperation(sessionKey);
+        },
+        abortController,
+        telegramCtx: ctx,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error('⏱ Timeout: Keine Antwort nach 5 Min. Bitte nochmal senden.')),
+          AGENT_RESPONSE_TIMEOUT_MS
+        )
+      ),
+    ]);
 
     await messageSender.finishStreaming(ctx, response.text);
+    streamingFinished = true;
     await maybeSendVoiceReply(ctx, response.text);
 
     // Context visibility notifications
@@ -603,7 +624,9 @@ async function handleStreamingResponse(
     // Follow-up action buttons
     await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
   } catch (error) {
-    await messageSender.cancelStreaming(ctx);
+    if (!streamingFinished) {
+      await messageSender.cancelStreaming(ctx);
+    }
     throw error;
   }
 }
@@ -622,8 +645,15 @@ async function handleWaitResponse(
   setAbortController(sessionKey, abortController);
 
   try {
-    const response = await sendToAgent(sessionKey, message, { abortController, telegramCtx: ctx });
-    messageSender.stopTypingInterval(typingInterval);
+    const response = await Promise.race([
+      sendToAgent(sessionKey, message, { abortController, telegramCtx: ctx }),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error('⏱ Timeout: Keine Antwort nach 5 Min. Bitte nochmal senden.')),
+          AGENT_RESPONSE_TIMEOUT_MS
+        )
+      ),
+    ]);
 
     await messageSender.sendMessage(ctx, response.text);
     await maybeSendVoiceReply(ctx, response.text);
@@ -635,8 +665,8 @@ async function handleWaitResponse(
 
     // Follow-up action buttons
     await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
-  } catch (error) {
+  } finally {
+    // Always stop typing indicator — even on timeout or error
     messageSender.stopTypingInterval(typingInterval);
-    throw error;
   }
 }

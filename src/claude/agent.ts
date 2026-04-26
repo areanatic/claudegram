@@ -894,6 +894,12 @@ export async function sendToAgent(
     );
   }
 
+  // T5: Trim in-memory conversation history to prevent unbounded RAM growth.
+  // PreCompact hook only needs the last few messages; no functional impact.
+  const MAX_CONVERSATION_HISTORY = 50; // ~25 user+assistant exchanges
+  if (history.length > MAX_CONVERSATION_HISTORY) {
+    history = history.slice(-MAX_CONVERSATION_HISTORY);
+  }
   conversationHistory.set(sessionKey, history);
 
   // Cache usage for /context and /status commands

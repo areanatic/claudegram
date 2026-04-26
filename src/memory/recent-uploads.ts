@@ -85,16 +85,19 @@ export function recordUpload(
  * Default `limit` is 3 — enough to recover from a recent compaction without
  * polluting every prompt with stale upload history.
  */
-export function buildRecentUploadsContext(workingDir: string, limit = 3): string {
+export function buildRecentUploadsContext(workingDir: string, limit = 10): string {
   const { uploads } = readSidecar(workingDir);
   if (uploads.length === 0) return '';
-  const slice = uploads.slice(0, limit);
+  const slice = uploads
+    .filter((u) => fs.existsSync(u.path))  // skip deleted files
+    .slice(0, limit);
+  if (slice.length === 0) return '';
   const lines = slice.map((u) => {
     const captionFragment = u.caption ? ` — caption: "${u.caption.slice(0, 80)}"` : '';
     return `- ${u.ts} ${u.path}${captionFragment}`;
   });
   return (
-    `\n\nRecent image uploads in this project (newest first, last ${slice.length}):\n` +
+    `\n\nRecent image uploads in this project (newest first, last ${slice.length} of max ${MAX_ENTRIES}):\n` +
     lines.join('\n') +
     `\nIf the user references one of these images (e.g. "das Bild von vorhin", "the screenshot"), use the Read tool with the absolute path.`
   );

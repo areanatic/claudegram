@@ -296,8 +296,8 @@ export async function createBot(): Promise<Bot> {
       return;
     }
 
-    // 2. Image documents → existing photo handler
-    if (doc?.mime_type?.startsWith('image/')) {
+    // 2. Image documents → existing photo handler (SVG excluded → goes to INBOX)
+    if (doc?.mime_type?.startsWith('image/') && doc.mime_type !== 'image/svg+xml') {
       await handleImageDocument(ctx);
       return;
     }

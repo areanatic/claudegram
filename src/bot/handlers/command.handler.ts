@@ -24,10 +24,11 @@ import {
 import { createTelegraphFromFile, createTelegraphPage } from '../../telegram/telegraph.js';
 import { isMediumUrl, fetchMediumArticle, FreediumArticle } from '../../medium/freedium.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
-import { getTTSSettings, setTTSEnabled, setTTSVoice, setTTSAutoplay } from '../../tts/tts-settings.js';
+import { getTTSSettings, setTTSEnabled, setTTSVoice, setTTSAutoplay, isVoiceActive } from '../../tts/tts-settings.js';
 import { getTerminalUISettings, setTerminalUIEnabled } from '../../telegram/terminal-settings.js';
 import { getTelegraphSettings, setTelegraphEnabled } from '../../telegram/telegraph-settings.js';
 import { maybeSendVoiceReply } from '../../tts/voice-reply.js';
+import { sendFollowUpButtons } from '../../telegram/followup-buttons.js';
 import { transcribeFile, downloadTelegramAudio } from '../../audio/transcribe.js';
 import { executeVReddit } from '../../reddit/vreddit.js';
 import { redditFetch, redditFetchBoth, type RedditFetchOptions } from '../../reddit/redditfetch.js';
@@ -2622,16 +2623,16 @@ async function transcribeAndSend(
   ctx: Context,
   fileId: string,
   mimeHint?: string
-): Promise<void> {
+): Promise<string | null> {
   if (!config.TRANSCRIBE_ENABLED) {
     await replyFeatureDisabled(ctx, 'Transcribe');
-    return;
+    return null;
   }
 
   const chatId = ctx.chat?.id;
   if (!chatId) {
     console.warn('[transcribeAndSend] No chatId — aborting');
-    return;
+    return null;
   }
 
   let ackMsg: Awaited<ReturnType<typeof ctx.reply>>;
@@ -2639,9 +2640,10 @@ async function transcribeAndSend(
     ackMsg = await ctx.reply('🎤 Transcribing...', { parse_mode: undefined });
   } catch (ackErr) {
     console.error('[transcribeAndSend] Failed to send ack:', ackErr);
-    return;
+    return null;
   }
   let tempFilePath: string | null = null;
+  let transcriptResult: string | null = null;
 
   try {
     const file = await ctx.api.getFile(fileId);
@@ -2677,6 +2679,7 @@ async function transcribeAndSend(
     }
 
     await sendTranscriptResult(ctx, transcript);
+    transcriptResult = transcript;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('[Transcribe] Error:', sanitizeError(error));
@@ -2694,6 +2697,7 @@ async function transcribeAndSend(
       }
     }
   }
+  return transcriptResult;
 }
 
 export async function handleTranscribe(ctx: Context): Promise<void> {
@@ -2749,8 +2753,67 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
     return;
   }
 
-  console.log(`[TranscribeAudio] file_id=${audio.file_id} mime=${audio.mime_type} size=${audio.file_size}`);
-  await transcribeAndSend(ctx, audio.file_id, audio.mime_type);
+  // If this is a reply to the ForceReply "Transcribe Audio" prompt → transcribe-only (no agent)
+  const replyTo = ctx.message?.reply_to_message;
+  const isTranscribeOnly = replyTo?.from?.is_bot &&
+    ((replyTo as { text?: string }).text || '').includes('Transcribe Audio');
+
+  console.log(`[TranscribeAudio] file_id=${audio.file_id} mime=${audio.mime_type} size=${audio.file_size} transcribeOnly=${isTranscribeOnly}`);
+  const transcript = await transcribeAndSend(ctx, audio.file_id, audio.mime_type);
+
+  // For plain forwarded audio (not /transcribe ForceReply), also feed transcript to Claude
+  if (!isTranscribeOnly && transcript) {
+    const keyInfo = getSessionKeyFromCtx(ctx);
+    if (!keyInfo) return;
+    const { sessionKey } = keyInfo;
+
+    const session = sessionManager.getOrResumeSession(sessionKey);
+    if (!session) return;
+
+    await queueRequest(sessionKey, transcript, async () => {
+      if (isVoiceActive(sessionKey)) {
+        await ctx.replyWithChatAction('typing');
+        const abortController = new AbortController();
+        setAbortController(sessionKey, abortController);
+        const response = await sendToAgent(sessionKey, transcript, {
+          abortController,
+          voiceMode: true,
+          telegramCtx: ctx,
+        });
+        await maybeSendVoiceReply(ctx, response.text, { voiceMode: true });
+        await messageSender.sendMessage(ctx, response.text);
+        await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
+      } else if (getStreamingMode() === 'streaming') {
+        await messageSender.startStreaming(ctx);
+        const abortController = new AbortController();
+        setAbortController(sessionKey, abortController);
+        try {
+          const response = await sendToAgent(sessionKey, transcript, {
+            onProgress: (progressText) => { messageSender.updateStream(ctx, progressText); },
+            abortController,
+            telegramCtx: ctx,
+          });
+          await messageSender.finishStreaming(ctx, response.text);
+          await maybeSendVoiceReply(ctx, response.text, {});
+          await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
+        } catch (error) {
+          await messageSender.cancelStreaming(ctx);
+          throw error;
+        }
+      } else {
+        await ctx.replyWithChatAction('typing');
+        const abortController = new AbortController();
+        setAbortController(sessionKey, abortController);
+        const response = await sendToAgent(sessionKey, transcript, {
+          abortController,
+          telegramCtx: ctx,
+        });
+        await messageSender.sendMessage(ctx, response.text);
+        await maybeSendVoiceReply(ctx, response.text, {});
+        await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
+      }
+    });
+  }
 }
 
 /**

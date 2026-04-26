@@ -11,6 +11,9 @@ const activeAbortControllers: Map<string, AbortController> = new Map();
 const activeQueries: Map<string, Query> = new Map();
 const pendingQueues: Map<string, Array<QueuedRequest<unknown>>> = new Map();
 const processingFlags: Map<string, boolean> = new Map();
+
+/** Hard ceiling: if a handler hasn't finished after this, we force-reject it. */
+const QUEUE_HANDLER_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 // Tracks chats where a cancel was initiated — checked by agent.ts to detect
 // user-initiated cancellation without calling controller.abort() (which crashes the SDK).
 const cancelledChats: Set<string> = new Set();
@@ -154,12 +157,37 @@ async function processQueue(sessionKey: string): Promise<void> {
   // ran out of order or was bypassed by an uncaught error upstream.
   clearCancelled(sessionKey);
 
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
   try {
-    const result = await request.handler();
+    const result = await Promise.race([
+      request.handler(),
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          // T1 Fix: Interrupt the active query to prevent ghost processes.
+          // Without this, the queue handler rejects but sendToAgent keeps running
+          // silently, consuming memory and blocking the session.
+          cancelledChats.add(sessionKey);
+          const q = activeQueries.get(sessionKey);
+          if (q) {
+            q.interrupt().catch(() => {});
+            clearActiveQuery(sessionKey);
+          } else {
+            const controller = activeAbortControllers.get(sessionKey);
+            if (controller) {
+              controller.abort();
+              clearAbortController(sessionKey, controller);
+            }
+          }
+          reject(new Error(`⏱ Timeout: Anfrage nach ${QUEUE_HANDLER_TIMEOUT_MS / 60000} Min abgebrochen. Bitte nochmal senden.`));
+        }, QUEUE_HANDLER_TIMEOUT_MS);
+      }),
+    ]);
     request.resolve(result);
   } catch (error) {
     request.reject(error instanceof Error ? error : new Error(String(error)));
   } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
     processingFlags.set(sessionKey, false);
     clearAbortController(sessionKey);
     clearActiveQuery(sessionKey);

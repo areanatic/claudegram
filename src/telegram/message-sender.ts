@@ -110,17 +110,24 @@ export class MessageSender {
     // Default: MarkdownV2 with chunking
     const parts = processMessageForTelegram(text, config.MAX_MESSAGE_LENGTH);
 
+    let sentCount = 0; // T4: track successfully sent MarkdownV2 parts
     for (const part of parts) {
       try {
         await ctx.reply(part, { parse_mode: 'MarkdownV2' });
+        sentCount++;
       } catch (error) {
-        // MarkdownV2 failed — send as plain text chunks (raw text may exceed 4096 chars)
+        // MarkdownV2 failed — re-split original text and send REMAINING chunks as plain.
+        // Use sentCount to skip already-delivered content and avoid duplicate messages.
         console.error('MarkdownV2 send failed, falling back to plain text:', error);
         const plainChunks = splitMessage(text);
-        for (const chunk of plainChunks) {
-          await ctx.reply(chunk, { parse_mode: undefined });
+        for (let i = sentCount; i < plainChunks.length; i++) {
+          try {
+            await ctx.reply(plainChunks[i], { parse_mode: undefined });
+          } catch (plainErr) {
+            console.error('[sendMessage] Plain text fallback failed:', plainErr);
+          }
         }
-        // Already sent full text as plain — skip remaining MarkdownV2 parts
+        // Already sent remaining content as plain — skip remaining MarkdownV2 parts
         return;
       }
     }
@@ -500,7 +507,11 @@ export class MessageSender {
                 await ctx.reply(parts[i], { parse_mode: 'MarkdownV2' });
               } catch (partError) {
                 console.error(`MarkdownV2 failed for part ${i + 1}:`, partError);
-                await ctx.reply(parts[i], { parse_mode: undefined });
+                try {
+                  await ctx.reply(parts[i], { parse_mode: undefined });
+                } catch (plainErr) {
+                  console.error(`Plain text fallback also failed for part ${i + 1}:`, plainErr);
+                }
               }
               await new Promise(resolve => setTimeout(resolve, 100));
             }
@@ -518,12 +529,23 @@ export class MessageSender {
               } catch { /* ignore */ }
 
               this.streamStates.delete(sessionKey);
-              await this.sendMessage(ctx, finalContent);
+              try {
+                await this.sendMessage(ctx, finalContent);
+              } catch (sendErr) {
+                console.error('[Stream] sendMessage fallback failed, sending plain error notice:', sendErr);
+                try {
+                  await ctx.api.sendMessage(chatId, '⚠️ Fehler beim Senden der Antwort. Bitte nochmal versuchen.');
+                } catch { /* cannot send anything */ }
+              }
               return;
             }
           }
         } catch (error) {
           console.error('Error finishing stream:', error);
+          // Last resort: notify user so they don't stare at a spinning indicator
+          try {
+            await ctx.api.sendMessage(chatId, '⚠️ Fehler beim Verarbeiten der Antwort. Bitte nochmal versuchen.');
+          } catch { /* cannot send anything */ }
         }
       }
     }
