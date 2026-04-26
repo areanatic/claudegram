@@ -26,7 +26,7 @@ import {
   getTimingReport,
   type AgentTimer,
 } from '../utils/agent-timer.js';
-import { recordTranscript, loadPreviousDayTranscript } from './transcript-logger.js';
+import { recordTranscript, loadPreviousDayTranscript, loadTodayTranscript } from './transcript-logger.js';
 import { buildNexusBridgePrompt } from '../nexus/bridge.js';
 import { injectContext, saveMemory } from '../memory/nexus-memory.js';
 import { logConversationTurn } from '../memory/conversation-logger.js';
@@ -635,6 +635,9 @@ export async function sendToAgent(
     const memoryContext = injectContext(prompt, config.BOT_MEMORY_PROJECT, sessionIsPrivate);
     // Load previous day's transcript for context continuity (only on fresh sessions)
     const previousDayContext = existingSessionId ? '' : loadPreviousDayTranscript(sessionKey);
+    // Load today's transcript for context recovery after a bot restart.
+    // Gives the bot visibility into what was already discussed today in this Telegram chat.
+    const todayContext = existingSessionId ? '' : loadTodayTranscript(sessionKey);
     // Recent image uploads — survives compaction so the bot can recover paths.
     const recentUploadsContext = buildRecentUploadsContext(cwd);
 
@@ -647,7 +650,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${previousDayContext}${recentUploadsContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
+        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${todayContext}${previousDayContext}${recentUploadsContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
       },
       settingSources: ['project', 'user'] as SettingSource[],
       model: effectiveModel,

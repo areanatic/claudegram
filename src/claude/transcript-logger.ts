@@ -32,6 +32,28 @@ function transcriptPath(userId: string): string {
 }
 
 /**
+ * Load today's transcript for context recovery after a bot restart.
+ * Injected when there is no active Claude session ID (= fresh start).
+ * Returns the last ~3000 chars or empty string if none exists.
+ */
+export function loadTodayTranscript(sessionKey: string): string {
+  try {
+    const filePath = path.join(TRANSCRIPT_DIR, todayStr(), `${sessionKey}.md`);
+    if (!fs.existsSync(filePath)) return '';
+
+    const content = fs.readFileSync(filePath, 'utf-8');
+    if (!content.trim()) return '';
+
+    const maxChars = 3000;
+    const trimmed = content.length > maxChars ? '…\n' + content.slice(-maxChars) : content;
+
+    return `\n\n<today-context>\nDies ist der bisherige Verlauf dieser Telegram-Session (Kontext-Recovery nach Neustart):\n${trimmed}\n</today-context>`;
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Load yesterday's transcript for context continuity on day change.
  * Returns the last ~4000 chars or empty string if none exists.
  */
