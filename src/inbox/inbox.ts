@@ -84,6 +84,7 @@ const ALLOWED_MIME_PREFIXES = [
   'application/rtf',
   'application/epub+zip',
   'application/x-tar',
+  'application/octet-stream', // Telegram fallback for .html, .ts, .js, custom formats
 ];
 
 // Max filename length (filesystem safety)
