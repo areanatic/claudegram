@@ -55,6 +55,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
   await dismissFollowUpButtons(ctx, sessionKey);
 
   // If this is a reply to the bot's "Transcribe Audio" ForceReply, route to transcribe-only flow
+  // (must run BEFORE session auto-creation — transcribe-only must never spawn an agent session)
   const replyTo = ctx.message?.reply_to_message;
   if (replyTo && replyTo.from?.is_bot) {
     const replyText = (replyTo as { text?: string }).text || '';
@@ -64,14 +65,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
     }
   }
 
-  // Check session — auto-resume from disk if bot restarted
-  const session = sessionManager.getOrResumeSession(sessionKey);
+  // Auto-resume or create session — voice notes must never be blocked
+  let session = sessionManager.getOrResumeSession(sessionKey);
   if (!session) {
-    await ctx.reply(
-      '⚠️ No project set\\.\n\nUse `/project` to open a project first\\.',
-      { parse_mode: 'MarkdownV2' }
-    );
-    return;
+    session = sessionManager.createSession(sessionKey, config.WORKSPACE_DIR || process.env.HOME || '.');
+    console.log(`[Voice] Auto-created session for ${sessionKey}`);
   }
 
   // Check file size
