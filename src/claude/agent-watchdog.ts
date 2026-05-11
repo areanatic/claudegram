@@ -14,6 +14,15 @@ export interface WatchdogOptions {
   onTimeout?: () => void;
 }
 
+/**
+ * State for an in-flight tool call. Used by the tool-aware watchdog.
+ * Mai-Intervention 2026-05-11 Phase B.7 (V2.4-7).
+ */
+interface ActiveToolState {
+  name: string;
+  startTime: number;
+}
+
 export class AgentWatchdog {
   private chatId: string;
   private warnAfterMs: number;
@@ -27,6 +36,11 @@ export class AgentWatchdog {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private hasWarned: boolean = false;
   private stopped: boolean = false;
+
+  // V2.4-7 tool-aware state. Keyed by tool_use_id when available,
+  // falls back to a synthetic counter otherwise. Multiple parallel tools supported.
+  private activeTools: Map<string, ActiveToolState> = new Map();
+  private fallbackToolCounter: number = 0;
 
   constructor(options: WatchdogOptions) {
     this.chatId = options.chatId;
@@ -55,48 +69,108 @@ export class AgentWatchdog {
   /**
    * Record activity (message received from SDK).
    */
-  recordActivity(messageType?: string): void {
+  recordActivity(_messageType?: string): void {
     this.lastActivityTime = Date.now();
     this.hasWarned = false; // Reset warning state on activity
   }
 
   /**
+   * Record start of a tool invocation. Refreshes activity AND tracks the tool
+   * so check() can extend the warning window while it is running.
+   *
+   * @param toolUseId — SDK-provided ID if available, '' to synthesize one
+   * @param toolName  — for logging only; not used to match end-events (tool_use_summary has no name)
+   */
+  recordToolStart(toolUseId: string, toolName: string): void {
+    const id = toolUseId || `__synthetic-${++this.fallbackToolCounter}`;
+    this.activeTools.set(id, { name: toolName, startTime: Date.now() });
+    this.lastActivityTime = Date.now();
+    this.hasWarned = false;
+  }
+
+  /**
+   * Tool-progress event (heartbeat). Refreshes activity without changing the
+   * active-tools map. Safe to call even when no tool is recorded.
+   */
+  recordToolProgress(): void {
+    this.lastActivityTime = Date.now();
+    this.hasWarned = false;
+  }
+
+  /**
+   * End of a tool invocation. If a specific id matches, remove just that one;
+   * otherwise drop the oldest entry (best-effort), and always refresh activity.
+   * tool_use_summary may not carry the original tool_use_id reliably — that is
+   * why this is a best-effort drop, not an assertion.
+   */
+  recordToolEnd(toolUseId?: string): void {
+    if (toolUseId && this.activeTools.has(toolUseId)) {
+      this.activeTools.delete(toolUseId);
+    } else if (this.activeTools.size > 0) {
+      // Drop oldest entry
+      const oldestKey = [...this.activeTools.entries()]
+        .sort((a, b) => a[1].startTime - b[1].startTime)[0][0];
+      this.activeTools.delete(oldestKey);
+    }
+    this.lastActivityTime = Date.now();
+    this.hasWarned = false;
+  }
+
+  /**
+   * Hard-clear all active tools — call on error_during_execution / Interrupt /
+   * Permission-denial / any event that may end the run without per-tool summaries.
+   */
+  clearActiveTools(reason: string): void {
+    if (this.activeTools.size > 0) {
+      console.log(
+        `[Claude] WATCHDOG: clearActiveTools(${reason}) — dropping ${this.activeTools.size} active tool(s), chat:${this.chatId}`
+      );
+    }
+    this.activeTools.clear();
+    this.lastActivityTime = Date.now();
+    this.hasWarned = false;
+  }
+
+  /**
    * Check if watchdog should fire warnings or timeout.
+   * V2.4-7: while tools are active, the warn threshold is relaxed (×4) but
+   * the hard timeout (timeoutMs) is ALWAYS respected — tools cannot suppress
+   * it indefinitely.
    */
   private check(): void {
     const now = Date.now();
     const sinceLastActivity = now - this.lastActivityTime;
     const totalElapsed = now - this.startTime;
+    const toolsActive = this.activeTools.size > 0;
+    const effectiveWarnMs = toolsActive ? this.warnAfterMs * 4 : this.warnAfterMs;
 
-    // Check hard timeout first
+    // Hard timeout — never suppressed, even with active tools
     if (this.timeoutMs > 0 && totalElapsed >= this.timeoutMs) {
       console.log(
-        `[Claude] WATCHDOG TIMEOUT: No response after ${formatDuration(totalElapsed)}, chat:${this.chatId}`
+        `[Claude] WATCHDOG TIMEOUT: No response after ${formatDuration(totalElapsed)}, chat:${this.chatId}${toolsActive ? ` (${this.activeTools.size} tool(s) still active)` : ''}`
       );
       this.onTimeout?.();
       this.stop();
       return;
     }
 
-    // Check warning threshold
-    if (sinceLastActivity >= this.warnAfterMs) {
+    // Warning threshold (relaxed while tools run)
+    if (sinceLastActivity >= effectiveWarnMs) {
       if (!this.hasWarned) {
-        // First warning at threshold
         this.hasWarned = true;
+        const toolsNote = toolsActive ? ` [tools-active: ${[...this.activeTools.values()].map(t => t.name).join(',')}]` : '';
         console.log(
-          `[Claude] WATCHDOG WARNING: No messages for ${formatDuration(sinceLastActivity)} (total: ${formatDuration(totalElapsed)}), chat:${this.chatId}`
+          `[Claude] WATCHDOG WARNING: No messages for ${formatDuration(sinceLastActivity)} (total: ${formatDuration(totalElapsed)}, threshold=${formatDuration(effectiveWarnMs)})${toolsNote}, chat:${this.chatId}`
         );
         this.onWarning?.(sinceLastActivity, totalElapsed);
       } else {
-        // Subsequent "still waiting" logs
         console.log(
           `[Claude] [${formatDuration(totalElapsed)}] WATCHDOG: Still waiting, no messages for ${formatDuration(sinceLastActivity)}, chat:${this.chatId}`
         );
       }
     } else {
-      // Under threshold - just log elapsed time at trace level
       console.log(
-        `[Claude] [${formatDuration(totalElapsed)}] WATCHDOG: Logging - still waiting for messages`
+        `[Claude] [${formatDuration(totalElapsed)}] WATCHDOG: Logging - still waiting for messages${toolsActive ? ` (${this.activeTools.size} tool(s) active)` : ''}`
       );
     }
   }

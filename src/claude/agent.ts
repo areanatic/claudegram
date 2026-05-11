@@ -13,7 +13,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import * as fs from 'fs';
 import { sessionManager } from './session-manager.js';
-import { setActiveQuery, clearActiveQuery, isCancelled } from './request-queue.js';
+import { setActiveQuery, clearActiveQuery, isCancelled, gracefulCancel } from './request-queue.js';
 import type { Context } from 'grammy';
 import { config } from '../config.js';
 import { AgentWatchdog } from './agent-watchdog.js';
@@ -727,13 +727,17 @@ export async function sendToAgent(
             }
           },
           onTimeout: () => {
-            logAt('basic', `[Claude] WATCHDOG: Query timeout reached, clearing stale session and aborting: ${sessionKey}`);
+            logAt('basic', `[Claude] WATCHDOG: Query timeout reached, clearing stale session and gracefulCancel: ${sessionKey}`);
             chatSessionIds.delete(sessionKey);
             const staleSession = sessionManager.getSession(sessionKey);
             if (staleSession) {
               staleSession.claudeSessionId = undefined;
             }
-            controller.abort();
+            // Mai-Intervention 2026-05-11 Phase B.6: route through gracefulCancel
+            // (prefers Query.interrupt, falls back to controller.abort with crash-risk marker)
+            gracefulCancel(sessionKey, 'watchdog-timeout').catch(err => {
+              console.debug('[Watchdog] gracefulCancel threw', err);
+            });
           },
         })
       : null;
@@ -780,6 +784,10 @@ export async function sendToAgent(
             }
             // Notify tool start for terminal UI
             onToolStart?.(block.name, toolInput);
+            // Mai-Intervention Phase B.7: register tool with watchdog so it relaxes
+            // its warn threshold while the tool runs. block.id is the SDK tool_use_id.
+            const toolUseId = 'id' in block && typeof block.id === 'string' ? block.id : '';
+            watchdog?.recordToolStart(toolUseId, block.name);
           }
         }
       } else if (responseMessage.type === 'system') {
@@ -807,15 +815,32 @@ export async function sendToAgent(
         }
       } else if (responseMessage.type === 'tool_progress') {
         logAt('verbose', `[Claude] Tool progress: ${responseMessage.tool_name}`, responseMessage);
+        // Mai-Intervention Phase B.7: heartbeat — refresh watchdog activity
+        watchdog?.recordToolProgress();
       } else if (responseMessage.type === 'tool_use_summary') {
         logAt('verbose', '[Claude] Tool use summary', responseMessage);
-        // Notify tool end for terminal UI (summary doesn't include tool name)
+        // Notify tool end for terminal UI (summary may not include matchable name)
         onToolEnd?.();
+        // Mai-Intervention Phase B.7: drop tool from watchdog active-map.
+        // tool_use_id is best-effort — if missing, watchdog drops oldest entry.
+        const summaryId = 'tool_use_id' in responseMessage && typeof (responseMessage as { tool_use_id?: unknown }).tool_use_id === 'string'
+          ? (responseMessage as { tool_use_id: string }).tool_use_id
+          : undefined;
+        watchdog?.recordToolEnd(summaryId);
       } else if (responseMessage.type === 'auth_status') {
         logAt('basic', '[Claude] Auth status', responseMessage);
       } else if (responseMessage.type === 'stream_event') {
         logAt('trace', '[Claude] Stream event', responseMessage.event);
       } else if (responseMessage.type === 'result') {
+        // Mai-Intervention Phase B.7: any result (success or error) ends the run.
+        // Clear active-tools BEFORE stop() so error_during_execution does not leave
+        // ghost entries that would affect later sessions if the watchdog instance
+        // were ever reused.
+        if (responseMessage.subtype === 'error_during_execution') {
+          watchdog?.clearActiveTools('result-error_during_execution');
+        } else {
+          watchdog?.clearActiveTools('result-' + (responseMessage.subtype ?? 'unknown'));
+        }
         watchdog?.stop();
         logAt('basic', `[Claude] Query completed: ${getTimingReport(timer)}`);
         logAt('verbose', '[Claude] Result:', JSON.stringify(responseMessage, null, 2).substring(0, 500));

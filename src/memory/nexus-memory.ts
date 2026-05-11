@@ -219,6 +219,90 @@ export function injectContext(
 /**
  * Close the database connection (call on graceful shutdown).
  */
+/**
+ * Read-only Memory-Search for the MCP-Tool exposed to Claude (nexus_memory_search).
+ * Mai-Intervention 2026-05-11 Phase B.5.
+ *
+ * Differences from searchMemory():
+ *  - Opens its OWN read-only connection (separate from the write-capable singleton)
+ *  - Always fail-CLOSED: privacy='public' filter is hard-wired, no includePrivate option
+ *  - Phrase-search first, falls back to bare-token search when 0 results
+ *  - Output stripped to {content, tags, project, score} — no file_path/source/privacy leak
+ *  - Limit clamped to [1, 20]
+ *
+ * Each call opens a transient connection; safer than mutating the shared db.
+ */
+export interface McpMemoryHit {
+  content: string;
+  tags: string | null;
+  project: string | null;
+  score: number;
+}
+
+export function searchMemoryReadOnly(
+  query: string,
+  limit = 5,
+  project?: string
+): McpMemoryHit[] {
+  const clampedLimit = Math.max(1, Math.min(20, Math.floor(limit)));
+  if (!query.trim()) return [];
+
+  let conn: Database.Database | null = null;
+  try {
+    conn = new Database(NEXUS_MEMORY_DB, { readonly: true, fileMustExist: true });
+    conn.pragma('busy_timeout = 5000');
+
+    const hasPriv = hasPrivacyColumn(conn);
+    const privClause = hasPriv ? `AND m.privacy = 'public'` : '';
+    const projectClause = project ? `AND m.project = ?` : '';
+
+    const buildStmt = (matchExpr: string) => conn!.prepare(`
+      SELECT m.content, m.tags, m.project, m.score
+      FROM memories_fts fts
+      JOIN memories m ON m.id = fts.rowid
+      WHERE memories_fts MATCH ?
+      ${projectClause}
+      ${privClause}
+      ORDER BY rank
+      LIMIT ?
+    `);
+
+    const phraseQuery = `"${query.replace(/"/g, '""')}"`;
+    const params: unknown[] = [phraseQuery];
+    if (project) params.push(project);
+    params.push(clampedLimit);
+
+    let rows = buildStmt(phraseQuery).all(...params) as McpMemoryHit[];
+
+    // Fallback: when phrase-search returns 0, try a bare token search
+    if (rows.length === 0) {
+      const tokenQuery = query
+        .replace(/[^\p{L}\p{N}\s@-]/gu, ' ')
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .join(' OR ');
+      if (tokenQuery) {
+        const fbParams: unknown[] = [tokenQuery];
+        if (project) fbParams.push(project);
+        fbParams.push(clampedLimit);
+        rows = buildStmt(tokenQuery).all(...fbParams) as McpMemoryHit[];
+      }
+    }
+
+    // Truncate long content to 500 chars per V2.4-5 spec
+    return rows.map(r => ({
+      ...r,
+      content: r.content.length > 500 ? r.content.slice(0, 500) + '…' : r.content,
+    }));
+  } catch (err) {
+    console.error('[NexusMemory/MCP] searchMemoryReadOnly error:', err);
+    return [];
+  } finally {
+    try { conn?.close(); } catch { /* swallow */ }
+  }
+}
+
 export function closeMemoryDb(): void {
   if (db) {
     try {

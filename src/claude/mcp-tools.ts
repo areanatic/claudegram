@@ -14,6 +14,7 @@ import * as path from 'path';
 import { config } from '../config.js';
 import { sessionManager } from './session-manager.js';
 import { getWorkspaceRoot, isPathWithinRoot } from '../utils/workspace-guard.js';
+import { searchMemoryReadOnly } from '../memory/nexus-memory.js';
 
 // Lazy imports to avoid circular deps and unnecessary module loading
 async function importInbox() {
@@ -90,6 +91,7 @@ function buildToolList(toolsCtx: McpToolsContext) {
   }
 
   tools.push(sendFileTool(toolsCtx));
+  tools.push(nexusMemorySearchTool(toolsCtx));
 
   return tools;
 }
@@ -490,6 +492,53 @@ function sendFileTool(toolsCtx: McpToolsContext) {
       } catch (error) {
         return {
           content: [{ type: 'text' as const, text: `Send file error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+/**
+ * nexus_memory_search — MCP-Tool wrapper around searchMemoryReadOnly.
+ * Mai-Intervention 2026-05-11 Phase B.5 (V2.4-5).
+ *
+ * Use when user asks about past context, identities (bots, people), prior
+ * decisions, or any fact that may live in the NEXUS FTS5 memory.
+ *
+ * V2.4-5 hardening:
+ *  - Read-only DB connection per call
+ *  - Fail-CLOSED privacy default (public only, never leaks 'private' rows)
+ *  - Limit clamped to [1, 20]
+ *  - Phrase-search first, falls back to token-search when 0 hits
+ *  - Output stripped to {content, tags, project, score} — no file_path/source/privacy
+ */
+function nexusMemorySearchTool(_toolsCtx: McpToolsContext) {
+  return tool(
+    'nexusgram_memory_search',
+    'Search NEXUS FTS5 memory database for past memories. Use when the user asks about identities (e.g. "wer ist Alina-Bot?"), prior decisions, project history, or any fact likely persisted earlier. Returns up to 5 (default) ranked matches, each with content snippet + tags + project + score. Privacy: only public memories are returned.',
+    {
+      query: z.string().min(1).describe('FTS5 search query, e.g. "alina bot family" or "nexusgram recovery plan"'),
+      project: z.string().optional().describe('Filter by project tag (e.g. "nexus", "family"). Omit for cross-project search.'),
+      limit: z.number().int().min(1).max(20).optional().describe('Max results (1–20, default 5).'),
+    },
+    async ({ query, project, limit }) => {
+      try {
+        const hits = searchMemoryReadOnly(query, limit ?? 5, project);
+        if (hits.length === 0) {
+          return {
+            content: [{ type: 'text' as const, text: `No memories found for query "${query}"${project ? ` in project "${project}"` : ''}.` }],
+          };
+        }
+        const formatted = hits.map((h, i) =>
+          `[${i + 1}] (project=${h.project ?? '-'}, score=${h.score.toFixed(2)}, tags=${h.tags ?? '-'})\n${h.content}`
+        ).join('\n\n---\n\n');
+        return {
+          content: [{ type: 'text' as const, text: `Found ${hits.length} memory hit${hits.length === 1 ? '' : 's'} for "${query}":\n\n${formatted}` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Memory search error: ${error instanceof Error ? error.message : String(error)}` }],
           isError: true,
         };
       }

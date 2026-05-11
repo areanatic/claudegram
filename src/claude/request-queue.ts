@@ -19,9 +19,51 @@ const processingFlags: Map<string, boolean> = new Map();
  * timer in message.handler.ts. Mai-Intervention 2026-05-11 Phase A.1.
  */
 const QUEUE_HANDLER_TIMEOUT_MS = config.AGENT_RESPONSE_TIMEOUT_MS + 60_000;
-// Tracks chats where a cancel was initiated — checked by agent.ts to detect
-// user-initiated cancellation without calling controller.abort() (which crashes the SDK).
+// Tracks chats where a cancel was initiated. Cleared by gracefulCancel after
+// the SDK has actually torn down. See gracefulCancel() below for the canonical
+// pathway — direct SDK-aborts outside that function are banned.
 const cancelledChats: Set<string> = new Set();
+
+/**
+ * gracefulCancel — single canonical cancel pathway.
+ * Mai-Intervention 2026-05-11 Phase B.6 (V2.4-6).
+ *
+ * Contract:
+ *  - Prefers Query.interrupt() (SDK-safe, does not crash subprocess)
+ *  - Falls back to direct SDK-abort ONLY as last resort, with explicit risk acknowledgement
+ *  - Idempotent: safe to call multiple times for the same sessionKey
+ *  - Marks the session as cancelled so agent.ts can detect on its next stream event
+ *
+ * Replaces all direct SDK-abort call-sites in this module and in agent.ts:736.
+ * Forensik 2026-05-11: 8 direct abort call-sites had landed across the codebase despite
+ * the in-code "Do NOT call" comment — gracefulCancel makes the safe path the only path.
+ */
+export async function gracefulCancel(sessionKey: string, reason: string): Promise<void> {
+  if (cancelledChats.has(sessionKey)) {
+    return;
+  }
+  cancelledChats.add(sessionKey);
+  console.log(`[gracefulCancel] ${sessionKey} reason=${reason}`);
+
+  const query = activeQueries.get(sessionKey);
+  if (query) {
+    try {
+      await query.interrupt();
+    } catch (err) {
+      console.debug(`[gracefulCancel] ${sessionKey} interrupt() threw`, err);
+    }
+    activeQueries.delete(sessionKey);
+  }
+
+  // Last-resort abort, only when no Query existed (handler still in race window).
+  // SDK subprocess may crash; we accept that risk only because nothing else can cancel.
+  const controller = activeAbortControllers.get(sessionKey);
+  if (controller && !controller.signal.aborted) {
+    console.warn(`[gracefulCancel] ${sessionKey} LAST-RESORT abort — SDK crash risk acknowledged. Reason: ${reason}`);
+    controller.abort(); // allow-hardcoded: reason="last-resort fallback inside gracefulCancel only — SDK crash risk acknowledged"
+    activeAbortControllers.delete(sessionKey);
+  }
+}
 
 export function getAbortController(sessionKey: string): AbortController | undefined {
   return activeAbortControllers.get(sessionKey);
@@ -86,23 +128,14 @@ export function getActiveSessionKeys(): string[] {
  * Used during graceful shutdown.
  */
 export async function cancelAllRequests(): Promise<void> {
-  // Interrupt all active SDK queries
-  for (const [sessionKey, q] of activeQueries) {
-    cancelledChats.add(sessionKey);
-    try {
-      await q.interrupt();
-    } catch (err) {
-      console.debug('[cancelAllRequests] interrupt() threw for', sessionKey, err);
-    }
+  // Use gracefulCancel for every active session — handles Query.interrupt + last-resort abort uniformly.
+  const sessionKeys = new Set<string>([
+    ...activeQueries.keys(),
+    ...activeAbortControllers.keys(),
+  ]);
+  for (const sessionKey of sessionKeys) {
+    await gracefulCancel(sessionKey, 'shutdown');
   }
-  activeQueries.clear();
-
-  // Abort any remaining controllers
-  for (const [sessionKey, controller] of activeAbortControllers) {
-    cancelledChats.add(sessionKey);
-    controller.abort();
-  }
-  activeAbortControllers.clear();
 
   // Reject all pending queue items — 'Queue cleared' is handled silently by all handlers
   for (const [, queue] of pendingQueues) {
@@ -170,20 +203,11 @@ async function processQueue(sessionKey: string): Promise<void> {
       new Promise<never>((_, reject) => {
         timeoutHandle = setTimeout(() => {
           // T1 Fix: Interrupt the active query to prevent ghost processes.
-          // Without this, the queue handler rejects but sendToAgent keeps running
-          // silently, consuming memory and blocking the session.
-          cancelledChats.add(sessionKey);
-          const q = activeQueries.get(sessionKey);
-          if (q) {
-            q.interrupt().catch(() => {});
-            clearActiveQuery(sessionKey);
-          } else {
-            const controller = activeAbortControllers.get(sessionKey);
-            if (controller) {
-              controller.abort();
-              clearAbortController(sessionKey, controller);
-            }
-          }
+          // Mai-Intervention Phase B.6: routed through gracefulCancel to avoid
+          // duplicating the interrupt/abort logic.
+          gracefulCancel(sessionKey, 'queue-handler-timeout').catch(err => {
+            console.debug('[processQueue] gracefulCancel threw', err);
+          });
           reject(new Error(`⏱ Timeout: Anfrage nach ${QUEUE_HANDLER_TIMEOUT_MS / 60000} Min abgebrochen. Bitte nochmal senden.`));
         }, QUEUE_HANDLER_TIMEOUT_MS);
       }),
@@ -204,67 +228,28 @@ async function processQueue(sessionKey: string): Promise<void> {
   }
 }
 
-/** Soft cancel: interrupt the running query but keep the session alive. */
+/**
+ * Soft cancel: backward-compat wrapper around gracefulCancel.
+ * Returns true when there was actually something to cancel for this sessionKey.
+ */
 export async function cancelRequest(sessionKey: string): Promise<boolean> {
-  const q = activeQueries.get(sessionKey);
-
-  if (q) {
-    // Set the cancelled flag BEFORE interrupt so agent.ts can detect it
-    // when the error_during_execution result arrives.
-    // Do NOT call controller.abort() — that crashes the SDK subprocess.
-    cancelledChats.add(sessionKey);
-    try {
-      await q.interrupt();
-    } catch (err) {
-      console.debug('[cancelRequest] interrupt() threw for chat', sessionKey, err);
-    }
-    clearActiveQuery(sessionKey);
-    return true;
+  const had = activeQueries.has(sessionKey) || activeAbortControllers.has(sessionKey);
+  if (had) {
+    await gracefulCancel(sessionKey, 'user-cancel');
   }
-
-  // Fallback to AbortController if no query stored.
-  // NOTE: this branch is the race-window case (handler set a controller but
-  // hasn't yet called setActiveQuery). Logging explicitly so we can tell
-  // later whether a "Request cancelled" came from /cancel vs. elsewhere.
-  const controller = activeAbortControllers.get(sessionKey);
-  if (controller) {
-    console.log(`[cancelRequest] Fallback abort (no active query yet) for ${sessionKey}`);
-    cancelledChats.add(sessionKey);
-    controller.abort();
-    clearAbortController(sessionKey, controller);
-    return true;
-  }
-
-  return false;
+  return had;
 }
 
-/** Soft reset: interrupt query + signal abort to fully tear down the session. */
+/**
+ * Soft reset: backward-compat wrapper around gracefulCancel with reset semantics.
+ * gracefulCancel handles both Query.interrupt and last-resort abort uniformly.
+ */
 export async function resetRequest(sessionKey: string): Promise<boolean> {
-  const q = activeQueries.get(sessionKey);
-  const controller = activeAbortControllers.get(sessionKey);
-
-  if (q) {
-    cancelledChats.add(sessionKey);
-    try {
-      await q.interrupt();
-    } catch (err) {
-      console.debug('[resetRequest] interrupt() threw for chat', sessionKey, err);
-    }
-    // Also abort controller to fully tear down
-    if (controller) controller.abort();
-    clearActiveQuery(sessionKey);
-    clearAbortController(sessionKey);
-    return true;
+  const had = activeQueries.has(sessionKey) || activeAbortControllers.has(sessionKey);
+  if (had) {
+    await gracefulCancel(sessionKey, 'user-reset');
   }
-
-  if (controller) {
-    cancelledChats.add(sessionKey);
-    controller.abort();
-    clearAbortController(sessionKey);
-    return true;
-  }
-
-  return false;
+  return had;
 }
 
 export function clearQueue(sessionKey: string): number {
