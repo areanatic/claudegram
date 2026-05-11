@@ -202,6 +202,13 @@ const envSchema = z.object({
     .string()
     .default('0')
     .transform((val) => parseInt(val, 10)), // 0 = disabled
+  // Max time message.handler waits for a single Claude response before aborting.
+  // Mai-Intervention 2026-05-11 Phase A.1: replaces hardcoded 5min in
+  // message.handler.ts (RI-01 root-cause). Default 10min covers Tool-Use research.
+  AGENT_RESPONSE_TIMEOUT_MS: z
+    .string()
+    .default('600000')
+    .transform((val) => parseInt(val, 10)),
   // Send a single user-facing "still working" message via Telegram when the
   // watchdog warning fires. One ping per query, configurable so deployments
   // can opt out or change the wording.

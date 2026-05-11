@@ -1,4 +1,5 @@
 import type { Query } from '@anthropic-ai/claude-agent-sdk';
+import { config } from '../config.js';
 
 type QueuedRequest<T> = {
   message: string;
@@ -12,8 +13,12 @@ const activeQueries: Map<string, Query> = new Map();
 const pendingQueues: Map<string, Array<QueuedRequest<unknown>>> = new Map();
 const processingFlags: Map<string, boolean> = new Map();
 
-/** Hard ceiling: if a handler hasn't finished after this, we force-reject it. */
-const QUEUE_HANDLER_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+/**
+ * Hard ceiling for handler completion. Set to AGENT_RESPONSE_TIMEOUT_MS + 60s
+ * buffer so the handler-level timer always fires after the in-flight Promise.race
+ * timer in message.handler.ts. Mai-Intervention 2026-05-11 Phase A.1.
+ */
+const QUEUE_HANDLER_TIMEOUT_MS = config.AGENT_RESPONSE_TIMEOUT_MS + 60_000;
 // Tracks chats where a cancel was initiated — checked by agent.ts to detect
 // user-initiated cancellation without calling controller.abort() (which crashes the SDK).
 const cancelledChats: Set<string> = new Set();

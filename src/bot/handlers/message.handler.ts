@@ -575,9 +575,6 @@ async function handleTelegraphReply(ctx: Context, sessionKey: string, filePath: 
   }
 }
 
-/** Max time to wait for a single Claude response before aborting. */
-const AGENT_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-
 async function handleStreamingResponse(
   ctx: Context,
   sessionKey: string,
@@ -606,8 +603,8 @@ async function handleStreamingResponse(
       }),
       new Promise<never>((_, reject) =>
         setTimeout(
-          () => reject(new Error('⏱ Timeout: Keine Antwort nach 5 Min. Bitte nochmal senden.')),
-          AGENT_RESPONSE_TIMEOUT_MS
+          () => reject(new Error(`⏱ Timeout: Keine Antwort nach ${Math.round(config.AGENT_RESPONSE_TIMEOUT_MS / 60000)} Min. Bitte nochmal senden.`)),
+          config.AGENT_RESPONSE_TIMEOUT_MS
         )
       ),
     ]);
@@ -649,8 +646,8 @@ async function handleWaitResponse(
       sendToAgent(sessionKey, message, { abortController, telegramCtx: ctx }),
       new Promise<never>((_, reject) =>
         setTimeout(
-          () => reject(new Error('⏱ Timeout: Keine Antwort nach 5 Min. Bitte nochmal senden.')),
-          AGENT_RESPONSE_TIMEOUT_MS
+          () => reject(new Error(`⏱ Timeout: Keine Antwort nach ${Math.round(config.AGENT_RESPONSE_TIMEOUT_MS / 60000)} Min. Bitte nochmal senden.`)),
+          config.AGENT_RESPONSE_TIMEOUT_MS
         )
       ),
     ]);

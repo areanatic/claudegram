@@ -215,7 +215,12 @@ Regeln:
 - Gute Beispiele: Ja/Nein-Entscheidungen, Optionsauswahl (A/B/C), nächste Schritte
 - Schlechte Beispiele: offene kreative Fragen, Konversation die freie Antwort braucht
 - Der [BUTTONS: ...] Block wird automatisch entfernt und als Telegram-Buttons angezeigt
-- Schreibe den Block IMMER in eine eigene Zeile am Ende` : '';
+- Schreibe den Block IMMER in eine eigene Zeile am Ende
+
+WICHTIG für [BUTTONS: ...] Reihenfolge (Mai-Intervention 2026-05-11 RI-08):
+- Falls du eine Reasoning Summary oder anderen Meta-Text hast: KOMMT VOR den Buttons
+- [BUTTONS: ...] muss ABSOLUTE LETZTE ZEILE deiner Antwort sein
+- KEIN Text NACH dem [BUTTONS: ...] Block — sonst rendert Telegram die Buttons nicht` : '';
 
 const TASK_OWNERSHIP_INSTRUCTION = `
 
@@ -245,7 +250,22 @@ Behavior rules (apply on EVERY response, not just long ones):
 
 These rules exist because the user previously experienced topic-loss + forgotten questions across multi-topic sessions and lost trust in your task-tracking. Your job is to be the one keeping the thread, not the user.`;
 
-const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING) + FOLLOWUP_BUTTONS_INSTRUCTION + TASK_OWNERSHIP_INSTRUCTION;
+/**
+ * Hard-coded Bot-Glossar (Mai-Intervention 2026-05-11 Phase A.1, RI-11 fix).
+ * Bridge-Cap-immune — wird in jeden System-Prompt prepended, kann nicht durch
+ * NEXUS_BRIDGE_MAX_CHARS truncated werden. soul.md + wiki/00-bot-glossary werden
+ * von Phase B als komplementäre Layer hinzukommen.
+ */
+const BOT_GLOSSARY_CONSTANT = `
+
+WICHTIG — Bot-Glossar (Production-Truth, hard-coded):
+- @AstronOneBot = Master Bot (Arashs Workspace, dieser hier)
+- @AlinaCheckBot = Family Bot (für Alina, BOT_NAME=Alina-Check)
+- @EffCheckBot = Mom Bot (für Effat, BOT_NAME=Mom-Check, FA+DE, weekly push)
+- @ManZamOneBot = Dad Bot (BOT_NAME=Dad-Check)
+Cross-Bot-Posting ist nicht implementiert. Bei "schick an Alina-Bot": ehrlich antworten dass dieser Mechanismus nicht existiert.`;
+
+const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + BOT_GLOSSARY_CONSTANT + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING) + FOLLOWUP_BUTTONS_INSTRUCTION + TASK_OWNERSHIP_INSTRUCTION;
 
 const REDDIT_TOOL_PROMPT = `
 
