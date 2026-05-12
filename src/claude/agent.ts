@@ -68,6 +68,25 @@ interface AgentResponse {
   sessionInit?: { model: string; sessionId: string };
 }
 
+/**
+ * Stage 2c (Mai-Intervention 2026-05-12): Canonical text the agent returns when
+ * it observes `isCancelled(sessionKey) === true` mid-stream. Exported so the
+ * Telegram-side streaming handler can detect "agent finished cleanly because
+ * /cancel won upstream" and route through the cancel-UI branch instead of
+ * `finishStreaming`, preventing the doppel-message pattern observed live on
+ * 2026-05-12 22:44 (one "🛑 Cancelled." from handleCancel + one
+ * "✅ Successfully cancelled..." edit on the streaming bubble).
+ *
+ * Single source of truth: any code emitting this sentinel MUST import this
+ * constant — do not duplicate the literal string elsewhere.
+ *
+ * Cross-Refs:
+ *  - shared-memory/nexus/phase_c_stage2c_minihotfix_report_2026-05-12.md
+ *  - src/bot/handlers/message.handler.ts (consumer)
+ */
+export const CLAUDE_CANCEL_SENTINEL_TEXT =
+  '✅ Successfully cancelled - no tools or agents in process.';
+
 interface ConversationMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -897,8 +916,10 @@ export async function sendToAgent(
             onProgress?.(fullText);
           }
         } else if (responseMessage.subtype === 'error_during_execution' && isCancelled(sessionKey)) {
-          // Interrupted via /cancel - show clean cancellation message
-          fullText = '✅ Successfully cancelled - no tools or agents in process.';
+          // Interrupted via /cancel - show clean cancellation message.
+          // Telegram-side handler detects this exact text (CLAUDE_CANCEL_SENTINEL_TEXT)
+          // to route the response through the cancel UI branch instead of finishStreaming.
+          fullText = CLAUDE_CANCEL_SENTINEL_TEXT;
           onProgress?.(fullText);
         } else {
           // error_max_turns or unexpected error_during_execution
@@ -917,10 +938,11 @@ export async function sendToAgent(
     }
   } catch (error) {
     watchdog?.stop();
-    // If cancelled via /cancel or /reset, return clean message
+    // If cancelled via /cancel or /reset, return clean message (Telegram-side
+    // handler detects CLAUDE_CANCEL_SENTINEL_TEXT and routes to cancel UI).
     if (isCancelled(sessionKey) || abortController?.signal.aborted) {
       return {
-        text: '✅ Successfully cancelled - no tools or agents in process.',
+        text: CLAUDE_CANCEL_SENTINEL_TEXT,
         toolsUsed,
       };
     }

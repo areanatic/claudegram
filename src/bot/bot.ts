@@ -157,8 +157,30 @@ export async function createBot(): Promise<Bot> {
     { command: 'commands', description: '📜 List all commands' },
   ];
 
-  bot.api.setMyCommands(commandList).then(() => {
-    console.log('📋 Command menu registered');
+  // Stage 2c (Mai-Intervention 2026-05-12): force-refresh the Telegram
+  // command menu. Live smoke-test 22:21 verified that newly added commands
+  // (e.g. /health) failed to match `bot.command('health', …)` because the
+  // Telegram backend kept serving a stale bot_command list — the user's
+  // typed "/health" arrived as plain text, fell through Grammy's command
+  // matcher and hit Claude as "Unknown skill: health". Deleting first
+  // forces Telegram to drop the cached list before we register the new one.
+  bot.api.deleteMyCommands().catch((err) => {
+    console.warn('⚠️ deleteMyCommands failed (non-fatal):', err?.message ?? err);
+  });
+  bot.api.setMyCommands(commandList).then(async () => {
+    console.log(`📋 Command menu registered (${commandList.length} commands)`);
+    // Confirm the Telegram backend now sees the new list. If a registered
+    // bot.command(...) is missing here it usually means a stale cache or a
+    // mismatch between this commandList and what the user is typing.
+    try {
+      const live = await bot.api.getMyCommands();
+      console.log(
+        `📋 Telegram backend reports ${live.length} commands: ` +
+          `[${live.map((c) => '/' + c.command).join(', ')}]`,
+      );
+    } catch (err) {
+      console.debug('[bot] getMyCommands confirmation failed:', err);
+    }
   }).catch((err) => {
     console.warn('⚠️ Failed to register commands:', err.message);
   });

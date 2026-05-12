@@ -1,5 +1,11 @@
 import { Context } from 'grammy';
-import { sendToAgent, sendLoopToAgent, clearConversation, type AgentUsage } from '../../claude/agent.js';
+import {
+  sendToAgent,
+  sendLoopToAgent,
+  clearConversation,
+  CLAUDE_CANCEL_SENTINEL_TEXT,
+  type AgentUsage,
+} from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { config } from '../../config.js';
 import { messageSender } from '../../telegram/message-sender.js';
@@ -34,6 +40,7 @@ import {
   disposeRequestContext,
   markSuccess,
   markCancelled,
+  HandlerState,
   type RequestContext,
   type RequestOrigin,
 } from '../../handler/request-context.js';
@@ -601,6 +608,24 @@ export async function handleAgentReply(
           throw innerErr;
         }
 
+        // Stage 2c (2026-05-12): cancel-sentinel guard — same rationale as
+        // handleStreamingResponse below. Detect the canonical cancel reply and
+        // route through cancelStreaming so /plan, /explore and /loop also obey
+        // the single-reply invariant when /cancel races a clean agent return.
+        const isCancelSentinel = response.text === CLAUDE_CANCEL_SENTINEL_TEXT;
+        const wasAlreadyCancelled = reqCtx.state === HandlerState.CANCELLED;
+        if (isCancelSentinel || wasAlreadyCancelled) {
+          markCancelled(reqCtx, 'user-cancel');
+          console.log(
+            `[RequestContext ${reqCtx.requestId}] ${mode} cancel-sentinel routed via ` +
+              `cancelStreaming (state=${reqCtx.state} sentinel=${isCancelSentinel})`,
+          );
+          try {
+            await messageSender.cancelStreaming(ctx);
+          } catch { /* best-effort */ }
+          return;
+        }
+
         if (!markSuccess(reqCtx)) {
           console.log(
             `[RequestContext ${reqCtx.requestId}] late ${mode} response discarded ` +
@@ -756,6 +781,37 @@ async function handleStreamingResponse(
       telegramCtx: ctx,
     });
 
+    // Stage 2c (2026-05-12): cancel-sentinel guard.
+    //
+    // The agent returns CLAUDE_CANCEL_SENTINEL_TEXT verbatim when it observed
+    // isCancelled(sessionKey) === true mid-stream. If we slipped past the
+    // markCancelled() race in handleCancel (handleCancel marked AFTER the
+    // streaming handler's await resolved), markSuccess() would otherwise win
+    // and finishStreaming() would edit the streaming bubble to the sentinel
+    // text — producing the live-reproduced doppel-message pattern
+    // (1× "🛑 Cancelled." from handleCancel + 1× "✅ Successfully cancelled…"
+    // edit on the streaming bubble).
+    //
+    // The single-reply invariant: handleCancel already sent "🛑 Cancelled." as
+    // a fresh bubble. Route this response through the cancel-UI branch so the
+    // initial streaming bubble gets edited to the neutral "⚠️ Request cancelled"
+    // status (set by cancelStreaming) — never to a second Claude-style reply.
+    const isCancelSentinel = response.text === CLAUDE_CANCEL_SENTINEL_TEXT;
+    const wasAlreadyCancelled = reqCtx.state === HandlerState.CANCELLED;
+    if (isCancelSentinel || wasAlreadyCancelled) {
+      // Idempotent: markCancelled returns false if finalize was already won
+      // by handleCancel — that's expected and fine, state is already CANCELLED.
+      markCancelled(reqCtx, 'user-cancel');
+      console.log(
+        `[RequestContext ${reqCtx.requestId}] cancel-sentinel routed via ` +
+          `cancelStreaming (state=${reqCtx.state} sentinel=${isCancelSentinel})`,
+      );
+      try {
+        await messageSender.cancelStreaming(ctx);
+      } catch { /* best-effort cleanup */ }
+      return;
+    }
+
     if (!markSuccess(reqCtx)) {
       // Hard-cap or external cancel already won finalize. The user has already
       // seen a timeout/cancel reply. Drop this late response on the floor.
@@ -847,6 +903,23 @@ async function handleWaitResponse(
         return;
       }
       throw error;
+    }
+
+    // Stage 2c (2026-05-12): cancel-sentinel guard for the wait path. Same
+    // rationale as the streaming variant: if /cancel races a clean agent
+    // return (agent saw isCancelled mid-stream and returned the sentinel),
+    // suppress the would-be second user-visible reply. handleCancel already
+    // sent "🛑 Cancelled." — we stay silent here to keep the single-reply
+    // invariant.
+    const isCancelSentinel = response.text === CLAUDE_CANCEL_SENTINEL_TEXT;
+    const wasAlreadyCancelled = reqCtx.state === HandlerState.CANCELLED;
+    if (isCancelSentinel || wasAlreadyCancelled) {
+      markCancelled(reqCtx, 'user-cancel');
+      console.log(
+        `[RequestContext ${reqCtx.requestId}] wait cancel-sentinel suppressed ` +
+          `(state=${reqCtx.state} sentinel=${isCancelSentinel})`,
+      );
+      return;
     }
 
     if (!markSuccess(reqCtx)) {
