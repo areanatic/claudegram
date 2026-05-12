@@ -3,7 +3,6 @@ import { sessionManager } from '../../claude/session-manager.js';
 import {
   clearConversation,
   sendToAgent,
-  sendLoopToAgent,
   setModel,
   getModel,
   isDangerousMode,
@@ -33,7 +32,7 @@ import { sendFollowUpButtons } from '../../telegram/followup-buttons.js';
 import { transcribeFile, downloadTelegramAudio } from '../../audio/transcribe.js';
 import { executeVReddit } from '../../reddit/vreddit.js';
 import { redditFetch, redditFetchBoth, type RedditFetchOptions } from '../../reddit/redditfetch.js';
-import { fmtTokens, getProgressBar } from './message.handler.js';
+import { fmtTokens, getProgressBar, handleAgentReply } from './message.handler.js';
 import {
   detectPlatform,
   platformLabel,
@@ -54,7 +53,11 @@ import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { findDefaultNexusRoot } from '../../nexus/bridge.js';
 import { isPrivate, setPrivate, setPublic, getStatus } from '../../memory/privacy-state.js';
-import { snapshotRegistry } from '../../handler/request-registry.js';
+import {
+  getActiveContextsForSession,
+  snapshotRegistry,
+} from '../../handler/request-registry.js';
+import { markCancelled } from '../../handler/request-context.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -1264,10 +1267,28 @@ export async function handleCancel(ctx: Context): Promise<void> {
   const { sessionKey } = keyInfo;
 
   const wasProcessing = isProcessing(sessionKey);
+
+  // Stage 2b Action 5: finalise active RequestContexts BEFORE the SDK
+  // cancellation reaches the handler. Marking them CANCELLED via
+  // `markCancelled()` (which calls finalizeOnce) makes the handler's
+  // `markSuccess()` return false on any late "Successfully cancelled"
+  // response from the agent — so the user sees exactly ONE cancel reply
+  // (this command's reply below), no duplicate from the agent stream.
+  const activeContexts = getActiveContextsForSession(sessionKey);
+  for (const reqCtx of activeContexts) {
+    const won = markCancelled(reqCtx, 'user-cancel');
+    if (won) {
+      console.log(
+        `[handleCancel] finalised RequestContext requestId=${reqCtx.requestId} ` +
+          `session=${sessionKey} origin=${reqCtx.origin}`,
+      );
+    }
+  }
+
   const cancelled = await cancelRequest(sessionKey);
   const clearedCount = clearQueue(sessionKey);
 
-  if (cancelled || clearedCount > 0) {
+  if (cancelled || clearedCount > 0 || activeContexts.length > 0) {
     let message = '🛑 Cancelled\\.';
     if (clearedCount > 0) {
       message += ` \\(${clearedCount} queued request${clearedCount > 1 ? 's' : ''} cleared\\)`;
@@ -1428,34 +1449,11 @@ export async function handlePlan(ctx: Context): Promise<void> {
     return;
   }
 
-  try {
-    await queueRequest(sessionKey, task, async () => {
-      await messageSender.startStreaming(ctx);
-
-      const abortController = new AbortController();
-      setAbortController(sessionKey, abortController);
-
-      try {
-        const response = await sendToAgent(sessionKey, task, {
-          onProgress: (progressText) => {
-            messageSender.updateStream(ctx, progressText);
-          },
-          abortController,
-          command: 'plan',
-        });
-
-        await messageSender.finishStreaming(ctx, response.text);
-        await maybeSendVoiceReply(ctx, response.text);
-      } catch (error) {
-        await messageSender.cancelStreaming(ctx);
-        throw error;
-      }
-    });
-  } catch (error) {
-    if ((error as Error).message === 'Queue cleared') return;
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    await replyMd(ctx, `❌ Error: ${esc(errorMessage)}`);
-  }
+  // Stage 2b Action 4: delegate to message.handler's `handleAgentReply` so the
+  // direct-command path (`/plan <task>`) gets the same RequestContext-driven
+  // hard-cap as the ForceReply path. DRY-er than maintaining two near-identical
+  // bodies; closes the Day-1 Doppel-Message gap on direct commands.
+  await handleAgentReply(ctx, sessionKey, task, 'plan');
 }
 
 export async function handleExplore(ctx: Context): Promise<void> {
@@ -1487,34 +1485,10 @@ export async function handleExplore(ctx: Context): Promise<void> {
     return;
   }
 
-  try {
-    await queueRequest(sessionKey, question, async () => {
-      await messageSender.startStreaming(ctx);
-
-      const abortController = new AbortController();
-      setAbortController(sessionKey, abortController);
-
-      try {
-        const response = await sendToAgent(sessionKey, question, {
-          onProgress: (progressText) => {
-            messageSender.updateStream(ctx, progressText);
-          },
-          abortController,
-          command: 'explore',
-        });
-
-        await messageSender.finishStreaming(ctx, response.text);
-        await maybeSendVoiceReply(ctx, response.text);
-      } catch (error) {
-        await messageSender.cancelStreaming(ctx);
-        throw error;
-      }
-    });
-  } catch (error) {
-    if ((error as Error).message === 'Queue cleared') return;
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    await replyMd(ctx, `❌ Error: ${esc(errorMessage)}`);
-  }
+  // Stage 2b Action 4: delegate to message.handler's `handleAgentReply` so the
+  // direct-command path (`/explore <question>`) gets the same RequestContext-driven
+  // hard-cap as the ForceReply path.
+  await handleAgentReply(ctx, sessionKey, question, 'explore');
 }
 
 export async function handleResume(ctx: Context): Promise<void> {
@@ -1636,33 +1610,10 @@ export async function handleLoop(ctx: Context): Promise<void> {
     return;
   }
 
-  try {
-    await queueRequest(sessionKey, task, async () => {
-      await messageSender.startStreaming(ctx);
-
-      const abortController = new AbortController();
-      setAbortController(sessionKey, abortController);
-
-      try {
-        const response = await sendLoopToAgent(sessionKey, task, {
-          onProgress: (progressText) => {
-            messageSender.updateStream(ctx, progressText);
-          },
-          abortController,
-        });
-
-        await messageSender.finishStreaming(ctx, response.text);
-        await maybeSendVoiceReply(ctx, response.text);
-      } catch (error) {
-        await messageSender.cancelStreaming(ctx);
-        throw error;
-      }
-    });
-  } catch (error) {
-    if ((error as Error).message === 'Queue cleared') return;
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    await replyMd(ctx, `❌ Error: ${esc(errorMessage)}`);
-  }
+  // Stage 2b Action 4: delegate to message.handler's `handleAgentReply` so the
+  // direct-command path (`/loop <task>`) gets the same RequestContext-driven
+  // hard-cap as the ForceReply path.
+  await handleAgentReply(ctx, sessionKey, task, 'loop');
 }
 
 export async function handleSessions(ctx: Context): Promise<void> {
@@ -3657,13 +3608,20 @@ export async function handleHealth(ctx: Context): Promise<void> {
     memoryError = err instanceof Error ? err.message : String(err);
   }
 
-  // Compliance check: Promise.race should be 0 in agent-call paths post-C.1.
-  // We expose the (deliberately) remaining call-sites for transparency rather
-  // than as a counter (would require runtime instrumentation). The number 4
-  // matches the post-C.1 mapping: index.ts:98 shutdown notify, request-queue.ts:201
-  // queue handler (Phase B gracefulCancel-wired), link-inbox.ts:119 capture
-  // pipeline, plus the comment-ref in request-queue.ts:18.
-  const promiseRaceRemaining = 4;
+  // Stage 2b Action 10: build-time static counter labelled as such so
+  // operators can verify against `grep -rnE 'await Promise\.race' src/`
+  // without thinking the number is runtime-instrumented. Updated on every
+  // build/commit; the label below contains the call-site list for transparency.
+  //
+  // Current call-sites (verify with: `grep -rnE 'await Promise\\.race' src/`):
+  //   - src/index.ts:98 (shutdown-notify race)
+  //   - src/claude/request-queue.ts (gracefulCancel interrupt-fallback)
+  //   - src/claude/request-queue.ts (processQueue failsafe — emits
+  //     QueueFailsafeTimeoutError, NOT user-facing)
+  //   - src/media/link-inbox.ts:119 (capture pipeline)
+  //
+  // Agent-call paths (message.handler.ts + handleAgentReply): 0 live races.
+  const PROMISE_RACE_BUILD_TIME_COUNT = 4; // allow-hardcoded: reason="build-time static counter, not a timeout"
 
   // Capability ledger pointer (file lives outside the repo — operator-readable)
   const ledgerPath = '/Volumes/AstronOne/shared-memory/nexus/capability_ledger.json';
@@ -3684,7 +3642,7 @@ export async function handleHealth(ctx: Context): Promise<void> {
   lines.push(
     ``,
     `*Memory FTS5 rows:* ${memoryRowCount >= 0 ? memoryRowCount : esc(`error: ${memoryError ?? 'unknown'}`)}`,
-    `*Promise\\.race outside agent path:* ${promiseRaceRemaining} \\(shutdown\\+queue\\+capture\\)`,
+    `*Promise\\.race outside agent path:* ${PROMISE_RACE_BUILD_TIME_COUNT} \\(build\\-time counter; verify: grep \\-rnE 'await Promise\\.race' src/\\)`,
     `*Agent\\-path Promise\\.race:* 0 \\(Sprint 3 RequestContext\\)`,
     `*Adaptive timeout threshold:* ${config.ADAPTIVE_TIMEOUT_QUEUE_THRESHOLD} queued`,
     `*Hard\\-cap base:* ${Math.round(config.AGENT_RESPONSE_TIMEOUT_MS / 60000)} min`, // allow-hardcoded: reason="ms→min display conversion"

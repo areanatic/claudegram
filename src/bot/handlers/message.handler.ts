@@ -12,6 +12,8 @@ import {
   setAbortController,
   cancelRequest,
   clearQueue,
+  QueueFailsafeTimeoutError,
+  QueueWaitTimeoutError,
 } from '../../claude/request-queue.js';
 import { isClaudeCommand } from '../../claude/command-parser.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
@@ -32,7 +34,6 @@ import {
   disposeRequestContext,
   markSuccess,
   markCancelled,
-  HandlerState,
   type RequestContext,
   type RequestOrigin,
 } from '../../handler/request-context.js';
@@ -369,6 +370,31 @@ export async function handleMessage(ctx: Context): Promise<void> {
     if ((error as Error).message === 'Queue cleared') {
       return;
     }
+    // Stage 2b Action 3: queue failsafe-timeout fired AFTER the RequestContext
+    // hard-cap already replied to the user. Swallow silently to avoid a
+    // doppel-message (the 2026-05-11 21:01 pattern observed by the user).
+    if (error instanceof QueueFailsafeTimeoutError) {
+      console.log(
+        `[handleMessage] swallowing QueueFailsafeTimeoutError for ${sessionKey} ` +
+          `— RequestContext.onHardCap already replied.`,
+      );
+      return;
+    }
+    // Stage 2b Action 1: queued item exceeded wait-bound BEFORE its
+    // RequestContext was created. Surface a single timeout message — this is
+    // the only layer that owns the user-reply for this case.
+    if (error instanceof QueueWaitTimeoutError) {
+      console.log(
+        `[handleMessage] queue-wait timeout for ${sessionKey} after ${Math.round(error.waitedMs / 1000)}s`, // allow-hardcoded: reason="ms→s log conversion"
+      );
+      try {
+        await ctx.reply(
+          '⏱ Timeout: Deine Anfrage hat zu lange in der Warteschlange gewartet. Bitte nochmal senden.',
+          { parse_mode: undefined },
+        );
+      } catch { /* best-effort */ }
+      return;
+    }
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('Error handling message:', error);
     await ctx.reply(`❌ Error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
@@ -482,8 +508,14 @@ async function handleFileReply(ctx: Context, sessionKey: string, filePath: strin
   }
 }
 
-// Handle reply to plan/explore/loop ForceReply prompts
-async function handleAgentReply(
+/**
+ * Handle reply to /plan, /explore, /loop ForceReply prompts AND direct
+ * command-argument invocations (Stage 2b Action 4: command.handler.ts
+ * `handlePlan`/`handleExplore`/`handleLoop` now delegate here so the
+ * RequestContext state-machine is the single agent-call entry-point for
+ * /plan, /explore, /loop. DRY-er than maintaining 4 near-identical bodies.
+ */
+export async function handleAgentReply(
   ctx: Context,
   sessionKey: string,
   input: string,
@@ -596,6 +628,28 @@ async function handleAgentReply(
     });
   } catch (error) {
     if ((error as Error).message === 'Queue cleared') return;
+    // Stage 2b Action 3: swallow failsafe (RequestContext already replied).
+    if (error instanceof QueueFailsafeTimeoutError) {
+      console.log(
+        `[handleAgentReply ${mode}] swallowing QueueFailsafeTimeoutError ` +
+          `for ${sessionKey} — RequestContext.onHardCap already replied.`,
+      );
+      return;
+    }
+    // Stage 2b Action 1: queued item timed out BEFORE RequestContext creation.
+    if (error instanceof QueueWaitTimeoutError) {
+      console.log(
+        `[handleAgentReply ${mode}] queue-wait timeout for ${sessionKey} after ` +
+          `${Math.round(error.waitedMs / 1000)}s`, // allow-hardcoded: reason="ms→s log conversion"
+      );
+      try {
+        await ctx.reply(
+          '⏱ Timeout: Deine Anfrage hat zu lange in der Warteschlange gewartet. Bitte nochmal senden.',
+          { parse_mode: undefined },
+        );
+      } catch { /* best-effort */ }
+      return;
+    }
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     await ctx.reply(`❌ Error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
   }
@@ -709,6 +763,11 @@ async function handleStreamingResponse(
         `[RequestContext ${reqCtx.requestId}] late agent response discarded ` +
           `(state=${reqCtx.state} reason=${reqCtx.cancelReason})`,
       );
+      // Stage 2b Action 6: cancel the streaming UI / typing indicator so it
+      // doesn't hang after the agent's late response was discarded.
+      try {
+        await messageSender.cancelStreaming(ctx);
+      } catch { /* best-effort cleanup */ }
       return;
     }
 

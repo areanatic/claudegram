@@ -693,7 +693,22 @@ export async function sendToAgent(
     // Store the Query object so /cancel can call interrupt()
     setActiveQuery(sessionKey, response);
 
-    // Initialize watchdog for long-running query monitoring
+    // Initialize watchdog for long-running query monitoring.
+    //
+    // Stage 2b Action 7 (deferred to Phase D): full RequestContext-aware
+    // watchdog. The watchdog currently runs as its own state machine and does
+    // not read the per-request RequestContext registry. Codex Pattern-B review
+    // flagged this as "V2.5-3 not yet enforced in code". Deferred because:
+    //   (a) the RequestContext hard-cap timer already enforces the per-request
+    //       timeout from the handler side — the watchdog is a defense-in-depth
+    //       SDK-stuck detector, NOT the primary user-facing timeout;
+    //   (b) coupling watchdog to registry creates a third place that can call
+    //       finalize/cancel — risk of triple-finalize in pathological cases;
+    //   (c) Phase D will redesign the watchdog as part of worker-process
+    //       isolation (Cluster F / Codex 2nd Review V2.4), making this hook
+    //       a transitional step that adds complexity for short-term gain.
+    //
+    // Tracked in: shared-memory/nexus/phase_c_stage2b_hotfix_report_2026-05-12.md (item 7).
     watchdog = config.AGENT_WATCHDOG_ENABLED
       ? new AgentWatchdog({
           chatId: sessionKey,

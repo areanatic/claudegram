@@ -22,7 +22,10 @@
 
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
-import { gracefulCancel } from '../claude/request-queue.js';
+import {
+  getPendingQueueLength,
+  gracefulCancel,
+} from '../claude/request-queue.js';
 import {
   registerRequestContext,
   unregisterRequestContext,
@@ -101,23 +104,60 @@ export interface CreateRequestContextOptions {
 }
 
 /**
- * Compute the effective per-request timeout based on current per-session queue
- * pressure. V2.5-3 / Sprint 5 Adaptive Timeout.
+ * Compute the effective per-request timeout based on current per-session
+ * queue pressure. V2.5-3 / Sprint 5 Adaptive Timeout.
  *
  * Formula:
  *   if queueLength <= threshold: baseTimeout
  *   else: max(baseTimeout * (1 - (queueLength - threshold) * step), baseTimeout * floor)
  *
+ * Stage 2b Action 2: `queueLength` is now the sum of the pending request-queue
+ * length AND the live RequestContext registry length. In serial workloads the
+ * registry is at most 1 (the in-flight handler), so the pending queue is the
+ * real pressure-signal. Combining both is forward-safe in case future workloads
+ * have multiple in-flight contexts per session.
+ *
  * Defaults yield: queueLen 6 → 90%, 7 → 80%, 10 → 50%, 100 → 50% (floored).
+ *
+ * Config-Validation Stage 2b: threshold/step/floor are clamped to a sane range
+ * inside the function so a misconfigured `.env` cannot produce a 0ms timeout.
  */
 export function computeAdaptiveTimeout(
   sessionKey: string,
   baseTimeoutMs: number,
 ): { effectiveTimeoutMs: number; queueLength: number } {
-  const queueLength = getActiveQueueLength(sessionKey);
-  const threshold = config.ADAPTIVE_TIMEOUT_QUEUE_THRESHOLD;
-  const step = config.ADAPTIVE_TIMEOUT_STEP_RATIO;
-  const floor = config.ADAPTIVE_TIMEOUT_FLOOR_RATIO;
+  // Combine pending-queue (real pressure) with active-registry (forward-safe).
+  const pending = safePendingQueueLength(sessionKey);
+  const active = getActiveQueueLength(sessionKey);
+  const queueLength = pending + active;
+
+  // Clamp config so a misconfigured deployment cannot break the timer.
+  const rawThreshold = config.ADAPTIVE_TIMEOUT_QUEUE_THRESHOLD;
+  const rawStep = config.ADAPTIVE_TIMEOUT_STEP_RATIO;
+  const rawFloor = config.ADAPTIVE_TIMEOUT_FLOOR_RATIO;
+  const threshold =
+    Number.isFinite(rawThreshold) && rawThreshold >= 0
+      ? rawThreshold
+      : 5; // allow-hardcoded: reason="config-fallback when env is invalid, not a timeout"
+  const step =
+    Number.isFinite(rawStep) && rawStep >= 0 && rawStep <= 1
+      ? rawStep
+      : 0.1; // allow-hardcoded: reason="config-fallback ratio for invalid env"
+  const floor =
+    Number.isFinite(rawFloor) && rawFloor > 0 && rawFloor <= 1
+      ? rawFloor
+      : 0.5; // allow-hardcoded: reason="config-fallback ratio for invalid env"
+  if (
+    rawThreshold !== threshold ||
+    rawStep !== step ||
+    rawFloor !== floor
+  ) {
+    console.warn(
+      `[ComputeAdaptiveTimeout] config clamp applied (env values out of range): ` +
+        `threshold=${rawThreshold}->${threshold}, step=${rawStep}->${step}, ` +
+        `floor=${rawFloor}->${floor}`,
+    );
+  }
 
   if (queueLength <= threshold) {
     return { effectiveTimeoutMs: baseTimeoutMs, queueLength };
@@ -126,6 +166,16 @@ export function computeAdaptiveTimeout(
   const shrunkRatio = Math.max(1 - excess * step, floor);
   const effective = Math.round(baseTimeoutMs * shrunkRatio);
   return { effectiveTimeoutMs: effective, queueLength };
+}
+
+function safePendingQueueLength(sessionKey: string): number {
+  // Defensive: request-queue.ts is loaded above; in pathological reload
+  // scenarios the function could be undefined. Treat as zero pressure.
+  try {
+    return getPendingQueueLength(sessionKey);
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -287,11 +337,5 @@ export function disposeRequestContext(ctx: RequestContext): void {
   unregisterRequestContext(ctx);
 }
 
-/**
- * Inspect whether the deadline has already passed. Used by request-queue.ts
- * to skip dequeued items whose timeout fired while they were waiting in line
- * (Codex Test-Case 5).
- */
-export function isDeadlineExpired(ctx: RequestContext): boolean {
-  return Date.now() > ctx.deadline_ms;
-}
+// (Stage 2b Action 10 dead-code removal): `isDeadlineExpired` was unused —
+// request-queue.ts reads `getEarliestDeadline(sessionKey)` directly. Removed.

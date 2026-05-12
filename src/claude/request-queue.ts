@@ -7,7 +7,36 @@ type QueuedRequest<T> = {
   handler: () => Promise<T>;
   resolve: (value: T) => void;
   reject: (error: Error) => void;
+  /**
+   * Stage 2b Action 1: enqueue-time timestamp. Used to enforce a wait-bound
+   * BEFORE the handler creates its RequestContext (the per-request hard-cap
+   * timer starts at dequeue, but the user expects total wait from "send" to
+   * be bounded). If a queued item sits past `enqueuedAt + AGENT_RESPONSE_TIMEOUT_MS`,
+   * it is skipped at dequeue with a marker error so the outer handler can stay
+   * silent — the RequestContext was never created, so no user-reply is owed
+   * from the RequestContext layer; we surface a one-time wait-bound timeout
+   * reply here instead.
+   */
+  enqueuedAt_ms: number;
+  /** Absolute epoch-ms deadline = enqueuedAt + AGENT_RESPONSE_TIMEOUT_MS. */
+  deadline_ms: number;
 };
+
+/**
+ * Stage 2b Action 1 + Action 3: wait-bound timeout. Raised at dequeue when
+ * the queued item is older than its deadline. Distinct from
+ * `QueueFailsafeTimeoutError` because no RequestContext was ever created —
+ * the outer error-handler crafts the user reply for this case.
+ */
+export class QueueWaitTimeoutError extends Error {
+  readonly name = 'QueueWaitTimeoutError';
+  constructor(public readonly sessionKey: string, public readonly waitedMs: number) {
+    super(
+      `Queued request waited ${Math.round(waitedMs / 1000)}s before dequeue — ` + // allow-hardcoded: reason="ms→s log conversion, not a timeout value"
+        `exceeds AGENT_RESPONSE_TIMEOUT_MS for session=${sessionKey}.`,
+    );
+  }
+}
 
 const activeAbortControllers: Map<string, AbortController> = new Map();
 const activeQueries: Map<string, Query> = new Map();
@@ -15,11 +44,45 @@ const pendingQueues: Map<string, Array<QueuedRequest<unknown>>> = new Map();
 const processingFlags: Map<string, boolean> = new Map();
 
 /**
- * Hard ceiling for handler completion. Set to AGENT_RESPONSE_TIMEOUT_MS + 60s
- * buffer so the handler-level timer always fires after the in-flight Promise.race
- * timer in message.handler.ts. Mai-Intervention 2026-05-11 Phase A.1.
+ * Hard ceiling for handler completion. Stage 2b Action 3 / Action 10:
+ *
+ * Pure internal failsafe — NOT a user-facing timer. The single source of
+ * timeout truth for the user is the per-request RequestContext hard-cap
+ * timer created in message.handler.ts / handleAgentReply. If this failsafe
+ * fires it means the handler did not honour its own RequestContext deadline
+ * (e.g. SDK hang past hard-cap + interrupt + AbortController fallback all
+ * failed). gracefulCancel tears down the SDK; the failsafe rejects with a
+ * QueueFailsafeTimeoutError that the outer handler MUST silently swallow —
+ * no second user-reply because RequestContext.onHardCap already sent one.
+ *
+ * Previously this comment referenced an in-flight `Promise.race` timer in
+ * message.handler.ts; that timer was removed in Stage 2 when the agent-call
+ * paths migrated to RequestContext. Stage 2b updated the comment to reflect
+ * the new contract.
  */
 const QUEUE_HANDLER_TIMEOUT_MS = config.AGENT_RESPONSE_TIMEOUT_MS + 60_000;
+
+/**
+ * Stage 2b Action 3: failsafe-timeout marker error. The outer error-handler
+ * in message.handler.ts checks `error.name === 'QueueFailsafeTimeoutError'`
+ * and suppresses the user-reply because the RequestContext has already
+ * delivered the timeout message via `onHardCap`.
+ */
+export class QueueFailsafeTimeoutError extends Error {
+  readonly name = 'QueueFailsafeTimeoutError';
+  constructor(public readonly sessionKey: string) {
+    super(`Queue handler failsafe timeout fired for session=${sessionKey}`);
+  }
+}
+
+/**
+ * Stage 2b Action 8: timeout for the SDK `query.interrupt()` call inside
+ * gracefulCancel. If the SDK does not respect interrupt within this window,
+ * fall back to last-resort AbortController.abort(). 5s is generous for a
+ * well-behaved SDK but short enough to keep the user from waiting.
+ */
+const INTERRUPT_TIMEOUT_MS = 5_000;
+
 // Tracks chats where a cancel was initiated. Cleared by gracefulCancel after
 // the SDK has actually torn down. See gracefulCancel() below for the canonical
 // pathway — direct SDK-aborts outside that function are banned.
@@ -47,21 +110,55 @@ export async function gracefulCancel(sessionKey: string, reason: string): Promis
   console.log(`[gracefulCancel] ${sessionKey} reason=${reason}`);
 
   const query = activeQueries.get(sessionKey);
+  let interruptHonoured = false;
   if (query) {
+    // Stage 2b Action 8: wrap query.interrupt() with its own short timeout.
+    // If the SDK ignores or hangs on interrupt(), we fall through to the
+    // AbortController last-resort below within INTERRUPT_TIMEOUT_MS instead
+    // of blocking the caller indefinitely.
+    //
+    // Note: Promise.race here is the *interrupt-fallback* race — not the
+    // request-handler timeout. Removing this race would leave gracefulCancel
+    // blocked indefinitely on a non-respecting SDK. If Phase D introduces
+    // worker-process-isolation, this race can be replaced by a kill-signal
+    // to the worker.
+    let timeoutHandle: NodeJS.Timeout | null = null;
     try {
-      await query.interrupt();
+      await Promise.race([
+        query.interrupt().then(() => {
+          interruptHonoured = true;
+        }),
+        new Promise<void>((resolve) => {
+          timeoutHandle = setTimeout(() => {
+            console.warn(
+              `[gracefulCancel] ${sessionKey} query.interrupt() exceeded ${INTERRUPT_TIMEOUT_MS}ms — falling back to AbortController.abort()`,
+            );
+            resolve();
+          }, INTERRUPT_TIMEOUT_MS);
+        }),
+      ]);
     } catch (err) {
       console.debug(`[gracefulCancel] ${sessionKey} interrupt() threw`, err);
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     }
     activeQueries.delete(sessionKey);
   }
 
-  // Last-resort abort, only when no Query existed (handler still in race window).
-  // SDK subprocess may crash; we accept that risk only because nothing else can cancel.
+  // Last-resort abort:
+  //   - whenever no Query was registered (handler still in race window), OR
+  //   - whenever query.interrupt() did NOT complete within INTERRUPT_TIMEOUT_MS
+  //     (Stage 2b Action 8: SDK-AbortSignal-Non-Respect fallback).
+  // SDK subprocess may crash; we accept that risk because nothing else can
+  // cancel a stuck SDK. Phase D may replace this with worker-process kill if
+  // AbortController is also ignored by the SDK.
   const controller = activeAbortControllers.get(sessionKey);
-  if (controller && !controller.signal.aborted) {
+  if (controller && !controller.signal.aborted && !interruptHonoured) {
     console.warn(`[gracefulCancel] ${sessionKey} LAST-RESORT abort — SDK crash risk acknowledged. Reason: ${reason}`);
     controller.abort(); // allow-hardcoded: reason="last-resort fallback inside gracefulCancel only — SDK crash risk acknowledged"
+    activeAbortControllers.delete(sessionKey);
+  } else if (interruptHonoured) {
+    // Interrupt won — drop the controller so a future request gets a fresh one.
     activeAbortControllers.delete(sessionKey);
   }
 }
@@ -153,17 +250,33 @@ export function getQueuePosition(sessionKey: string): number {
   return queue ? queue.length : 0;
 }
 
+/**
+ * Stage 2b Action 2: real per-session pending-queue pressure signal. Used by
+ * `computeAdaptiveTimeout()` so adaptive shrink reacts to actual queue depth
+ * (not just the in-flight RequestContext count). Read-only.
+ */
+export function getPendingQueueLength(sessionKey: string): number {
+  const queue = pendingQueues.get(sessionKey);
+  return queue ? queue.length : 0;
+}
+
 export async function queueRequest<T>(
   sessionKey: string,
   message: string,
   handler: () => Promise<T>
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
+    const enqueuedAt_ms = Date.now();
     const request: QueuedRequest<T> = {
       message,
       handler,
       resolve: resolve as (value: unknown) => void,
       reject,
+      enqueuedAt_ms,
+      // Stage 2b Action 1: enqueue-time deadline. Uses the base
+      // AGENT_RESPONSE_TIMEOUT_MS — adaptive shrink applies later at the
+      // RequestContext layer when the handler actually runs.
+      deadline_ms: enqueuedAt_ms + config.AGENT_RESPONSE_TIMEOUT_MS,
     };
 
     let queue = pendingQueues.get(sessionKey);
@@ -196,20 +309,35 @@ async function processQueue(sessionKey: string): Promise<void> {
   // ran out of order or was bypassed by an uncaught error upstream.
   clearCancelled(sessionKey);
 
-  // Phase C.1 / V2.5-3: Deadline-Propagation. If a RequestContext for this
-  // session already expired while sitting in the queue (Codex Test-Case 5:
-  // "Queue-Drain mit bereits abgelaufener Deadline startet keinen Agent-Call
-  // mehr"), reject immediately without spawning a fresh SDK call. The handler
-  // itself will create its own RequestContext on dequeue; this guard fires
-  // ONLY for stale upstream contexts that already finalised TIMED_OUT.
+  // Phase C.1 / V2.5-3: Deadline-Propagation, two layers.
+  //
+  // Layer 1 (Stage 2b Action 1): per-queue-item enqueue-time deadline.
+  // The user expects total wait (from "send" to first reply) to be bounded
+  // by AGENT_RESPONSE_TIMEOUT_MS. If a queued item sat past that, skip it
+  // and surface a single wait-bound timeout error to the caller. No
+  // RequestContext was created yet for this item, so the OUTER handler owns
+  // the user-reply via QueueWaitTimeoutError instanceof check.
+  const nowAtDequeue = Date.now();
+  if (nowAtDequeue > request.deadline_ms) {
+    const waitedMs = nowAtDequeue - request.enqueuedAt_ms;
+    processingFlags.set(sessionKey, false);
+    request.reject(new QueueWaitTimeoutError(sessionKey, waitedMs));
+    if (queue.length > 0) {
+      processQueue(sessionKey);
+    }
+    return;
+  }
+
+  // Layer 2 (Stage 2 V2.5-3): stale RequestContext deadline.
+  // Defense-in-depth check for the case where a previous handler crashed
+  // without disposing its RequestContext — the registry still holds an
+  // expired ctx that would falsely make `getEarliestDeadline` claim "past".
+  // The Stage 2b registry sweep (`sweepTerminalContexts`) eventually clears
+  // such orphans; this guard ensures correctness in the window before sweep.
   const earliestDeadline = getEarliestDeadline(sessionKey);
   if (earliestDeadline !== undefined && Date.now() > earliestDeadline) {
     processingFlags.set(sessionKey, false);
-    request.reject(
-      new Error(
-        '⏱ Timeout: Deadline ist abgelaufen, bevor die Anfrage drankam. Bitte nochmal senden.',
-      ),
-    );
+    request.reject(new QueueWaitTimeoutError(sessionKey, Date.now() - request.enqueuedAt_ms));
     if (queue.length > 0) {
       processQueue(sessionKey);
     }
@@ -219,17 +347,27 @@ async function processQueue(sessionKey: string): Promise<void> {
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
   try {
+    // Stage 2b Action 3: failsafe-timeout no longer crafts a user-facing
+    // error message. The RequestContext hard-cap timer in message.handler /
+    // handleAgentReply has ALREADY delivered the timeout reply via
+    // `onHardCap`. If this race wins, it means the handler did not honour
+    // its own deadline — we tear down the SDK + reject with a marker error
+    // so the outer error-handler can swallow it silently.
     const result = await Promise.race([
       request.handler(),
       new Promise<never>((_, reject) => {
         timeoutHandle = setTimeout(() => {
           // T1 Fix: Interrupt the active query to prevent ghost processes.
-          // Mai-Intervention Phase B.6: routed through gracefulCancel to avoid
-          // duplicating the interrupt/abort logic.
-          gracefulCancel(sessionKey, 'queue-handler-timeout').catch(err => {
+          // Mai-Intervention Phase B.6: routed through gracefulCancel.
+          gracefulCancel(sessionKey, 'queue-handler-failsafe').catch(err => {
             console.debug('[processQueue] gracefulCancel threw', err);
           });
-          reject(new Error(`⏱ Timeout: Anfrage nach ${QUEUE_HANDLER_TIMEOUT_MS / 60000} Min abgebrochen. Bitte nochmal senden.`));
+          console.warn(
+            `[processQueue] FAILSAFE timeout fired for ${sessionKey} after ` +
+              `${QUEUE_HANDLER_TIMEOUT_MS / 60_000}min. ` + // allow-hardcoded: reason="ms→min log conversion"
+              `Handler did not honour its RequestContext deadline — no user reply emitted from queue layer.`,
+          );
+          reject(new QueueFailsafeTimeoutError(sessionKey));
         }, QUEUE_HANDLER_TIMEOUT_MS);
       }),
     ]);

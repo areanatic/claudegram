@@ -62,6 +62,7 @@ import { handleVoice } from './handlers/voice.handler.js';
 import { handlePhoto, handleImageDocument } from './handlers/photo.handler.js';
 import { handleDocument } from './handlers/document.handler.js';
 import { handleFollowUpCallback } from '../telegram/followup-buttons.js';
+import { startRegistrySweep } from '../handler/request-registry.js';
 
 // Resolve sequentialize constraint: same-chat updates are ordered,
 // but /cancel is registered BEFORE this middleware so it bypasses it.
@@ -76,6 +77,11 @@ function getSequentializeKey(ctx: Context): string | undefined {
 }
 
 export async function createBot(): Promise<Bot> {
+  // Stage 2b Action 9: defensive RequestContext registry sweep. Eager-remove
+  // happens in `disposeRequestContext()`; this periodic safety-net catches
+  // contexts whose handler crashed outside the try/finally guard. 60s cadence.
+  startRegistrySweep();
+
   const botOptions: ConstructorParameters<typeof Bot>[1] = {
     client: {
       // Default is 500s which causes long hangs on network interruptions.
