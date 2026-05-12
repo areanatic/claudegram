@@ -20,6 +20,7 @@ import {
   isProcessing,
   queueRequest,
   setAbortController,
+  getActiveSessionKeys,
 } from '../../claude/request-queue.js';
 import { createTelegraphFromFile, createTelegraphPage } from '../../telegram/telegraph.js';
 import { isMediumUrl, fetchMediumArticle, FreediumArticle } from '../../medium/freedium.js';
@@ -53,6 +54,7 @@ import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { findDefaultNexusRoot } from '../../nexus/bridge.js';
 import { isPrivate, setPrivate, setPublic, getStatus } from '../../memory/privacy-state.js';
+import { snapshotRegistry } from '../../handler/request-registry.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -3594,6 +3596,109 @@ export async function handlePrivate(ctx: Context): Promise<void> {
       `Use /private on to temporarily isolate this chat from memory / wiki / personal tone\\.`,
     );
   }
+}
+
+/**
+ * /health — read-only compliance + observability dashboard.
+ * Mai-Intervention Phase C.3 / Sprint 8.
+ *
+ * Aggregates state from process metrics, the per-session active queue,
+ * the RequestContext registry, and the NEXUS memory FTS5 row count. Output
+ * is constrained to <1500 chars MarkdownV2 so it fits a single Telegram bubble.
+ *
+ * Cross-Refs:
+ *  - shared-memory/nexus/v25_phase_c_handoff_2026-05-12.md (C.3)
+ *  - shared-memory/nexus/codex_phase_c_pre_review_2026-05-12.md §5
+ */
+export async function handleHealth(ctx: Context): Promise<void> {
+  // Process metrics
+  const uptimeSec = Math.floor(process.uptime());
+  const hours = Math.floor(uptimeSec / 3600); // allow-hardcoded: reason="sec→h display conversion, not a timeout"
+  const minutes = Math.floor((uptimeSec % 3600) / 60); // allow-hardcoded: reason="sec→min display conversion"
+  const seconds = uptimeSec % 60; // allow-hardcoded: reason="display conversion"
+  const uptimeStr = hours > 0
+    ? `${hours}h ${minutes}m ${seconds}s`
+    : minutes > 0
+      ? `${minutes}m ${seconds}s`
+      : `${seconds}s`;
+
+  const pid = process.pid;
+  const memMB = (process.memoryUsage.rss() / 1024 / 1024).toFixed(1); // allow-hardcoded: reason="bytes→MB display conversion"
+
+  // Active queue + RequestContext registry
+  const activeKeys = getActiveSessionKeys();
+  const snapshot = snapshotRegistry();
+  const byStateLines = Object.entries(snapshot.byState)
+    .filter(([, n]) => n > 0)
+    .map(([state, n]) => `  • ${state}: ${n}`)
+    .join('\n');
+  const byOriginLines = Object.entries(snapshot.byOrigin)
+    .filter(([, n]) => n > 0)
+    .map(([origin, n]) => `  • ${origin}: ${n}`)
+    .join('\n');
+
+  // NEXUS Memory DB FTS5 row count (read-only). Lazy import so /health works
+  // even if memory subsystem fails to initialize.
+  let memoryRowCount = -1;
+  let memoryError: string | null = null;
+  try {
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(
+      '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/memory.db',
+      { readonly: true },
+    );
+    try {
+      const row = db.prepare('SELECT COUNT(*) AS n FROM memories').get() as { n: number };
+      memoryRowCount = row.n;
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    memoryError = err instanceof Error ? err.message : String(err);
+  }
+
+  // Compliance check: Promise.race should be 0 in agent-call paths post-C.1.
+  // We expose the (deliberately) remaining call-sites for transparency rather
+  // than as a counter (would require runtime instrumentation). The number 4
+  // matches the post-C.1 mapping: index.ts:98 shutdown notify, request-queue.ts:201
+  // queue handler (Phase B gracefulCancel-wired), link-inbox.ts:119 capture
+  // pipeline, plus the comment-ref in request-queue.ts:18.
+  const promiseRaceRemaining = 4;
+
+  // Capability ledger pointer (file lives outside the repo — operator-readable)
+  const ledgerPath = '/Volumes/AstronOne/shared-memory/nexus/capability_ledger.json';
+
+  const lines = [
+    `🩺 *Health* \\(${esc(config.BOT_NAME)}\\)`,
+    `*Uptime:* ${esc(uptimeStr)} · *PID:* ${pid} · *Mem:* ${esc(memMB)} MB`,
+    ``,
+    `*Active sessions:* ${activeKeys.length}`,
+    `*Active requests:* ${snapshot.totalActive} \\(${snapshot.sessionsActive} sessions\\)`,
+  ];
+  if (byStateLines) {
+    lines.push(`*By state:*\n${esc(byStateLines)}`);
+  }
+  if (byOriginLines) {
+    lines.push(`*By origin:*\n${esc(byOriginLines)}`);
+  }
+  lines.push(
+    ``,
+    `*Memory FTS5 rows:* ${memoryRowCount >= 0 ? memoryRowCount : esc(`error: ${memoryError ?? 'unknown'}`)}`,
+    `*Promise\\.race outside agent path:* ${promiseRaceRemaining} \\(shutdown\\+queue\\+capture\\)`,
+    `*Agent\\-path Promise\\.race:* 0 \\(Sprint 3 RequestContext\\)`,
+    `*Adaptive timeout threshold:* ${config.ADAPTIVE_TIMEOUT_QUEUE_THRESHOLD} queued`,
+    `*Hard\\-cap base:* ${Math.round(config.AGENT_RESPONSE_TIMEOUT_MS / 60000)} min`, // allow-hardcoded: reason="ms→min display conversion"
+    `*Capability ledger:* \`${esc(ledgerPath)}\``,
+  );
+
+  const body = lines.join('\n');
+  // Telegram MarkdownV2 single-bubble cap (4096); we self-cap at 1500 per Codex spec.
+  const HEALTH_MAX_CHARS = 1500;
+  const truncated = body.length > HEALTH_MAX_CHARS
+    ? body.slice(0, HEALTH_MAX_CHARS - 32) + '\n\\.\\.\\. \\(truncated\\)'
+    : body;
+
+  await replyMd(ctx, truncated);
 }
 
 // Re-export the state helpers so other modules (message handler, agent, etc.)

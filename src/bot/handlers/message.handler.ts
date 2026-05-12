@@ -27,6 +27,15 @@ import * as path from 'path';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
+import {
+  createRequestContext,
+  disposeRequestContext,
+  markSuccess,
+  markCancelled,
+  HandlerState,
+  type RequestContext,
+  type RequestOrigin,
+} from '../../handler/request-context.js';
 
 async function replyFeatureDisabled(ctx: Context, feature: string): Promise<void> {
   await ctx.reply(`⚠️ ${feature} feature is disabled in configuration.`, { parse_mode: undefined });
@@ -122,6 +131,53 @@ async function sendSessionInitNotification(
       + `_The agent may not remember earlier details\\. Consider sharing context\\._`;
     await ctx.reply(msg, { parse_mode: 'MarkdownV2' });
   }
+}
+
+/**
+ * Build the standard onLongRunning / onHardCap callbacks for a Telegram-context
+ * RequestContext. Mai-Intervention Phase C.1 / V2.5-1.
+ *
+ * onLongRunning sends ONE non-finalizing heartbeat. The agent stream keeps
+ * running; this is purely UX.
+ *
+ * onHardCap is invoked AFTER finalizeOnce has been won by the timer and AFTER
+ * gracefulCancel has been issued. It sends the user-facing timeout reply.
+ * Late real responses are silently discarded by the handler's success branch
+ * because their finalizeOnce() call returns false.
+ */
+function buildContextCallbacks(ctx: Context): {
+  onLongRunning: (reqCtx: RequestContext) => Promise<void>;
+  onHardCap: (reqCtx: RequestContext) => Promise<void>;
+} {
+  const onLongRunning = async (reqCtx: RequestContext): Promise<void> => {
+    const msg = config.HANDLER_LONG_RUNNING_MESSAGE;
+    if (!msg) return;
+    try {
+      await ctx.reply(msg, { parse_mode: undefined });
+    } catch (err) {
+      console.debug(
+        `[RequestContext ${reqCtx.requestId}] long-running notify failed:`,
+        err,
+      );
+    }
+  };
+
+  const onHardCap = async (reqCtx: RequestContext): Promise<void> => {
+    const minutes = Math.round(reqCtx.effectiveTimeoutMs / 60000); // allow-hardcoded: reason="ms→min display conversion, not a timeout value"
+    try {
+      await ctx.reply(
+        `⏱ Timeout: Keine Antwort nach ${minutes} Min. Bitte nochmal senden.`,
+        { parse_mode: undefined },
+      );
+    } catch (err) {
+      console.debug(
+        `[RequestContext ${reqCtx.requestId}] hard-cap notify failed:`,
+        err,
+      );
+    }
+  };
+
+  return { onLongRunning, onHardCap };
 }
 
 function getAutoVRedditUrl(text: string): string | null {
@@ -458,31 +514,70 @@ async function handleAgentReply(
       const abortController = new AbortController();
       setAbortController(sessionKey, abortController);
 
+      // Phase C.1 / V2.5-2 Option B (Codex Sparring 2026-05-12 conf 0.82):
+      // /plan /explore /loop previously had NO hard-cap and could wait forever
+      // when the SDK stalls. Wrap with the same RequestContext state machine
+      // used by streaming + wait paths so the timeout invariant is universal.
+      const origin: RequestOrigin = mode; // 'plan' | 'explore' | 'loop'
+      const callbacks = buildContextCallbacks(ctx);
+      const reqCtx = createRequestContext(sessionKey, origin, callbacks);
+
       try {
         let response;
-        if (mode === 'loop') {
-          response = await sendLoopToAgent(sessionKey, trimmedInput, {
-            onProgress: (progressText) => {
-              messageSender.updateStream(ctx, progressText);
-            },
-            abortController,
-            telegramCtx: ctx,
-          });
-        } else {
-          response = await sendToAgent(sessionKey, trimmedInput, {
-            onProgress: (progressText) => {
-              messageSender.updateStream(ctx, progressText);
-            },
-            onToolStart: (toolName, input) => {
-              messageSender.updateToolOperation(sessionKey, toolName, input, ctx);
-            },
-            onToolEnd: () => {
-              messageSender.clearToolOperation(sessionKey);
-            },
-            abortController,
-            command: mode,
-            telegramCtx: ctx,
-          });
+        try {
+          if (mode === 'loop') {
+            response = await sendLoopToAgent(sessionKey, trimmedInput, {
+              onProgress: (progressText) => {
+                messageSender.updateStream(ctx, progressText);
+              },
+              abortController,
+              telegramCtx: ctx,
+            });
+          } else {
+            response = await sendToAgent(sessionKey, trimmedInput, {
+              onProgress: (progressText) => {
+                messageSender.updateStream(ctx, progressText);
+              },
+              onToolStart: (toolName, input) => {
+                messageSender.updateToolOperation(sessionKey, toolName, input, ctx);
+              },
+              onToolEnd: () => {
+                messageSender.clearToolOperation(sessionKey);
+              },
+              abortController,
+              command: mode,
+              telegramCtx: ctx,
+            });
+          }
+        } catch (innerErr) {
+          const isAbort =
+            innerErr instanceof Error &&
+            (innerErr.name === 'AbortError' || innerErr.message.includes('aborted'));
+          if (!markCancelled(reqCtx, isAbort ? 'user-cancel' : 'system')) {
+            // Hard-cap already won: timeout reply has been sent. Cancel the
+            // streaming UI and stay silent.
+            console.log(
+              `[RequestContext ${reqCtx.requestId}] error after finalize discarded: ` +
+                (innerErr instanceof Error ? innerErr.message : String(innerErr)),
+            );
+            try {
+              await messageSender.cancelStreaming(ctx);
+            } catch { /* best-effort */ }
+            return;
+          }
+          await messageSender.cancelStreaming(ctx);
+          throw innerErr;
+        }
+
+        if (!markSuccess(reqCtx)) {
+          console.log(
+            `[RequestContext ${reqCtx.requestId}] late ${mode} response discarded ` +
+              `(state=${reqCtx.state} reason=${reqCtx.cancelReason})`,
+          );
+          try {
+            await messageSender.cancelStreaming(ctx);
+          } catch { /* best-effort */ }
+          return;
         }
 
         await messageSender.finishStreaming(ctx, response.text);
@@ -495,9 +590,8 @@ async function handleAgentReply(
 
         // Follow-up action buttons
         await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
-      } catch (error) {
-        await messageSender.cancelStreaming(ctx);
-        throw error;
+      } finally {
+        disposeRequestContext(reqCtx);
       }
     });
   } catch (error) {
@@ -585,29 +679,38 @@ async function handleStreamingResponse(
   const abortController = new AbortController();
   setAbortController(sessionKey, abortController);
 
+  // Phase C.1 / V2.5-1+V2.5-2: replace legacy Promise.race(handler, setTimeout) with
+  // RequestContext-driven state machine. Hard-cap is the SINGLE source of timeout
+  // truth; late agent responses after a timeout are silently discarded by the
+  // markSuccess() guard below.
+  const callbacks = buildContextCallbacks(ctx);
+  const reqCtx = createRequestContext(sessionKey, 'streaming', callbacks);
+
   let streamingFinished = false;
   try {
-    const response = await Promise.race([
-      sendToAgent(sessionKey, message, {
-        onProgress: (progressText) => {
-          messageSender.updateStream(ctx, progressText);
-        },
-        onToolStart: (toolName, input) => {
-          messageSender.updateToolOperation(sessionKey, toolName, input, ctx);
-        },
-        onToolEnd: () => {
-          messageSender.clearToolOperation(sessionKey);
-        },
-        abortController,
-        telegramCtx: ctx,
-      }),
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`⏱ Timeout: Keine Antwort nach ${Math.round(config.AGENT_RESPONSE_TIMEOUT_MS / 60000)} Min. Bitte nochmal senden.`)),
-          config.AGENT_RESPONSE_TIMEOUT_MS
-        )
-      ),
-    ]);
+    const response = await sendToAgent(sessionKey, message, {
+      onProgress: (progressText) => {
+        messageSender.updateStream(ctx, progressText);
+      },
+      onToolStart: (toolName, input) => {
+        messageSender.updateToolOperation(sessionKey, toolName, input, ctx);
+      },
+      onToolEnd: () => {
+        messageSender.clearToolOperation(sessionKey);
+      },
+      abortController,
+      telegramCtx: ctx,
+    });
+
+    if (!markSuccess(reqCtx)) {
+      // Hard-cap or external cancel already won finalize. The user has already
+      // seen a timeout/cancel reply. Drop this late response on the floor.
+      console.log(
+        `[RequestContext ${reqCtx.requestId}] late agent response discarded ` +
+          `(state=${reqCtx.state} reason=${reqCtx.cancelReason})`,
+      );
+      return;
+    }
 
     await messageSender.finishStreaming(ctx, response.text);
     streamingFinished = true;
@@ -621,10 +724,28 @@ async function handleStreamingResponse(
     // Follow-up action buttons
     await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
   } catch (error) {
+    const isAbort =
+      error instanceof Error &&
+      (error.name === 'AbortError' || error.message.includes('aborted'));
+    // If the hard-cap already won, suppress: user has seen the timeout message.
+    if (!markCancelled(reqCtx, isAbort ? 'user-cancel' : 'system')) {
+      console.log(
+        `[RequestContext ${reqCtx.requestId}] error after finalize discarded: ` +
+          (error instanceof Error ? error.message : String(error)),
+      );
+      if (!streamingFinished) {
+        try {
+          await messageSender.cancelStreaming(ctx);
+        } catch { /* best-effort cleanup */ }
+      }
+      return;
+    }
     if (!streamingFinished) {
       await messageSender.cancelStreaming(ctx);
     }
     throw error;
+  } finally {
+    disposeRequestContext(reqCtx);
   }
 }
 
@@ -641,16 +762,41 @@ async function handleWaitResponse(
   const abortController = new AbortController();
   setAbortController(sessionKey, abortController);
 
+  // Phase C.1 / V2.5-1+V2.5-2: replace legacy Promise.race(handler, setTimeout)
+  // with RequestContext state machine. Same contract as streaming path.
+  const callbacks = buildContextCallbacks(ctx);
+  const reqCtx = createRequestContext(sessionKey, 'wait', callbacks);
+
   try {
-    const response = await Promise.race([
-      sendToAgent(sessionKey, message, { abortController, telegramCtx: ctx }),
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`⏱ Timeout: Keine Antwort nach ${Math.round(config.AGENT_RESPONSE_TIMEOUT_MS / 60000)} Min. Bitte nochmal senden.`)),
-          config.AGENT_RESPONSE_TIMEOUT_MS
-        )
-      ),
-    ]);
+    let response;
+    try {
+      response = await sendToAgent(sessionKey, message, {
+        abortController,
+        telegramCtx: ctx,
+      });
+    } catch (error) {
+      const isAbort =
+        error instanceof Error &&
+        (error.name === 'AbortError' || error.message.includes('aborted'));
+      if (!markCancelled(reqCtx, isAbort ? 'user-cancel' : 'system')) {
+        // Hard-cap already won: silently swallow this late error — user has
+        // seen the timeout message via onHardCap.
+        console.log(
+          `[RequestContext ${reqCtx.requestId}] error after finalize discarded: ` +
+            (error instanceof Error ? error.message : String(error)),
+        );
+        return;
+      }
+      throw error;
+    }
+
+    if (!markSuccess(reqCtx)) {
+      console.log(
+        `[RequestContext ${reqCtx.requestId}] late agent response discarded ` +
+          `(state=${reqCtx.state} reason=${reqCtx.cancelReason})`,
+      );
+      return;
+    }
 
     await messageSender.sendMessage(ctx, response.text);
     await maybeSendVoiceReply(ctx, response.text);
@@ -665,5 +811,6 @@ async function handleWaitResponse(
   } finally {
     // Always stop typing indicator — even on timeout or error
     messageSender.stopTypingInterval(typingInterval);
+    disposeRequestContext(reqCtx);
   }
 }

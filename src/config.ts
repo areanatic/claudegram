@@ -209,6 +209,39 @@ const envSchema = z.object({
     .string()
     .default('600000')
     .transform((val) => parseInt(val, 10)),
+  // Mai-Intervention Phase C.1: Heartbeat threshold for RequestContext.
+  // When a request exceeds this, a one-time "still working" notification is sent
+  // and the state transitions WAITING → LONG_RUNNING. Does NOT finalize the request.
+  // Default 30s sits below the watchdog-warning so users get UX feedback early.
+  HANDLER_LONG_RUNNING_HEARTBEAT_MS: z
+    .string()
+    .default('30000')
+    .transform((val) => parseInt(val, 10)),
+  // Optional user-facing heartbeat sent on the LONG_RUNNING transition. Sent at
+  // most once per request. Disable by setting empty.
+  HANDLER_LONG_RUNNING_MESSAGE: z
+    .string()
+    .default('🐌 Brauche länger als gewöhnlich, bin aber dran…'),
+  // Mai-Intervention Phase C.2: Adaptive Per-Request Timeout (Sprint 5).
+  // When the per-session queue length exceeds this threshold, new requests get a
+  // proportionally shorter deadline so a back-pressured queue can drain before
+  // the user sees stale results.
+  ADAPTIVE_TIMEOUT_QUEUE_THRESHOLD: z
+    .string()
+    .default('5')
+    .transform((val) => parseInt(val, 10)),
+  // Per-item reduction step applied for every queued item above the threshold.
+  // 0.1 = 10% shorter per excess item. Clamped by ADAPTIVE_TIMEOUT_FLOOR_RATIO.
+  ADAPTIVE_TIMEOUT_STEP_RATIO: z
+    .string()
+    .default('0.1')
+    .transform((val) => parseFloat(val)),
+  // Lower bound for the adaptive multiplier — never shrink below this fraction
+  // of AGENT_RESPONSE_TIMEOUT_MS even if the queue is huge.
+  ADAPTIVE_TIMEOUT_FLOOR_RATIO: z
+    .string()
+    .default('0.5')
+    .transform((val) => parseFloat(val)),
   // Send a single user-facing "still working" message via Telegram when the
   // watchdog warning fires. One ping per query, configurable so deployments
   // can opt out or change the wording.

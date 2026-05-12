@@ -55,6 +55,7 @@ import {
   handleInboxCallback,
   handleWiki,
   handlePrivate,
+  handleHealth,
 } from './handlers/command.handler.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
@@ -146,6 +147,7 @@ export async function createBot(): Promise<Bot> {
     { command: 'mode', description: '⚙️ Toggle streaming mode' },
     { command: 'terminalui', description: '🖥️ Toggle terminal-style display' },
     { command: 'tts', description: '🔊 Toggle voice replies' },
+    { command: 'health', description: '🩺 Compliance + observability dashboard' },
     { command: 'commands', description: '📜 List all commands' },
   ];
 
@@ -164,6 +166,9 @@ export async function createBot(): Promise<Bot> {
   bot.command('softreset', handleReset);
   bot.command('reset', handleReset); // alias for /softreset
   bot.command('ping', handlePing);
+  // /health is read-only and must respond even when sequentialize is backed up,
+  // so register before the sequentialize middleware (same tier as /ping).
+  bot.command('health', handleHealth);
 
   // Sequentialize: same-chat updates are processed in order.
   // This runs AFTER /cancel so cancel bypasses it.

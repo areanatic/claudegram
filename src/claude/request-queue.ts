@@ -1,5 +1,6 @@
 import type { Query } from '@anthropic-ai/claude-agent-sdk';
 import { config } from '../config.js';
+import { getEarliestDeadline } from '../handler/request-registry.js';
 
 type QueuedRequest<T> = {
   message: string;
@@ -194,6 +195,26 @@ async function processQueue(sessionKey: string): Promise<void> {
   // clearing here guarantees a clean slate even if the previous finally
   // ran out of order or was bypassed by an uncaught error upstream.
   clearCancelled(sessionKey);
+
+  // Phase C.1 / V2.5-3: Deadline-Propagation. If a RequestContext for this
+  // session already expired while sitting in the queue (Codex Test-Case 5:
+  // "Queue-Drain mit bereits abgelaufener Deadline startet keinen Agent-Call
+  // mehr"), reject immediately without spawning a fresh SDK call. The handler
+  // itself will create its own RequestContext on dequeue; this guard fires
+  // ONLY for stale upstream contexts that already finalised TIMED_OUT.
+  const earliestDeadline = getEarliestDeadline(sessionKey);
+  if (earliestDeadline !== undefined && Date.now() > earliestDeadline) {
+    processingFlags.set(sessionKey, false);
+    request.reject(
+      new Error(
+        '⏱ Timeout: Deadline ist abgelaufen, bevor die Anfrage drankam. Bitte nochmal senden.',
+      ),
+    );
+    if (queue.length > 0) {
+      processQueue(sessionKey);
+    }
+    return;
+  }
 
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
