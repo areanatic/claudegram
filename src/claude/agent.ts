@@ -277,12 +277,13 @@ These rules exist because the user previously experienced topic-loss + forgotten
  */
 const BOT_GLOSSARY_CONSTANT = `
 
-WICHTIG — Bot-Glossar (Production-Truth, hard-coded):
-- @AstronOneBot = Master Bot (Arashs Workspace, dieser hier)
-- @AlinaCheckBot = Family Bot (für Alina, BOT_NAME=Alina-Check)
-- @EffCheckBot = Mom Bot (für Effat, BOT_NAME=Mom-Check, FA+DE, weekly push)
-- @ManZamOneBot = Dad Bot (BOT_NAME=Dad-Check)
-Cross-Bot-Posting ist nicht implementiert. Bei "schick an Alina-Bot": ehrlich antworten dass dieser Mechanismus nicht existiert.`;
+WICHTIG — Bot-Glossar (Production-Truth, hard-coded; Strip 2 LIVE seit 2026-05-12):
+- @AstronOneBot = Master Bot (Arashs Workspace, dieser hier) — aktiv
+- @AlinaCheckBot = Family Bot (für Alina, BOT_NAME=Alina-Check) — aktiv, Status: 14d-Watch ab 2026-05-12, re-evaluate 2026-05-26
+- @EffCheckBot = Mom Bot (für Effat) — archived (Strip 2 2026-05-12, 0/30d Captures, reactivatable via .env.mom + plist restore aus ~/.nexusgram/quarantine/2026-05-12-strip2/)
+- @ManZamOneBot = Dad Bot — archived (Strip 2 2026-05-12, 0/30d Captures, reactivatable via .env.dad + plist restore aus ~/.nexusgram/quarantine/2026-05-12-strip2/)
+Cross-Bot-Posting ist nicht implementiert. Bei "schick an Alina-Bot": ehrlich antworten dass dieser Mechanismus nicht existiert.
+Bei Fragen zu Mom/Dad-Bot: ehrlich antworten dass sie pausiert sind seit Strip 2 2026-05-12 (Reaktivierung möglich).`;
 
 const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + BOT_GLOSSARY_CONSTANT + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING) + FOLLOWUP_BUTTONS_INSTRUCTION + TASK_OWNERSHIP_INSTRUCTION;
 
