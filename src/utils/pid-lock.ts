@@ -9,38 +9,68 @@ function lockPath(botName: string): string {
 }
 
 /**
+ * Check whether a process with the given PID is currently alive.
+ * signal 0 sends nothing — it only probes existence. EPERM means the
+ * process exists but is owned by another user (still alive).
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
  * Acquire PID lock. Returns true if lock acquired successfully.
- * Returns false if another instance of this bot is already running.
+ * Returns false if another live instance of this bot is already running.
+ *
+ * The lock file is created atomically via openSync(..., 'wx'), so two
+ * processes starting at the same instant cannot both win the lock — the
+ * previous existsSync()-then-writeFileSync() sequence had a check-then-write
+ * race where both would see "no file" and both proceed.
  */
 export function acquireLock(botName: string): boolean {
   fs.mkdirSync(LOCK_DIR, { recursive: true });
   const file = lockPath(botName);
 
-  if (fs.existsSync(file)) {
+  // Two attempts: the second covers the case where we removed a stale lock
+  // and need to re-run the atomic create.
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const existingPid = parseInt(fs.readFileSync(file, 'utf8').trim(), 10);
-      if (!isNaN(existingPid)) {
-        // If the lock is held by our own process, re-acquire silently (supports retry loops)
-        if (existingPid === process.pid) {
-          return true;
-        }
-        process.kill(existingPid, 0); // signal 0 = check if alive
-        // Process is alive — lock is held by another instance
+      // 'wx' = create + exclusive: fails atomically with EEXIST if the file exists.
+      const fd = fs.openSync(file, 'wx');
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      console.log(`[PID Lock] Acquired lock for "${botName}" (PID ${process.pid}).`);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+
+      // Lock file already exists — inspect the holder.
+      let existingPid = NaN;
+      try {
+        existingPid = parseInt(fs.readFileSync(file, 'utf8').trim(), 10);
+      } catch { /* unreadable — treat as stale below */ }
+
+      // Our own lock (supports in-process re-entry) — accept it.
+      if (existingPid === process.pid) {
+        return true;
+      }
+      // Held by another LIVE process — refuse.
+      if (!isNaN(existingPid) && isProcessAlive(existingPid)) {
         console.error(`[PID Lock] Another instance (PID ${existingPid}) holds the lock for "${botName}".`);
         return false;
       }
-    } catch {
-      // process.kill threw — PID doesn't exist, stale lock
-      console.log(`[PID Lock] Removing stale lock for "${botName}".`);
+      // Stale lock (holder dead, or file unreadable) — remove and retry once.
+      console.log(`[PID Lock] Removing stale lock for "${botName}" (PID ${isNaN(existingPid) ? 'unreadable' : existingPid}).`);
+      try { fs.unlinkSync(file); } catch { /* ignore — another process may have cleaned it */ }
     }
-    // Remove stale lock
-    try { fs.unlinkSync(file); } catch { /* ignore */ }
   }
 
-  // Write our PID
-  fs.writeFileSync(file, String(process.pid), 'utf8');
-  console.log(`[PID Lock] Acquired lock for "${botName}" (PID ${process.pid}).`);
-  return true;
+  console.error(`[PID Lock] Could not acquire lock for "${botName}" after stale-lock cleanup (lost a startup race).`);
+  return false;
 }
 
 /**

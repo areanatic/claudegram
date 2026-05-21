@@ -145,6 +145,30 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
     console.log(`[Voice] Transcript received (${transcript.length} chars, lang=${detectedLanguage})`);
 
+    // A2 confidence gate: a hallucinated transcript (low Whisper confidence, or
+    // a language the user does not speak — e.g. German audio mis-read as
+    // Korean) must NOT reach the agent. Ask for a resend instead.
+    const allowedLangs = config.VOICE_ALLOWED_LANGUAGES;
+    const languageOk = allowedLangs.length === 0 || allowedLangs.includes(detectedLanguage);
+    if (transcribeResult.lowConfidence || !languageOk || transcript.length < 2) {
+      console.warn(
+        `[Voice] transcript rejected by confidence gate: lang=${detectedLanguage} ` +
+        `languageOk=${languageOk} lowConfidence=${transcribeResult.lowConfidence} ` +
+        `len=${transcript.length} avg_logprob=${transcribeResult.avgLogprob ?? 'n/a'}`,
+      );
+      markDropped(inputLogRowId, 'low_confidence_transcript');
+      const hint = !languageOk
+        ? `Ich hab dich als "${detectedLanguage}" verstanden — das passt nicht. `
+        : 'Das Audio war zu leise, zu kurz oder unklar. ';
+      const askResend = `🎤 ${hint}Schick die Sprachnachricht bitte nochmal — oder tipp sie kurz.`;
+      try {
+        await ctx.api.editMessageText(chatId, ackMsg.message_id, askResend, { parse_mode: undefined });
+      } catch {
+        try { await ctx.reply(askResend); } catch { /* best-effort */ }
+      }
+      return;
+    }
+
     // Attach the transcript to the durable Input-Log row — the original
     // INSERT only had the file_id (transcription happens after receive).
     attachContent(inputLogRowId, transcript);

@@ -19,6 +19,16 @@ export interface TranscribeResult {
   language: string;
   /** ISO 639-1 language code, e.g. "en", "de" */
   languageCode: string;
+  /** Whisper avg_logprob of the first segment (null if unavailable). */
+  avgLogprob: number | null;
+  /** Whisper no_speech_prob of the first segment (null if unavailable). */
+  noSpeechProb: number | null;
+  /**
+   * True when Whisper's confidence signals indicate a likely hallucination
+   * (avg_logprob < -1.0 or no_speech_prob > 0.6). A2 confidence gate: the voice
+   * handler refuses to forward a low-confidence transcript to the agent.
+   */
+  lowConfidence: boolean;
 }
 
 /** Map Whisper's full language names to ISO 639-1 codes */
@@ -90,7 +100,20 @@ export async function transcribeFileWithLanguage(filePath: string, options?: Tra
   const detectedLanguage = (result.language || 'english').toLowerCase();
   const languageCode = LANGUAGE_NAME_TO_CODE[detectedLanguage] || config.VOICE_LANGUAGE;
 
-  return { text: transcript, language: detectedLanguage, languageCode };
+  // A2 confidence gate: surface Whisper's confidence signals so the caller can
+  // refuse a hallucinated transcript instead of feeding nonsense to the agent.
+  const lowConfidence =
+    (typeof avgLogprob === 'number' && avgLogprob < -1.0) ||
+    (typeof noSpeechProb === 'number' && noSpeechProb > 0.6);
+
+  return {
+    text: transcript,
+    language: detectedLanguage,
+    languageCode,
+    avgLogprob: typeof avgLogprob === 'number' ? avgLogprob : null,
+    noSpeechProb: typeof noSpeechProb === 'number' ? noSpeechProb : null,
+    lowConfidence,
+  };
 }
 
 /**

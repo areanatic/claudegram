@@ -280,6 +280,40 @@ export function countPending(): number {
   }
 }
 
+/**
+ * Boot-recovery (Akt 1c): on startup every row still 'received'/'processing'
+ * is necessarily orphaned — the only processor is this bot, which just started
+ * fresh with no in-memory handler for those rows. Mark them 'dropped' with
+ * reason 'startup_recovery' so they are visible and the /health pending count
+ * does not drift upward forever. MUST run before the runner starts polling, so
+ * freshly-arriving inputs are never affected.
+ *
+ * Returns the number of rows recovered (0 if none, -1 if logging unavailable).
+ */
+export function recoverOrphanedInputs(): number {
+  const conn = getDb();
+  if (!conn) return -1;
+  try {
+    const cutoff = new Date().toISOString();
+    const info = conn
+      .prepare(
+        `UPDATE input_log
+            SET status = 'dropped', dropped_reason = 'startup_recovery', updated_at = ?
+          WHERE status IN ('received', 'processing') AND received_at <= ?`,
+      )
+      .run(cutoff, cutoff);
+    if (info.changes > 0) {
+      console.log(
+        `[InputLog] boot-recovery: marked ${info.changes} orphaned input(s) dropped (startup_recovery)`,
+      );
+    }
+    return info.changes;
+  } catch (err) {
+    console.error('[InputLog] recoverOrphanedInputs failed:', err);
+    return -1;
+  }
+}
+
 /** Close the DB on shutdown. Idempotent. */
 export function closeInputLog(): void {
   if (db) {

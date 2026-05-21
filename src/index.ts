@@ -5,13 +5,10 @@ import { config } from './config.js';
 import { preventSleep, allowSleep } from './utils/caffeinate.js';
 import { stopCleanup } from './telegram/deduplication.js';
 import { closeMemoryDb } from './memory/nexus-memory.js';
-import { closeInputLog } from './inbox/input-log.js';
+import { closeInputLog, recoverOrphanedInputs } from './inbox/input-log.js';
 import { acquireLock, releaseLock } from './utils/pid-lock.js';
 import { cancelAllRequests, getActiveSessionKeys } from './claude/request-queue.js';
 import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
-
-const MAX_409_RETRIES = 5;
-const BASE_409_DELAY_MS = 5000; // 5s, 10s, 20s, 40s, 80s
 
 async function main() {
   // Clear CLAUDECODE so claude subprocesses can start even when launched
@@ -38,6 +35,14 @@ async function main() {
   await bot.init();
   console.log(`✅ Bot started as @${bot.botInfo.username}`);
   console.log('📱 Send /start in Telegram to begin');
+
+  // Akt 1c boot-recovery: any input_log row still 'received'/'processing' is
+  // orphaned from a previous process — mark it dropped BEFORE polling starts,
+  // so it neither lingers as silent drift nor inflates the /health pending count.
+  const recovered = recoverOrphanedInputs();
+  if (recovered > 0) {
+    console.log(`[Startup] Boot-recovery: ${recovered} orphaned input(s) from a previous run marked dropped.`);
+  }
 
   // Start concurrent runner — updates are processed in parallel,
   // with per-chat ordering enforced by the sequentialize middleware in bot.ts.
@@ -133,38 +138,32 @@ function is409Error(error: unknown): boolean {
   return false;
 }
 
-async function startWithRetry() {
-  for (let attempt = 0; attempt <= MAX_409_RETRIES; attempt++) {
-    try {
-      await main();
-      // Clean exit from runner.task() — release lock and exit
-      releaseLock(config.BOT_NAME);
-      return;
-    } catch (error) {
-      if (is409Error(error) && attempt < MAX_409_RETRIES) {
-        const delay = BASE_409_DELAY_MS * Math.pow(2, attempt);
-        console.warn(
-          `[409] Conflict detected (attempt ${attempt + 1}/${MAX_409_RETRIES}). ` +
-          `Another instance may be polling. Retrying in ${delay / 1000}s...`
-        );
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
+/**
+ * Start the bot exactly once. On a 409 conflict we do NOT retry in-process:
+ * an in-process retry calls main() -> run() again while the previous runner
+ * is still polling, producing a self-inflicted 409. Instead we exit cleanly
+ * and let launchd relaunch after its ThrottleInterval — by which time the
+ * competing poller is gone.
+ */
+async function start() {
+  try {
+    await main();
+    // Clean exit from runner.task()
+    releaseLock(config.BOT_NAME);
+  } catch (error) {
+    releaseLock(config.BOT_NAME);
+    allowSleep();
 
-      // Non-409 error or max retries exceeded
-      console.error('Fatal error:', error);
-      releaseLock(config.BOT_NAME);
-      allowSleep();
-
-      if (is409Error(error)) {
-        console.error('[409] Max retries exceeded. Another bot instance is likely running.');
-        console.error('Check: launchctl list | grep nexusgram');
-        process.exit(0); // Don't trigger LaunchAgent restart loop
-      }
-
-      process.exit(1);
+    if (is409Error(error)) {
+      console.error('[409] Conflict: another getUpdates poller is active. Exiting cleanly —');
+      console.error('      launchd relaunches after ThrottleInterval; the conflict should be gone by then.');
+      console.error('      If this persists: launchctl list | grep nexusgram');
+      process.exit(0); // exit 0 — relaunch is throttled, no tight loop
     }
+
+    console.error('Fatal error:', error);
+    process.exit(1);
   }
 }
 
-startWithRetry();
+start();

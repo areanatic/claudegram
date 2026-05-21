@@ -139,6 +139,14 @@ const envSchema = z.object({
     .default('19')
     .transform((val) => parseInt(val, 10)),
   VOICE_LANGUAGE: z.string().default('en'),
+  // A2 confidence gate: ISO 639-1 codes the user actually speaks. A transcript
+  // whose detected language is NOT in this list is treated as a Whisper
+  // hallucination (e.g. German audio mis-transcribed as Korean) and the user is
+  // asked to resend instead of the nonsense being fed to the agent. Empty = any.
+  VOICE_ALLOWED_LANGUAGES: z
+    .string()
+    .default('de,en')
+    .transform((val) => val.split(',').map((c) => c.trim().toLowerCase()).filter(Boolean)),
   // Voice-first mode: auto-enable TTS when user sends voice messages
   VOICE_FIRST_MODE_ENABLED: z.string().default('true').transform(toBool),
   VOICE_TIMEOUT_MS: z
@@ -267,10 +275,12 @@ const envSchema = z.object({
     .string()
     .default('0.5')
     .transform((val) => parseFloat(val)),
-  // Send a single user-facing "still working" message via Telegram when the
-  // watchdog warning fires. One ping per query, configurable so deployments
-  // can opt out or change the wording.
-  AGENT_WATCHDOG_USER_NOTIFY: z.string().default('true').transform(toBool),
+  // Watchdog user-facing "still working" Telegram ping. OFF by default
+  // (Akt 3 A3 status-dedup): the RequestContext long-running heartbeat
+  // (HANDLER_LONG_RUNNING_MESSAGE) is the single user-facing progress signal.
+  // The watchdog stays a pure log/timeout guard — two independent timers both
+  // messaging the user produced overlapping "Bin dran…" + "Brauche länger…" spam.
+  AGENT_WATCHDOG_USER_NOTIFY: z.string().default('false').transform(toBool),
   AGENT_WATCHDOG_USER_NOTIFY_MESSAGE: z
     .string()
     .default('🔄 Bin dran, brauche noch einen Moment…'),
