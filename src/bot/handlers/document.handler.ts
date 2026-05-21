@@ -18,7 +18,7 @@ import { Context } from 'grammy';
 import * as fs from 'fs';
 import * as path from 'path';
 import { config } from '../../config.js';
-import { sendToAgent } from '../../claude/agent.js';
+import { sendToAgent, StaleTurnError } from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -261,33 +261,44 @@ async function sendSingleFileConfirmation(
       'Keep your response short (1-3 sentences).',
     ].join('\n');
 
-    await queueRequest(sessionKey, agentPrompt, async () => {
-      if (getStreamingMode() === 'streaming') {
-        await messageSender.startStreaming(ctx);
-        const abortController = new AbortController();
-        setAbortController(sessionKey, abortController);
+    try {
+      await queueRequest(sessionKey, agentPrompt, async (turnEpoch) => {
+        if (getStreamingMode() === 'streaming') {
+          await messageSender.startStreaming(ctx);
+          const abortController = new AbortController();
+          setAbortController(sessionKey, abortController, turnEpoch);
 
-        try {
-          const response = await sendToAgent(sessionKey, agentPrompt, {
-            onProgress: (progressText) => {
-              messageSender.updateStream(ctx, progressText);
-            },
-            abortController,
-          });
-          await messageSender.finishStreaming(ctx, response.text);
-        } catch (error) {
-          await messageSender.cancelStreaming(ctx);
-          // Fallback to simple confirmation
-          await messageSender.sendMessage(ctx, confirmMsg);
+          try {
+            const response = await sendToAgent(sessionKey, agentPrompt, {
+              onProgress: (progressText) => {
+                messageSender.updateStream(ctx, progressText);
+              },
+              abortController,
+              turnEpoch,
+            });
+            await messageSender.finishStreaming(ctx, response.text);
+          } catch (error) {
+            await messageSender.cancelStreaming(ctx);
+            if (error instanceof StaleTurnError) throw error; // bubble to outer
+            // Fallback to simple confirmation
+            await messageSender.sendMessage(ctx, confirmMsg);
+          }
+        } else {
+          await ctx.replyWithChatAction('typing');
+          const abortController = new AbortController();
+          setAbortController(sessionKey, abortController, turnEpoch);
+          const response = await sendToAgent(sessionKey, agentPrompt, { abortController, turnEpoch });
+          await messageSender.sendMessage(ctx, response.text);
         }
-      } else {
-        await ctx.replyWithChatAction('typing');
-        const abortController = new AbortController();
-        setAbortController(sessionKey, abortController);
-        const response = await sendToAgent(sessionKey, agentPrompt, { abortController });
-        await messageSender.sendMessage(ctx, response.text);
+      });
+    } catch (error) {
+      // Codex round 7: stale turn superseded — swallow silently.
+      if (error instanceof StaleTurnError) {
+        console.log(`[Document] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+      } else if ((error as Error).message !== 'Queue cleared') {
+        console.error('[Document] Agent error:', error instanceof Error ? error.message : error);
       }
-    });
+    }
   } else {
     // No session or no caption — just confirm
     await messageSender.sendMessage(ctx, confirmMsg);

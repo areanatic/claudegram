@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { preventSleep, allowSleep } from './utils/caffeinate.js';
 import { stopCleanup } from './telegram/deduplication.js';
 import { closeMemoryDb } from './memory/nexus-memory.js';
+import { closeInputLog } from './inbox/input-log.js';
 import { acquireLock, releaseLock } from './utils/pid-lock.js';
 import { cancelAllRequests, getActiveSessionKeys } from './claude/request-queue.js';
 import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
@@ -113,6 +114,7 @@ async function main() {
     allowSleep();
     stopCleanup();
     closeMemoryDb();
+    closeInputLog();
 
     console.log('[Shutdown] Done. Exiting.');
     process.exit(0);

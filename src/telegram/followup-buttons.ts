@@ -2,7 +2,7 @@ import { Context } from 'grammy';
 import { config } from '../config.js';
 import { getSessionKeyFromCtx } from '../utils/session-key.js';
 import { queueRequest, setAbortController } from '../claude/request-queue.js';
-import { sendToAgent } from '../claude/agent.js';
+import { sendToAgent, StaleTurnError } from '../claude/agent.js';
 import { messageSender } from './message-sender.js';
 import { maybeSendVoiceReply } from '../tts/voice-reply.js';
 import { sanitizeError } from '../utils/sanitize.js';
@@ -115,15 +115,16 @@ export async function handleFollowUpCallback(ctx: Context): Promise<void> {
 
   // Send the button label as user message to Claude
   try {
-    await queueRequest(sessionKey, label, async () => {
+    await queueRequest(sessionKey, label, async (turnEpoch) => {
       await messageSender.startStreaming(ctx);
       const abortController = new AbortController();
-      setAbortController(sessionKey, abortController);
+      setAbortController(sessionKey, abortController, turnEpoch);
       try {
         const response = await sendToAgent(sessionKey, label, {
           onProgress: (text) => { messageSender.updateStream(ctx, text); },
           abortController,
           telegramCtx: ctx,
+          turnEpoch,
         });
         await messageSender.finishStreaming(ctx, response.text);
         await maybeSendVoiceReply(ctx, response.text);
@@ -135,6 +136,11 @@ export async function handleFollowUpCallback(ctx: Context): Promise<void> {
     });
   } catch (error) {
     if ((error as Error).message === 'Queue cleared') return;
+    // Codex round 7: stale turn superseded — swallow silently.
+    if (error instanceof StaleTurnError) {
+      console.log(`[FollowUp] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+      return;
+    }
     const errorMessage = sanitizeError(error);
     console.error('[FollowUp] Callback error:', errorMessage);
     try {

@@ -175,6 +175,45 @@ class SessionManager {
     // Note: We don't clear history here - history is for resuming past sessions
   }
 
+  /**
+   * Schlachtplan Akt 1.3 Cancel-Fix 3 (2026-05-21): force a genuinely fresh
+   * session for `/reset`.
+   *
+   * The bug: `clearSession` only drops the in-memory session. The very next
+   * message calls `getOrResumeSession`, which falls through to
+   * `resumeLastSession` and rebuilds the session FROM HISTORY — including the
+   * old `claudeSessionId`. So `/reset` did not start fresh; it silently
+   * resumed the conversation it was supposed to discard.
+   *
+   * This method creates a brand-new session (new conversationId,
+   * claudeSessionId === undefined) for the same working directory, so the next
+   * `getOrResumeSession` finds the fresh in-memory session and never resumes
+   * the old Claude session. Returns the working directory used, or undefined
+   * if no prior session/working directory could be determined.
+   */
+  forceFreshSession(sessionKey: string): string | undefined {
+    // Determine the working directory from the live session, then history.
+    const existing = this.sessions.get(sessionKey);
+    let workDir = existing?.workingDirectory;
+    if (!workDir) {
+      const lastEntry = sessionHistory.getLastSession(sessionKey);
+      if (lastEntry) {
+        workDir = lastEntry.projectPath;
+      }
+    }
+    if (!workDir) {
+      // Nothing to anchor a fresh session to — just drop the in-memory one.
+      this.sessions.delete(sessionKey);
+      return undefined;
+    }
+    // Drop the stale session, then create a clean one. createSession writes a
+    // new history entry with claudeSessionId undefined, so resume can't pick
+    // the old Claude session back up.
+    this.sessions.delete(sessionKey);
+    const fresh = this.createSession(sessionKey, workDir);
+    return fresh.workingDirectory;
+  }
+
   resumeSession(sessionKey: string, conversationId: string): Session | undefined {
     const historyEntry = sessionHistory.getSessionByConversationId(sessionKey, conversationId);
     if (!historyEntry) {

@@ -3,7 +3,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { config } from '../../config.js';
-import { sendToAgent } from '../../claude/agent.js';
+import {
+  sendToAgent,
+  CLAUDE_CANCEL_SENTINEL_TEXT,
+  ToolBudgetExceededError,
+  TOOL_BUDGET_REPLY_TEXT,
+  StaleTurnError,
+} from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -13,6 +19,7 @@ import {
   isProcessing,
   getQueuePosition,
   setAbortController,
+  gracefulCancel,
 } from '../../claude/request-queue.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
 import { getStreamingMode } from './command.handler.js';
@@ -24,6 +31,9 @@ import { downloadFileSecure, getTelegramFileUrl } from '../../utils/download.js'
 import { sanitizeError, sanitizePath } from '../../utils/sanitize.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
+import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.middleware.js';
+import { markProcessing, markDone, markDropped, markError, attachContent } from '../../inbox/input-log.js';
+import { withHardTimeout, HardTimeoutError } from '../../utils/hard-timeout.js';
 
 export async function handleVoice(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
@@ -33,6 +43,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
   if (!keyInfo || !messageId || !messageDate || !voice) return;
   const { chatId, sessionKey } = keyInfo;
+
+  // Schlachtplan Akt 1.2: durable Input-Log row recorded by the middleware
+  // before sequentialize. Track its lifecycle so a watchdog-cancel or error
+  // leaves an honest status on disk instead of a silently-lost input.
+  const inputLogRowId = getInputLogRowId(chatId, messageId);
 
   // Stale/duplicate filters
   if (isStaleMessage(messageDate)) {
@@ -87,6 +102,9 @@ export async function handleVoice(ctx: Context): Promise<void> {
   const ackMsg = await ctx.reply('🎤 Transcribing...', { parse_mode: undefined });
 
   let tempFilePath: string | null = null;
+  // Codex re-review MEDIUM: function-scoped so the outer catch can cancel a
+  // dangling streaming bubble when the hard-cap fires while a stream was open.
+  let streamingStarted = false;
 
   try {
     // Download voice file from Telegram (with retry for transient network errors)
@@ -126,6 +144,10 @@ export async function handleVoice(ctx: Context): Promise<void> {
     const detectedLanguage = transcribeResult.languageCode;
 
     console.log(`[Voice] Transcript received (${transcript.length} chars, lang=${detectedLanguage})`);
+
+    // Attach the transcript to the durable Input-Log row — the original
+    // INSERT only had the file_id (transcription happens after receive).
+    attachContent(inputLogRowId, transcript);
 
     // Activate voice-first mode (if enabled in config) and store detected language
     if (config.VOICE_FIRST_MODE_ENABLED) {
@@ -168,71 +190,159 @@ export async function handleVoice(ctx: Context): Promise<void> {
       await ctx.reply(`⏳ Queued \\(position ${position}\\)`, { parse_mode: 'MarkdownV2' });
     }
 
-    // Feed transcript into agent
-    await queueRequest(sessionKey, transcript, async () => {
-      if (isVoiceActive(sessionKey)) {
-        // Voice-first mode: skip streaming display, just show typing indicator
-        // This reduces latency by avoiding message creation/editing overhead
-        await ctx.replyWithChatAction('typing');
+    // Schlachtplan Akt 1.3 Fix B: hard cap for the Voice agent turn. The Voice
+    // path has no RequestContext state machine — this local cap is its
+    // fail-fast guard. On expiry: gracefulCancel tears down the SDK and the
+    // turn rejects with HardTimeoutError (handled in the catch below).
+    const voiceHardCapMs = config.VOICE_AGENT_HARD_CAP_MS;
 
-        const abortController = new AbortController();
-        setAbortController(sessionKey, abortController);
+    // Codex BLOCKER 1 fix: finalize-once guard. `withHardTimeout` ignores the
+    // RESULT of a late-settling op() but cannot stop op()'s side effects. This
+    // boolean is the single source of truth for "this turn already produced a
+    // user-visible outcome". The hard-cap onTimeout claims it; the agent path
+    // checks it before sending any Telegram reply. Whoever loses stays silent.
+    let turnFinalized = false;
+    const finalizeTurn = (): boolean => {
+      if (turnFinalized) return false;
+      turnFinalized = true;
+      return true;
+    };
+    // Feed transcript into agent. The queue handler receives `turnEpoch` —
+    // the dequeue-bound ownership token — and threads it into sendToAgent.
+    await queueRequest(sessionKey, transcript, async (turnEpoch) => {
+      // Input-Log: turn has been dequeued and is now actually running.
+      markProcessing(inputLogRowId);
 
-        const response = await sendToAgent(sessionKey, transcript, {
-          abortController,
-          voiceMode: true,
-          telegramCtx: ctx,
-        });
+      await withHardTimeout(
+        async () => {
+          // Resolve the agent response WITHOUT sending anything yet, so the
+          // finalize-once guard can be checked between agent-return and send.
+          let response;
+          if (isVoiceActive(sessionKey)) {
+            // Voice-first mode: skip streaming display, just show typing indicator
+            await ctx.replyWithChatAction('typing');
+            const abortController = new AbortController();
+            setAbortController(sessionKey, abortController, turnEpoch);
+            response = await sendToAgent(sessionKey, transcript, {
+              abortController,
+              voiceMode: true,
+              telegramCtx: ctx,
+              turnEpoch,
+            });
+          } else if (getStreamingMode() === 'streaming') {
+            await messageSender.startStreaming(ctx);
+            streamingStarted = true;
+            const abortController = new AbortController();
+            setAbortController(sessionKey, abortController, turnEpoch);
+            try {
+              response = await sendToAgent(sessionKey, transcript, {
+                onProgress: (progressText) => {
+                  messageSender.updateStream(ctx, progressText);
+                },
+                abortController,
+                telegramCtx: ctx,
+                turnEpoch,
+              });
+            } catch (error) {
+              await messageSender.cancelStreaming(ctx);
+              throw error;
+            }
+          } else {
+            await ctx.replyWithChatAction('typing');
+            const abortController = new AbortController();
+            setAbortController(sessionKey, abortController, turnEpoch);
+            response = await sendToAgent(sessionKey, transcript, {
+              abortController,
+              telegramCtx: ctx,
+              turnEpoch,
+            });
+          }
 
-        // Send voice reply FIRST (primary output in voice mode)
-        await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage, voiceMode: true });
+          // Codex BLOCKER 1: if the hard-cap already fired (or /cancel won),
+          // the agent return is stale — drop it silently, no double reply.
+          if (!finalizeTurn()) {
+            console.log(`[Voice] late agent return discarded for ${sessionKey} — turn already finalized`);
+            if (streamingStarted) {
+              try { await messageSender.cancelStreaming(ctx); } catch { /* best-effort */ }
+            }
+            return;
+          }
 
-        // Send text as secondary reference (shorter in voice mode)
-        await messageSender.sendMessage(ctx, response.text);
-        await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
-      } else if (getStreamingMode() === 'streaming') {
-        await messageSender.startStreaming(ctx);
+          // Codex BLOCKER 3: a tool-budget abort throws ToolBudgetExceededError
+          // (handled in the catch). A /cancel mid-turn returns the cancel
+          // sentinel verbatim — the Voice path previously sent it as a normal
+          // reply. Suppress it like the text path does.
+          if (response.text === CLAUDE_CANCEL_SENTINEL_TEXT) {
+            console.log(`[Voice] cancel-sentinel suppressed for ${sessionKey}`);
+            if (streamingStarted) {
+              try { await messageSender.cancelStreaming(ctx); } catch { /* best-effort */ }
+            }
+            markDropped(inputLogRowId, 'cancelled');
+            return;
+          }
 
-        const abortController = new AbortController();
-        setAbortController(sessionKey, abortController);
-
-        try {
-          const response = await sendToAgent(sessionKey, transcript, {
-            onProgress: (progressText) => {
-              messageSender.updateStream(ctx, progressText);
-            },
-            abortController,
-            telegramCtx: ctx,
-          });
-
-          await messageSender.finishStreaming(ctx, response.text);
-          await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
+          if (streamingStarted) {
+            await messageSender.finishStreaming(ctx, response.text);
+            await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
+          } else if (isVoiceActive(sessionKey)) {
+            // Send voice reply FIRST (primary output in voice mode)
+            await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage, voiceMode: true });
+            await messageSender.sendMessage(ctx, response.text);
+          } else {
+            await messageSender.sendMessage(ctx, response.text);
+            await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
+          }
           await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
-        } catch (error) {
-          await messageSender.cancelStreaming(ctx);
-          throw error;
-        }
-      } else {
-        await ctx.replyWithChatAction('typing');
-
-        const abortController = new AbortController();
-        setAbortController(sessionKey, abortController);
-
-        const response = await sendToAgent(sessionKey, transcript, {
-          abortController,
-          telegramCtx: ctx,
-        });
-        await messageSender.sendMessage(ctx, response.text);
-        await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
-        await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
-      }
+          markDone(inputLogRowId);
+        },
+        voiceHardCapMs,
+        () => {
+          // Hard-cap won the race. Claim the turn so a late agent return stays
+          // silent, then tear down the SDK. The catch block sends the single
+          // user-facing timeout reply.
+          finalizeTurn();
+          return gracefulCancel(sessionKey, 'voice-hard-timeout');
+        },
+        'voice-turn',
+      );
     });
   } catch (error) {
-    if ((error as Error).message === 'Queue cleared') return;
+    if ((error as Error).message === 'Queue cleared') {
+      markDropped(inputLogRowId, 'queue_cleared');
+      return;
+    }
+    // Codex round 7: a stale turn was superseded by a newer one. Swallow
+    // silently — the newer turn owns the user-facing reply, no error shown.
+    if (error instanceof StaleTurnError) {
+      console.log(`[Voice] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+      markDropped(inputLogRowId, 'superseded');
+      return;
+    }
 
-    const errorMessage = sanitizeError(error);
-    console.error('[Voice] Error:', errorMessage);
+    const isHardTimeout = error instanceof HardTimeoutError;
+    const isToolBudget = error instanceof ToolBudgetExceededError;
+    let errorMessage: string;
+    if (isHardTimeout) {
+      errorMessage = '⏱️ Das hat zu lange gedauert und wurde abgebrochen. Schick die Nachricht bitte nochmal — gern etwas kürzer.';
+      markDropped(inputLogRowId, 'voice_hard_timeout');
+    } else if (isToolBudget) {
+      errorMessage = TOOL_BUDGET_REPLY_TEXT;
+      markDropped(inputLogRowId, 'tool_budget_exceeded');
+    } else {
+      errorMessage = sanitizeError(error);
+      markError(inputLogRowId, errorMessage.slice(0, 200));
+    }
+    console.error('[Voice] Error:', isHardTimeout ? 'voice-hard-timeout' : isToolBudget ? 'tool-budget-exceeded' : errorMessage);
 
+    // Codex re-review MEDIUM: if a streaming bubble was open when the hard-cap
+    // (or budget abort) fired, cancel it immediately so it does not hang as a
+    // partial-UI artefact while the (possibly stuck) SDK is still being torn
+    // down in the background.
+    if (streamingStarted) {
+      try { await messageSender.cancelStreaming(ctx); } catch { /* best-effort */ }
+    }
+
+    const plainReply = isHardTimeout || isToolBudget;
     // Try to update ack message with error
     try {
       await ctx.api.editMessageText(
@@ -242,9 +352,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
         { parse_mode: undefined }
       );
     } catch {
-      await ctx.reply(`❌ Voice error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+      await ctx.reply(plainReply ? errorMessage : `❌ Voice error: ${esc(errorMessage)}`,
+        plainReply ? { parse_mode: undefined } : { parse_mode: 'MarkdownV2' });
     }
   } finally {
+    forgetInputLogRowId(chatId, messageId);
     // Clean up temp file
     if (tempFilePath && fs.existsSync(tempFilePath)) {
       try {

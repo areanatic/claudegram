@@ -2,7 +2,7 @@ import { Context } from 'grammy';
 import * as fs from 'fs';
 import * as path from 'path';
 import { config } from '../../config.js';
-import { sendToAgent } from '../../claude/agent.js';
+import { sendToAgent, StaleTurnError } from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -92,12 +92,12 @@ async function handleSavedImage(
   }
 
   try {
-    await queueRequest(sessionKey, agentPrompt, async () => {
+    await queueRequest(sessionKey, agentPrompt, async (turnEpoch) => {
       if (getStreamingMode() === 'streaming') {
         await messageSender.startStreaming(ctx);
 
         const abortController = new AbortController();
-        setAbortController(sessionKey, abortController);
+        setAbortController(sessionKey, abortController, turnEpoch);
 
         try {
           const response = await sendToAgent(sessionKey, agentPrompt, {
@@ -106,6 +106,7 @@ async function handleSavedImage(
             },
             abortController,
             telegramCtx: ctx,
+            turnEpoch,
           });
 
           await messageSender.finishStreaming(ctx, response.text);
@@ -116,17 +117,23 @@ async function handleSavedImage(
       } else {
         await ctx.replyWithChatAction('typing');
         const abortController = new AbortController();
-        setAbortController(sessionKey, abortController);
+        setAbortController(sessionKey, abortController, turnEpoch);
 
         const response = await sendToAgent(sessionKey, agentPrompt, {
           abortController,
           telegramCtx: ctx,
+          turnEpoch,
         });
         await messageSender.sendMessage(ctx, response.text);
       }
     });
   } catch (error) {
     if ((error as Error).message === 'Queue cleared') return;
+    // Codex round 7: stale turn superseded — swallow silently.
+    if (error instanceof StaleTurnError) {
+      console.log(`[Photo] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+      return;
+    }
     const errorMessage = sanitizeError(error);
     console.error('[Photo] Agent error:', errorMessage);
     await ctx.reply(`Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });

@@ -198,10 +198,35 @@ const envSchema = z.object({
     .string()
     .default('10')
     .transform((val) => parseInt(val, 10)),
+  // Schlachtplan Akt 1.3 Fix D (2026-05-21): default is no longer 0. A 0
+  // default silently DISABLES the agent watchdog hard timeout — exactly the
+  // gap that let a Voice turn run unbounded. 180000ms (3min) is a real upper
+  // bound that still covers Tool-Use research. An explicit env value still
+  // wins; set it to 0 only with a deliberate reason.
   AGENT_QUERY_TIMEOUT_MS: z
     .string()
-    .default('0')
-    .transform((val) => parseInt(val, 10)), // 0 = disabled
+    .default('180000')
+    .transform((val) => parseInt(val, 10)),
+  // Schlachtplan Akt 1.3 Fix B (2026-05-21): hard cap for a single Voice agent
+  // turn. The Voice path has no RequestContext state machine (Phase C only
+  // wired the text path); this local cap is its fail-fast guard. On expiry the
+  // turn is gracefulCancel-ed and the user gets a clear timeout reply.
+  VOICE_AGENT_HARD_CAP_MS: z
+    .string()
+    .default('180000')
+    .transform((val) => parseInt(val, 10)),
+  // Schlachtplan Akt 1.3 Fix C (2026-05-21): per-turn tool budget. A single
+  // turn exceeding this many tool_use blocks is aborted as a controlled error
+  // instead of running away (the 30-tool / 6-minute Voice incident). Voice
+  // gets the tighter budget; text more headroom for research.
+  TOOL_BUDGET_VOICE: z
+    .string()
+    .default('4')
+    .transform((val) => parseInt(val, 10)),
+  TOOL_BUDGET_TEXT: z
+    .string()
+    .default('12')
+    .transform((val) => parseInt(val, 10)),
   // Max time message.handler waits for a single Claude response before aborting.
   // Mai-Intervention 2026-05-11 Phase A.1: replaces hardcoded 5min in
   // message.handler.ts (RI-01 root-cause). Default 10min covers Tool-Use research.

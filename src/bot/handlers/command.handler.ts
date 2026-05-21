@@ -7,6 +7,7 @@ import {
   getModel,
   isDangerousMode,
   getCachedUsage,
+  StaleTurnError,
 } from '../../claude/agent.js';
 import { config } from '../../config.js';
 import { messageSender } from '../../telegram/message-sender.js';
@@ -58,6 +59,7 @@ import {
   snapshotRegistry,
 } from '../../handler/request-registry.js';
 import { markCancelled } from '../../handler/request-context.js';
+import { countPending as countPendingInputs } from '../../inbox/input-log.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -1296,6 +1298,12 @@ export async function handleCancel(ctx: Context): Promise<void> {
     await replyMd(ctx, message);
   } else if (!wasProcessing) {
     await replyMd(ctx, 'ℹ️ Nothing to cancel\\.');
+  } else {
+    // Schlachtplan Akt 1.3 Cancel-Fix 2 (2026-05-21): previously this branch
+    // (wasProcessing && nothing concrete to cancel) sent NO reply at all — the
+    // user pressed /cancel and got silence (RI-22). Always answer. The turn
+    // was already finishing on its own; tell the user so honestly.
+    await replyMd(ctx, '🛑 Stop angefordert — die laufende Anfrage war bereits am Abschließen\\.');
   }
 }
 
@@ -1308,9 +1316,13 @@ export async function handleReset(ctx: Context): Promise<void> {
   const reset = await resetRequest(sessionKey);
   clearQueue(sessionKey);
 
-  // Clear the session so user starts fresh
+  // Clear the session so user starts fresh.
+  // Schlachtplan Akt 1.3 Cancel-Fix 3 (2026-05-21): clearConversation +
+  // clearSession alone did NOT start fresh — the next message resumed the old
+  // claudeSessionId from history. forceFreshSession installs a clean in-memory
+  // session (claudeSessionId undefined) so the next turn genuinely starts new.
   clearConversation(sessionKey);
-  sessionManager.clearSession(sessionKey);
+  sessionManager.forceFreshSession(sessionKey);
 
   if (wasProcessing || reset) {
     await replyMd(ctx, '🔄 Session reset\\. Current request cancelled and session cleared\\.');
@@ -2203,17 +2215,18 @@ export async function handleRedditActionCallback(ctx: Context): Promise<void> {
 
         // 3. Queue a streaming response
         try {
-          await queueRequest(sessionKey, prompt, async () => {
+          await queueRequest(sessionKey, prompt, async (turnEpoch) => {
             if (getStreamingMode() === 'streaming') {
               await messageSender.startStreaming(ctx);
               const abortController = new AbortController();
-              setAbortController(sessionKey, abortController);
+              setAbortController(sessionKey, abortController, turnEpoch);
               try {
                 const response = await sendToAgent(sessionKey, prompt, {
                   onProgress: (progressText) => {
                     messageSender.updateStream(ctx, progressText);
                   },
                   abortController,
+                  turnEpoch,
                 });
                 await messageSender.finishStreaming(ctx, response.text);
                 await maybeSendVoiceReply(ctx, response.text);
@@ -2224,14 +2237,16 @@ export async function handleRedditActionCallback(ctx: Context): Promise<void> {
             } else {
               await ctx.replyWithChatAction('typing');
               const abortController = new AbortController();
-              setAbortController(sessionKey, abortController);
-              const response = await sendToAgent(sessionKey, prompt, { abortController });
+              setAbortController(sessionKey, abortController, turnEpoch);
+              const response = await sendToAgent(sessionKey, prompt, { abortController, turnEpoch });
               await messageSender.sendMessage(ctx, response.text);
               await maybeSendVoiceReply(ctx, response.text);
             }
           });
         } catch (error) {
-          if ((error as Error).message !== 'Queue cleared') {
+          if (error instanceof StaleTurnError) {
+            console.log(`[RedditChat] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+          } else if ((error as Error).message !== 'Queue cleared') {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
             await replyMd(ctx, `❌ Chat failed: ${esc(errorMessage)}`);
           }
@@ -2723,15 +2738,17 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
     const session = sessionManager.getOrResumeSession(sessionKey);
     if (!session) return;
 
-    await queueRequest(sessionKey, transcript, async () => {
+    try {
+    await queueRequest(sessionKey, transcript, async (turnEpoch) => {
       if (isVoiceActive(sessionKey)) {
         await ctx.replyWithChatAction('typing');
         const abortController = new AbortController();
-        setAbortController(sessionKey, abortController);
+        setAbortController(sessionKey, abortController, turnEpoch);
         const response = await sendToAgent(sessionKey, transcript, {
           abortController,
           voiceMode: true,
           telegramCtx: ctx,
+          turnEpoch,
         });
         await maybeSendVoiceReply(ctx, response.text, { voiceMode: true });
         await messageSender.sendMessage(ctx, response.text);
@@ -2739,12 +2756,13 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
       } else if (getStreamingMode() === 'streaming') {
         await messageSender.startStreaming(ctx);
         const abortController = new AbortController();
-        setAbortController(sessionKey, abortController);
+        setAbortController(sessionKey, abortController, turnEpoch);
         try {
           const response = await sendToAgent(sessionKey, transcript, {
             onProgress: (progressText) => { messageSender.updateStream(ctx, progressText); },
             abortController,
             telegramCtx: ctx,
+            turnEpoch,
           });
           await messageSender.finishStreaming(ctx, response.text);
           await maybeSendVoiceReply(ctx, response.text, {});
@@ -2756,16 +2774,26 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
       } else {
         await ctx.replyWithChatAction('typing');
         const abortController = new AbortController();
-        setAbortController(sessionKey, abortController);
+        setAbortController(sessionKey, abortController, turnEpoch);
         const response = await sendToAgent(sessionKey, transcript, {
           abortController,
           telegramCtx: ctx,
+          turnEpoch,
         });
         await messageSender.sendMessage(ctx, response.text);
         await maybeSendVoiceReply(ctx, response.text, {});
         await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
       }
     });
+    } catch (error) {
+      if (error instanceof StaleTurnError) {
+        console.log(`[TranscribeAudio] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+        return;
+      }
+      if ((error as Error).message === 'Queue cleared') return;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('[TranscribeAudio] Agent error:', errorMessage);
+    }
   }
 }
 
@@ -3639,8 +3667,14 @@ export async function handleHealth(ctx: Context): Promise<void> {
   if (byOriginLines) {
     lines.push(`*By origin:*\n${esc(byOriginLines)}`);
   }
+  // Schlachtplan Akt 1.2: durable Input-Log pending count. >0 for a sustained
+  // period means inputs are being received but not finalized — the early
+  // warning signal RI-19 lacked.
+  const pendingInputs = countPendingInputs();
+
   lines.push(
     ``,
+    `*Input\\-Log pending:* ${pendingInputs >= 0 ? pendingInputs : esc('n/a')}`,
     `*Memory FTS5 rows:* ${memoryRowCount >= 0 ? memoryRowCount : esc(`error: ${memoryError ?? 'unknown'}`)}`,
     `*Promise\\.race outside agent path:* ${PROMISE_RACE_BUILD_TIME_COUNT} \\(build\\-time counter; verify: grep \\-rnE 'await Promise\\.race' src/\\)`,
     `*Agent\\-path Promise\\.race:* 0 \\(Sprint 3 RequestContext\\)`,

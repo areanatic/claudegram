@@ -2,9 +2,18 @@ import type { Query } from '@anthropic-ai/claude-agent-sdk';
 import { config } from '../config.js';
 import { getEarliestDeadline } from '../handler/request-registry.js';
 
+/**
+ * Codex BLOCKER (Akt 1.3 round 6): the handler receives the turn epoch that
+ * `processQueue` assigned to THIS dequeue. It must be threaded through to
+ * `sendToAgent` so ownership is bound to the dequeue moment — NOT read later
+ * inside `sendToAgent`, where a failsafe-released old handler could observe a
+ * newer turn's epoch.
+ */
+export type QueueHandler<T> = (turnEpoch: number) => Promise<T>;
+
 type QueuedRequest<T> = {
   message: string;
-  handler: () => Promise<T>;
+  handler: QueueHandler<T>;
   resolve: (value: T) => void;
   reject: (error: Error) => void;
   /**
@@ -42,6 +51,30 @@ const activeAbortControllers: Map<string, AbortController> = new Map();
 const activeQueries: Map<string, Query> = new Map();
 const pendingQueues: Map<string, Array<QueuedRequest<unknown>>> = new Map();
 const processingFlags: Map<string, boolean> = new Map();
+
+/**
+ * Codex BLOCKER (Akt 1.3 round 5): per-session turn epoch.
+ *
+ * Incremented every time `processQueue` dequeues a request — i.e. at the
+ * START of a turn, BEFORE the handler runs any `await` and long before
+ * `setActiveQuery()`. This is the authoritative "which turn is current"
+ * signal. It closes the window the active-query slot could not: between
+ * `clearActiveQuery()` in processQueue's finally and the next turn's
+ * `setActiveQuery()`, the slot is empty but the epoch has already advanced.
+ *
+ * A handler captures the epoch at entry (`currentTurnEpoch`) and later asks
+ * `isCurrentTurnEpoch()` to know whether a NEWER turn has since taken over.
+ */
+const turnEpochs: Map<string, number> = new Map();
+
+/**
+ * True if `epoch` is still the latest turn epoch for this session — i.e. no
+ * newer turn has been dequeued since `epoch` was assigned. agent.ts uses this
+ * to guard every shared-session-state mutation against a late old turn.
+ */
+export function isCurrentTurnEpoch(sessionKey: string, epoch: number): boolean {
+  return (turnEpochs.get(sessionKey) ?? 0) === epoch;
+}
 
 /**
  * Hard ceiling for handler completion. Stage 2b Action 3 / Action 10:
@@ -109,7 +142,12 @@ export async function gracefulCancel(sessionKey: string, reason: string): Promis
   cancelledChats.add(sessionKey);
   console.log(`[gracefulCancel] ${sessionKey} reason=${reason}`);
 
+  // Codex BLOCKER 1 (Akt 1.3 re-review): snapshot the Query + AbortController
+  // this cancel OWNS, up front. After the interrupt window a newer turn may
+  // have replaced the map slots — the cleanup below must only touch the
+  // objects it captured here, never a newer turn's Query/Controller.
   const query = activeQueries.get(sessionKey);
+  const ownedController = activeAbortControllers.get(sessionKey);
   let interruptHonoured = false;
   if (query) {
     // Stage 2b Action 8: wrap query.interrupt() with its own short timeout.
@@ -142,7 +180,11 @@ export async function gracefulCancel(sessionKey: string, reason: string): Promis
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
     }
-    activeQueries.delete(sessionKey);
+    // Ownership-guarded: only drop the slot if it still holds OUR Query. A
+    // newer turn may have set its own Query during the interrupt window.
+    if (activeQueries.get(sessionKey) === query) {
+      activeQueries.delete(sessionKey);
+    }
   }
 
   // Last-resort abort:
@@ -152,13 +194,21 @@ export async function gracefulCancel(sessionKey: string, reason: string): Promis
   // SDK subprocess may crash; we accept that risk because nothing else can
   // cancel a stuck SDK. Phase D may replace this with worker-process kill if
   // AbortController is also ignored by the SDK.
-  const controller = activeAbortControllers.get(sessionKey);
-  if (controller && !controller.signal.aborted && !interruptHonoured) {
+  //
+  // Codex BLOCKER 1: act ONLY on the controller captured at function start.
+  // If a newer turn has since replaced the map slot, aborting/deleting the
+  // current slot would kill that newer turn.
+  const currentController = activeAbortControllers.get(sessionKey);
+  const sameOwner = ownedController !== undefined && currentController === ownedController;
+  if (ownedController && !ownedController.signal.aborted && !interruptHonoured) {
     console.warn(`[gracefulCancel] ${sessionKey} LAST-RESORT abort — SDK crash risk acknowledged. Reason: ${reason}`);
-    controller.abort(); // allow-hardcoded: reason="last-resort fallback inside gracefulCancel only — SDK crash risk acknowledged"
-    activeAbortControllers.delete(sessionKey);
-  } else if (interruptHonoured) {
+    ownedController.abort(); // allow-hardcoded: reason="last-resort fallback inside gracefulCancel only — SDK crash risk acknowledged"
+    if (sameOwner) {
+      activeAbortControllers.delete(sessionKey);
+    }
+  } else if (interruptHonoured && sameOwner) {
     // Interrupt won — drop the controller so a future request gets a fresh one.
+    // Only if the slot still holds our controller (no newer turn took over).
     activeAbortControllers.delete(sessionKey);
   }
 }
@@ -167,8 +217,27 @@ export function getAbortController(sessionKey: string): AbortController | undefi
   return activeAbortControllers.get(sessionKey);
 }
 
-export function setAbortController(sessionKey: string, controller: AbortController): void {
+/**
+ * Register the AbortController for the current turn.
+ *
+ * Codex BLOCKER (Akt 1.3 round 7): when `turnEpoch` is supplied, the set is
+ * REFUSED if that epoch is no longer current — a failsafe-released old turn
+ * must not overwrite the controller slot a newer turn owns (which would make
+ * a later /cancel abort the wrong turn). Returns true if the set happened.
+ */
+export function setAbortController(
+  sessionKey: string,
+  controller: AbortController,
+  turnEpoch?: number,
+): boolean {
+  if (turnEpoch !== undefined && !isCurrentTurnEpoch(sessionKey, turnEpoch)) {
+    console.warn(
+      `[request-queue] setAbortController refused for ${sessionKey} — stale turn epoch ${turnEpoch}`,
+    );
+    return false;
+  }
   activeAbortControllers.set(sessionKey, controller);
+  return true;
 }
 
 export function clearAbortController(sessionKey: string, expected?: AbortController): void {
@@ -186,7 +255,23 @@ export function setActiveQuery(sessionKey: string, q: Query): void {
   activeQueries.set(sessionKey, q);
 }
 
-export function clearActiveQuery(sessionKey: string): void {
+/**
+ * Clear the active Query for a session.
+ *
+ * Codex BLOCKER 1 (Akt 1.3 re-review): turn-ownership guard. When `expected`
+ * is passed, the slot is only cleared if it STILL holds that exact Query — a
+ * late teardown of an old (hard-capped) turn must not delete the Query of a
+ * newer turn that already claimed the slot. Without `expected`, behaviour is
+ * the legacy unconditional delete.
+ */
+export function clearActiveQuery(sessionKey: string, expected?: Query): void {
+  if (expected) {
+    const current = activeQueries.get(sessionKey);
+    if (current && current !== expected) {
+      // A newer turn owns this slot — leave it alone.
+      return;
+    }
+  }
   activeQueries.delete(sessionKey);
 }
 
@@ -263,7 +348,7 @@ export function getPendingQueueLength(sessionKey: string): number {
 export async function queueRequest<T>(
   sessionKey: string,
   message: string,
-  handler: () => Promise<T>
+  handler: QueueHandler<T>,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const enqueuedAt_ms = Date.now();
@@ -302,6 +387,14 @@ async function processQueue(sessionKey: string): Promise<void> {
 
   processingFlags.set(sessionKey, true);
   const request = queue.shift()!;
+
+  // Codex BLOCKER (Akt 1.3 round 5/6): advance the turn epoch at dequeue. This
+  // marks "a new turn has begun" BEFORE the handler runs any await. The value
+  // is captured here and passed EXPLICITLY into the handler — never re-read
+  // later — so a failsafe-released old handler cannot observe a newer turn's
+  // epoch and falsely consider itself the owner.
+  const thisTurnEpoch = (turnEpochs.get(sessionKey) ?? 0) + 1;
+  turnEpochs.set(sessionKey, thisTurnEpoch);
 
   // Defense-in-depth: ensure no stale cancel flag leaks from the previous
   // request onto this fresh handler execution. finally also clears it, but
@@ -354,7 +447,8 @@ async function processQueue(sessionKey: string): Promise<void> {
     // its own deadline — we tear down the SDK + reject with a marker error
     // so the outer error-handler can swallow it silently.
     const result = await Promise.race([
-      request.handler(),
+      // Pass the dequeue-bound turn epoch explicitly (Codex round 6).
+      request.handler(thisTurnEpoch),
       new Promise<never>((_, reject) => {
         timeoutHandle = setTimeout(() => {
           // T1 Fix: Interrupt the active query to prevent ghost processes.

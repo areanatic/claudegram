@@ -13,7 +13,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import * as fs from 'fs';
 import { sessionManager } from './session-manager.js';
-import { setActiveQuery, clearActiveQuery, isCancelled, gracefulCancel } from './request-queue.js';
+import { setActiveQuery, clearActiveQuery, isCancelled, clearCancelled, gracefulCancel, isCurrentTurnEpoch } from './request-queue.js';
 import type { Context } from 'grammy';
 import { config } from '../config.js';
 import { AgentWatchdog } from './agent-watchdog.js';
@@ -87,6 +87,39 @@ interface AgentResponse {
 export const CLAUDE_CANCEL_SENTINEL_TEXT =
   '✅ Successfully cancelled - no tools or agents in process.';
 
+/**
+ * Schlachtplan Akt 1.3 Fix C (2026-05-21): dedicated error for a per-turn
+ * tool-budget overrun. Distinct from a /cancel so handlers can tell the user
+ * exactly what happened ("tool limit reached") instead of misrouting it
+ * through the generic cancel-sentinel path. Carries the counts for logging.
+ */
+export class ToolBudgetExceededError extends Error {
+  readonly name = 'ToolBudgetExceededError';
+  constructor(public readonly used: number, public readonly limit: number, public readonly voiceMode: boolean) {
+    super(`Tool limit exceeded (${used}/${limit}, voiceMode=${voiceMode}) — turn aborted`);
+  }
+}
+
+/** User-facing reply for a tool-budget abort. Handlers send this verbatim. */
+export const TOOL_BUDGET_REPLY_TEXT =
+  '⚠️ Tool-Limit für diese Anfrage erreicht — der Turn wurde abgebrochen. Bitte stell die Aufgabe etwas enger oder kleiner.';
+
+/**
+ * Schlachtplan Akt 1.3 (Codex round 7): thrown by `sendToAgent` at its very
+ * start when the turn epoch is stale — i.e. a newer turn for the same session
+ * has already been dequeued. A failsafe-released old handler that wakes up and
+ * reaches `sendToAgent` is stopped HERE, before it can run `updateActivity`,
+ * `recordTranscript`, `query()` or `setActiveQuery`. Handlers swallow this
+ * error silently: the stale turn's queue promise was already rejected and the
+ * newer turn owns the user-facing reply.
+ */
+export class StaleTurnError extends Error {
+  readonly name = 'StaleTurnError';
+  constructor(public readonly sessionKey: string, public readonly turnEpoch: number) {
+    super(`Turn epoch ${turnEpoch} is stale for session=${sessionKey} — a newer turn took over`);
+  }
+}
+
 interface ConversationMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -102,6 +135,13 @@ interface AgentOptions {
   telegramCtx?: Context;
   /** When true, appends voice-mode instructions for conversational TTS-friendly responses */
   voiceMode?: boolean;
+  /**
+   * Codex BLOCKER (Akt 1.3 round 6): the turn epoch assigned by `processQueue`
+   * at dequeue. Passed explicitly from the queue handler so ownership is bound
+   * to the dequeue moment. When omitted (non-queued call), ownership checks
+   * default to "still owner".
+   */
+  turnEpoch?: number;
 }
 
 interface LoopOptions extends AgentOptions {
@@ -448,7 +488,23 @@ export async function sendToAgent(
   message: string,
   options: AgentOptions = {}
 ): Promise<AgentResponse> {
-  const { onProgress, onToolStart, onToolEnd, abortController, command, model, voiceMode } = options;
+  const { onProgress, onToolStart, onToolEnd, abortController, command, model, voiceMode, turnEpoch } = options;
+
+  // Codex BLOCKER (Akt 1.3 round 6): the turn epoch is the one `processQueue`
+  // assigned at DEQUEUE and passed explicitly through the queue handler — NOT
+  // re-read here. Re-reading would let a failsafe-released old handler observe
+  // a newer turn's epoch and falsely pass the ownership check. When undefined
+  // (a non-queued direct call), `isStillOwnerTurn()` defaults to true.
+  const myTurnEpoch = turnEpoch;
+
+  // Codex BLOCKER (round 7): hard early-bail. If this turn's epoch is already
+  // stale (a newer turn was dequeued while this handler was suspended before
+  // reaching sendToAgent), stop NOW — before updateActivity / recordTranscript
+  // / query() / setActiveQuery run any side effect. The handler swallows
+  // StaleTurnError silently; the newer turn owns the user-facing reply.
+  if (myTurnEpoch !== undefined && !isCurrentTurnEpoch(sessionKey, myTurnEpoch)) {
+    throw new StaleTurnError(sessionKey, myTurnEpoch);
+  }
 
   const session = sessionManager.getOrResumeSession(sessionKey);
 
@@ -464,8 +520,11 @@ export async function sendToAgent(
 
   sessionManager.updateActivity(sessionKey, message);
 
-  // Get or initialize conversation history
-  let history = conversationHistory.get(sessionKey) || [];
+  // Get or initialize conversation history.
+  // Codex BLOCKER 1 (round 4): clone the array — do NOT mutate the Map's array
+  // in place. A late old turn mutating the shared array would corrupt a newer
+  // turn's history. The final write-back is itself ownership-guarded below.
+  let history = [...(conversationHistory.get(sessionKey) || [])];
 
   // Determine the prompt based on command
   let prompt = message;
@@ -501,6 +560,19 @@ export async function sendToAgent(
   let watchdog: AgentWatchdog | null = null;
   // One Telegram heartbeat per query — set once when watchdog warning first fires.
   let watchdogUserWarningSent = false;
+  // Codex BLOCKER 1 (Akt 1.3 re-review): the Query this turn owns. Used so the
+  // catch/finally clear the active-query slot ONLY if it still holds OUR Query
+  // — a late teardown must not delete a newer turn's Query.
+  let ownedQuery: ReturnType<typeof query> | undefined;
+  // Codex BLOCKER (round 3/5/6): true if no NEWER turn has taken over this
+  // session. Guards every mutation of shared session state (chatSessionIds /
+  // claudeSessionId / conversationHistory / cancelledChats) so a stale
+  // watchdog or a late success/error from an old turn cannot corrupt a newer
+  // turn. Uses the per-session turn EPOCH captured at queue-dequeue and passed
+  // in explicitly — robust even when a failsafe released an old handler. When
+  // `myTurnEpoch` is undefined (a non-queued direct call), defaults to true.
+  const isStillOwnerTurn = (): boolean =>
+    myTurnEpoch === undefined || isCurrentTurnEpoch(sessionKey, myTurnEpoch);
 
   try {
     const controller = abortController || new AbortController();
@@ -515,13 +587,25 @@ export async function sendToAgent(
       logAt('basic', `[Claude] Resuming session ${existingSessionId} for session ${sessionKey}`);
     }
 
+    // Schlachtplan Akt 1.3 Fix C (2026-05-21): in voiceMode, drop `Task` from
+    // the allowed tools. A Voice turn must never spawn subagent cascades — that
+    // is the exact escalation behind the 30-tool / 6-minute incident.
+    const effectiveBotTools = voiceMode
+      ? config.BOT_TOOLS.filter((t) => t !== 'Task')
+      : config.BOT_TOOLS;
+
     const toolsOption = config.DANGEROUS_MODE
       ? { type: 'preset' as const, preset: 'claude_code' as const }
-      : config.BOT_TOOLS;
+      : effectiveBotTools;
 
     const allowedToolsOption = config.DANGEROUS_MODE
       ? undefined
-      : config.BOT_TOOLS;
+      : effectiveBotTools;
+
+    // Schlachtplan Akt 1.3 Fix C: per-turn tool budget. When the agent issues
+    // more tool_use blocks than this, the turn is aborted as a controlled
+    // error instead of running away unbounded. Voice gets the tighter budget.
+    const maxToolsThisTurn = voiceMode ? config.TOOL_BUDGET_VOICE : config.TOOL_BUDGET_TEXT;
 
     // PreCompact hook: log + flush conversation context to daily transcript
     const preCompactHook: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
@@ -537,7 +621,10 @@ export async function sendToAgent(
           // This preserves what was discussed so the bot can recover context post-compaction
           try {
             const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
-            const recentHistory = conversationHistory.get(sessionKey) || [];
+            // Codex round 5 MEDIUM: use this turn's local `history` clone — it
+            // includes the current user message, which is only written back to
+            // the shared Map at turn end. Reading the Map here would miss it.
+            const recentHistory = history;
             const lastMessages = recentHistory.slice(-6); // last 3 exchanges (user+assistant)
 
             let contextSummary = `**[COMPACTION]** ${timestamp} | trigger: ${trigger}\n`;
@@ -709,6 +796,7 @@ export async function sendToAgent(
       prompt,
       options: queryOptions,
     });
+    ownedQuery = response;
 
     // Store the Query object so /cancel can call interrupt()
     setActiveQuery(sessionKey, response);
@@ -763,10 +851,18 @@ export async function sendToAgent(
           },
           onTimeout: () => {
             logAt('basic', `[Claude] WATCHDOG: Query timeout reached, clearing stale session and gracefulCancel: ${sessionKey}`);
-            chatSessionIds.delete(sessionKey);
-            const staleSession = sessionManager.getSession(sessionKey);
-            if (staleSession) {
-              staleSession.claudeSessionId = undefined;
+            // Codex BLOCKER 1 (Akt 1.3 round 3): turn-ownership guard for the
+            // session-state cleanup. A stale watchdog from an old turn must not
+            // wipe a NEWER turn's claudeSessionId. Only clear if the active
+            // query slot still holds OUR query (= no newer turn took over).
+            if (isStillOwnerTurn()) {
+              chatSessionIds.delete(sessionKey);
+              const staleSession = sessionManager.getSession(sessionKey);
+              if (staleSession) {
+                staleSession.claudeSessionId = undefined;
+              }
+            } else {
+              logAt('basic', `[Claude] WATCHDOG: skipping session-state clear — a newer turn owns ${sessionKey}`);
             }
             // Mai-Intervention 2026-05-11 Phase B.6: route through gracefulCancel
             // (prefers Query.interrupt, falls back to controller.abort with crash-risk marker)
@@ -811,6 +907,30 @@ export async function sendToAgent(
                   : '';
             logAt('verbose', `[Claude] [${formatDuration(getElapsedMs(timer))}] Tool: ${block.name}${inputSummary ? ` → ${inputSummary}` : ''}`);
             toolsUsed.push(block.name);
+            // Schlachtplan Akt 1.3 Fix C: enforce the per-turn tool budget.
+            // Exceeding it is a CONTROLLED abort, NOT a /cancel: we abort the
+            // local AbortController (stops the SDK for this turn only) and
+            // throw a dedicated ToolBudgetExceededError. We deliberately do
+            // NOT call gracefulCancel here — that would set the process-global
+            // `cancelledChats` flag and the abort would be misrouted as a
+            // "Successfully cancelled" sentinel (Codex BLOCKER 3). The catch
+            // block re-throws ToolBudgetExceededError so the handler can send
+            // a clean, specific reply.
+            if (toolsUsed.length > maxToolsThisTurn) {
+              watchdog?.stop();
+              console.warn(
+                `[Claude] TOOL BUDGET EXCEEDED: ${toolsUsed.length}/${maxToolsThisTurn} ` +
+                  `(voiceMode=${!!voiceMode}) session:${sessionKey} — aborting turn`,
+              );
+              if (!controller.signal.aborted) {
+                controller.abort(); // allow-hardcoded: reason="local tool-budget abort — not a /cancel, no global cancel flag set"
+              }
+              throw new ToolBudgetExceededError(
+                toolsUsed.length,
+                maxToolsThisTurn,
+                !!voiceMode,
+              );
+            }
             // Special logging for Task tool (subagents) - always log at basic level
             if (block.name === 'Task') {
               const taskDesc = toolInput.description || toolInput.prompt || 'unnamed task';
@@ -903,9 +1023,16 @@ export async function sendToAgent(
         if (responseMessage.subtype === 'success') {
           // Only store session_id on successful results (not on error_during_execution)
           if ('session_id' in responseMessage && responseMessage.session_id) {
-            chatSessionIds.set(sessionKey, responseMessage.session_id);
-            sessionManager.setClaudeSessionId(sessionKey, responseMessage.session_id);
-            logAt('basic', `[Claude] Stored session ${responseMessage.session_id} for session ${sessionKey}`);
+            // Codex BLOCKER 1 (round 4): turn-ownership guard. A late `success`
+            // from an old (hard-capped) turn must not overwrite the session-id
+            // a NEWER turn already owns.
+            if (isStillOwnerTurn()) {
+              chatSessionIds.set(sessionKey, responseMessage.session_id);
+              sessionManager.setClaudeSessionId(sessionKey, responseMessage.session_id);
+              logAt('basic', `[Claude] Stored session ${responseMessage.session_id} for session ${sessionKey}`);
+            } else {
+              logAt('basic', `[Claude] Skipping session-id store for ${sessionKey} — a newer turn owns the session`);
+            }
           }
 
           // Append final result text if different from accumulated
@@ -922,15 +1049,30 @@ export async function sendToAgent(
           // to route the response through the cancel UI branch instead of finishStreaming.
           fullText = CLAUDE_CANCEL_SENTINEL_TEXT;
           onProgress?.(fullText);
+          // Schlachtplan Akt 1.3 Cancel-Fix 1 (2026-05-21): the cancel flag has
+          // now done its job (sentinel emitted). Clear it immediately so it can
+          // never leak onto the next turn and make a real answer look cancelled
+          // (RI-22). processQueue's finally also clears it, but a follow-up
+          // message that does not start a fresh processQueue cycle would
+          // otherwise see a stale `true`.
+          // Codex round 4: only if still owner — a late old turn must not
+          // consume a NEWER turn's cancel flag.
+          if (isStillOwnerTurn()) clearCancelled(sessionKey);
         } else {
           // error_max_turns or unexpected error_during_execution
-          // Clear stale session ID so next attempt starts fresh
-          chatSessionIds.delete(sessionKey);
-          const session = sessionManager.getSession(sessionKey);
-          if (session) {
-            session.claudeSessionId = undefined;
+          // Clear stale session ID so next attempt starts fresh.
+          // Codex BLOCKER 1 (round 3): turn-ownership guard. A late error from
+          // an old (hard-capped) turn must not wipe a NEWER turn's session.
+          if (isStillOwnerTurn()) {
+            chatSessionIds.delete(sessionKey);
+            const session = sessionManager.getSession(sessionKey);
+            if (session) {
+              session.claudeSessionId = undefined;
+            }
+            logAt('basic', `[Claude] Cleared stale session for session ${sessionKey} due to ${responseMessage.subtype}`);
+          } else {
+            logAt('basic', `[Claude] Skipping stale-session clear for ${sessionKey} — a newer turn owns the session`);
           }
-          logAt('basic', `[Claude] Cleared stale session for session ${sessionKey} due to ${responseMessage.subtype}`);
 
           fullText = `Error: ${responseMessage.subtype}`;
           onProgress?.(fullText);
@@ -939,9 +1081,24 @@ export async function sendToAgent(
     }
   } catch (error) {
     watchdog?.stop();
+    // Schlachtplan Akt 1.3 Fix C (Codex BLOCKER 3): a tool-budget abort MUST be
+    // checked BEFORE the generic cancel branch. The budget code aborts the
+    // local controller, so `abortController.signal.aborted` is true here — but
+    // this is NOT a /cancel and must not become a cancel-sentinel. Re-throw the
+    // dedicated error so the handler sends the specific tool-limit reply.
+    if (error instanceof ToolBudgetExceededError) {
+      clearActiveQuery(sessionKey, ownedQuery);
+      throw error;
+    }
     // If cancelled via /cancel or /reset, return clean message (Telegram-side
     // handler detects CLAUDE_CANCEL_SENTINEL_TEXT and routes to cancel UI).
     if (isCancelled(sessionKey) || abortController?.signal.aborted) {
+      // Schlachtplan Akt 1.3 Cancel-Fix 1 (2026-05-21): clear the cancel flag
+      // before returning the sentinel — otherwise it leaks onto the next turn
+      // and a real answer gets misrouted as a cancel reply (RI-22).
+      // Codex round 4: only if still owner — a late old turn must not consume
+      // a NEWER turn's cancel flag.
+      if (isStillOwnerTurn()) clearCancelled(sessionKey);
       return {
         text: CLAUDE_CANCEL_SENTINEL_TEXT,
         toolsUsed,
@@ -958,7 +1115,9 @@ export async function sendToAgent(
     }
   } finally {
     watchdog?.stop();
-    clearActiveQuery(sessionKey);
+    // Codex BLOCKER 1: ownership-guarded — only clear the slot if it still
+    // holds OUR Query. A late teardown must not delete a newer turn's Query.
+    clearActiveQuery(sessionKey, ownedQuery);
   }
 
   // Add assistant response to history and persist to transcript
@@ -986,7 +1145,13 @@ export async function sendToAgent(
   if (history.length > MAX_CONVERSATION_HISTORY) {
     history = history.slice(-MAX_CONVERSATION_HISTORY);
   }
-  conversationHistory.set(sessionKey, history);
+  // Codex BLOCKER 1 (round 4): turn-ownership guard. A late old turn must not
+  // write its (stale) history back over a newer turn's conversation.
+  if (isStillOwnerTurn()) {
+    conversationHistory.set(sessionKey, history);
+  } else {
+    logAt('basic', `[Claude] Skipping conversationHistory write for ${sessionKey} — a newer turn owns the session`);
+  }
 
   // Cache usage for /context and /status commands
   if (resultUsage) {
@@ -1064,6 +1229,7 @@ IMPORTANT: When you have fully completed this task, respond with the word "DONE"
         abortController,
         model: options.model,
         telegramCtx: options.telegramCtx,
+        turnEpoch: options.turnEpoch,
       });
 
       combinedText += response.text;

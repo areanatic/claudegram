@@ -4,6 +4,7 @@ import { sequentialize } from '@grammyjs/runner';
 import { config } from '../config.js';
 import { buildSessionKey } from '../utils/session-key.js';
 import { authMiddleware } from './middleware/auth.middleware.js';
+import { inputLogMiddleware } from './middleware/input-log.middleware.js';
 import {
   handleStart,
   handleClear,
@@ -187,6 +188,13 @@ export async function createBot(): Promise<Bot> {
 
   // Apply auth middleware to all updates
   bot.use(authMiddleware);
+
+  // Schlachtplan Akt 1.2: durable Input-Log. Registered AFTER auth, BEFORE
+  // sequentialize — every content update is persisted to SQLite + ACKed the
+  // moment it arrives, so nothing is lost when a later agent turn hangs or
+  // gets watchdog-cancelled (RI-19). Bot commands are skipped inside the
+  // middleware. This is the single hard input-durability invariant.
+  bot.use(inputLogMiddleware);
 
   // /cancel, /reset, /softreset, and /ping fire BEFORE sequentialize so they bypass per-chat ordering.
   // This lets them interrupt a running query without waiting for it to finish.

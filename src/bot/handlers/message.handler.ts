@@ -4,6 +4,9 @@ import {
   sendLoopToAgent,
   clearConversation,
   CLAUDE_CANCEL_SENTINEL_TEXT,
+  ToolBudgetExceededError,
+  TOOL_BUDGET_REPLY_TEXT,
+  StaleTurnError,
   type AgentUsage,
 } from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
@@ -35,6 +38,8 @@ import * as path from 'path';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
+import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.middleware.js';
+import { markProcessing, markDone, markDropped, markError } from '../../inbox/input-log.js';
 import {
   createRequestContext,
   disposeRequestContext,
@@ -364,17 +369,34 @@ export async function handleMessage(ctx: Context): Promise<void> {
     }
   }
 
+  // Schlachtplan Akt 1.2: durable Input-Log row recorded by the middleware
+  // before sequentialize. Track its lifecycle through the agent turn.
+  const inputLogRowId = getInputLogRowId(chatId, messageId);
+
   try {
-    // Queue the request - process one at a time per session
-    await queueRequest(sessionKey, text, async () => {
+    // Queue the request - process one at a time per session. The handler
+    // receives `turnEpoch` (the dequeue-bound ownership token) and threads it
+    // into sendToAgent so a late old turn cannot corrupt a newer turn's state.
+    await queueRequest(sessionKey, text, async (turnEpoch) => {
+      markProcessing(inputLogRowId);
       if (getStreamingMode() === 'streaming') {
-        await handleStreamingResponse(ctx, sessionKey, text);
+        await handleStreamingResponse(ctx, sessionKey, text, turnEpoch);
       } else {
-        await handleWaitResponse(ctx, sessionKey, chatId, text);
+        await handleWaitResponse(ctx, sessionKey, chatId, text, turnEpoch);
       }
     });
+    markDone(inputLogRowId);
   } catch (error) {
     if ((error as Error).message === 'Queue cleared') {
+      markDropped(inputLogRowId, 'queue_cleared');
+      forgetInputLogRowId(chatId, messageId);
+      return;
+    }
+    // Codex round 7: stale turn superseded by a newer one — swallow silently.
+    if (error instanceof StaleTurnError) {
+      console.log(`[handleMessage] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+      markDropped(inputLogRowId, 'superseded');
+      forgetInputLogRowId(chatId, messageId);
       return;
     }
     // Stage 2b Action 3: queue failsafe-timeout fired AFTER the RequestContext
@@ -385,6 +407,8 @@ export async function handleMessage(ctx: Context): Promise<void> {
         `[handleMessage] swallowing QueueFailsafeTimeoutError for ${sessionKey} ` +
           `— RequestContext.onHardCap already replied.`,
       );
+      markDropped(inputLogRowId, 'queue_failsafe_timeout');
+      forgetInputLogRowId(chatId, messageId);
       return;
     }
     // Stage 2b Action 1: queued item exceeded wait-bound BEFORE its
@@ -394,17 +418,32 @@ export async function handleMessage(ctx: Context): Promise<void> {
       console.log(
         `[handleMessage] queue-wait timeout for ${sessionKey} after ${Math.round(error.waitedMs / 1000)}s`, // allow-hardcoded: reason="ms→s log conversion"
       );
+      markDropped(inputLogRowId, 'queue_wait_timeout');
       try {
         await ctx.reply(
           '⏱ Timeout: Deine Anfrage hat zu lange in der Warteschlange gewartet. Bitte nochmal senden.',
           { parse_mode: undefined },
         );
       } catch { /* best-effort */ }
+      forgetInputLogRowId(chatId, messageId);
+      return;
+    }
+    // Schlachtplan Akt 1.3 Fix C (Codex BLOCKER 3): a tool-budget abort gets a
+    // specific, friendly reply — not the generic error bubble.
+    if (error instanceof ToolBudgetExceededError) {
+      console.warn(`[handleMessage] tool budget exceeded for ${sessionKey}: ${error.message}`);
+      markDropped(inputLogRowId, 'tool_budget_exceeded');
+      try {
+        await ctx.reply(TOOL_BUDGET_REPLY_TEXT, { parse_mode: undefined });
+      } catch { /* best-effort */ }
       return;
     }
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('Error handling message:', error);
+    markError(inputLogRowId, errorMessage.slice(0, 200));
     await ctx.reply(`❌ Error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+  } finally {
+    forgetInputLogRowId(chatId, messageId);
   }
 }
 
@@ -547,11 +586,11 @@ export async function handleAgentReply(
   }
 
   try {
-    await queueRequest(sessionKey, trimmedInput, async () => {
+    await queueRequest(sessionKey, trimmedInput, async (turnEpoch) => {
       await messageSender.startStreaming(ctx);
 
       const abortController = new AbortController();
-      setAbortController(sessionKey, abortController);
+      setAbortController(sessionKey, abortController, turnEpoch);
 
       // Phase C.1 / V2.5-2 Option B (Codex Sparring 2026-05-12 conf 0.82):
       // /plan /explore /loop previously had NO hard-cap and could wait forever
@@ -571,6 +610,7 @@ export async function handleAgentReply(
               },
               abortController,
               telegramCtx: ctx,
+              turnEpoch,
             });
           } else {
             response = await sendToAgent(sessionKey, trimmedInput, {
@@ -586,6 +626,7 @@ export async function handleAgentReply(
               abortController,
               command: mode,
               telegramCtx: ctx,
+              turnEpoch,
             });
           }
         } catch (innerErr) {
@@ -653,6 +694,11 @@ export async function handleAgentReply(
     });
   } catch (error) {
     if ((error as Error).message === 'Queue cleared') return;
+    // Codex round 7: stale turn superseded — swallow silently.
+    if (error instanceof StaleTurnError) {
+      console.log(`[handleAgentReply ${mode}] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+      return;
+    }
     // Stage 2b Action 3: swallow failsafe (RequestContext already replied).
     if (error instanceof QueueFailsafeTimeoutError) {
       console.log(
@@ -672,6 +718,14 @@ export async function handleAgentReply(
           '⏱ Timeout: Deine Anfrage hat zu lange in der Warteschlange gewartet. Bitte nochmal senden.',
           { parse_mode: undefined },
         );
+      } catch { /* best-effort */ }
+      return;
+    }
+    // Schlachtplan Akt 1.3 Fix C (Codex BLOCKER 3): tool-budget abort.
+    if (error instanceof ToolBudgetExceededError) {
+      console.warn(`[handleAgentReply ${mode}] tool budget exceeded for ${sessionKey}: ${error.message}`);
+      try {
+        await ctx.reply(TOOL_BUDGET_REPLY_TEXT, { parse_mode: undefined });
       } catch { /* best-effort */ }
       return;
     }
@@ -751,12 +805,13 @@ async function handleTelegraphReply(ctx: Context, sessionKey: string, filePath: 
 async function handleStreamingResponse(
   ctx: Context,
   sessionKey: string,
-  message: string
+  message: string,
+  turnEpoch: number,
 ): Promise<void> {
   await messageSender.startStreaming(ctx);
 
   const abortController = new AbortController();
-  setAbortController(sessionKey, abortController);
+  setAbortController(sessionKey, abortController, turnEpoch);
 
   // Phase C.1 / V2.5-1+V2.5-2: replace legacy Promise.race(handler, setTimeout) with
   // RequestContext-driven state machine. Hard-cap is the SINGLE source of timeout
@@ -779,6 +834,7 @@ async function handleStreamingResponse(
       },
       abortController,
       telegramCtx: ctx,
+      turnEpoch,
     });
 
     // Stage 2c (2026-05-12): cancel-sentinel guard.
@@ -868,14 +924,15 @@ async function handleWaitResponse(
   ctx: Context,
   sessionKey: string,
   chatId: number,
-  message: string
+  message: string,
+  turnEpoch: number,
 ): Promise<void> {
   // Start continuous typing indicator (every 4s)
   const keyInfo = getSessionKeyFromCtx(ctx);
   const typingInterval = messageSender.startTypingIndicator(ctx.api, chatId, keyInfo?.threadId);
 
   const abortController = new AbortController();
-  setAbortController(sessionKey, abortController);
+  setAbortController(sessionKey, abortController, turnEpoch);
 
   // Phase C.1 / V2.5-1+V2.5-2: replace legacy Promise.race(handler, setTimeout)
   // with RequestContext state machine. Same contract as streaming path.
@@ -888,6 +945,7 @@ async function handleWaitResponse(
       response = await sendToAgent(sessionKey, message, {
         abortController,
         telegramCtx: ctx,
+        turnEpoch,
       });
     } catch (error) {
       const isAbort =
