@@ -223,17 +223,20 @@ const envSchema = z.object({
     .string()
     .default('180000')
     .transform((val) => parseInt(val, 10)),
-  // Schlachtplan Akt 1.3 Fix C (2026-05-21): per-turn tool budget. A single
-  // turn exceeding this many tool_use blocks is aborted as a controlled error
-  // instead of running away (the 30-tool / 6-minute Voice incident). Voice
-  // gets the tighter budget; text more headroom for research.
+  // Schlachtplan Akt 1.3 Fix C (2026-05-21) / crash-safe re-design 2026-05-22:
+  // per-turn tool budget. A turn exceeding this many tool_use blocks is stopped
+  // COOPERATIVELY (interrupt → close, never controller.abort()) and returns its
+  // partial answer — see interruptForToolBudget() in agent.ts. Voice gets the
+  // tighter budget; text more headroom for research. Raised 4→10 / 12→15 on
+  // 2026-05-22: the old voice cap of 4 aborted "search memory + check INBOX"
+  // tasks before they could even produce an answer.
   TOOL_BUDGET_VOICE: z
     .string()
-    .default('4')
+    .default('10')
     .transform((val) => parseInt(val, 10)),
   TOOL_BUDGET_TEXT: z
     .string()
-    .default('12')
+    .default('15')
     .transform((val) => parseInt(val, 10)),
   // Max time message.handler waits for a single Claude response before aborting.
   // Mai-Intervention 2026-05-11 Phase A.1: replaces hardcoded 5min in

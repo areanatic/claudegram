@@ -6,8 +6,6 @@ import { config } from '../../config.js';
 import {
   sendToAgent,
   CLAUDE_CANCEL_SENTINEL_TEXT,
-  ToolBudgetExceededError,
-  TOOL_BUDGET_REPLY_TEXT,
   StaleTurnError,
 } from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
@@ -292,10 +290,10 @@ export async function handleVoice(ctx: Context): Promise<void> {
             return;
           }
 
-          // Codex BLOCKER 3: a tool-budget abort throws ToolBudgetExceededError
-          // (handled in the catch). A /cancel mid-turn returns the cancel
-          // sentinel verbatim — the Voice path previously sent it as a normal
-          // reply. Suppress it like the text path does.
+          // A /cancel mid-turn returns the cancel sentinel verbatim — the Voice
+          // path previously sent it as a normal reply. Suppress it like the
+          // text path does. (A tool-budget stop is no longer an error here — it
+          // returns a normal partial answer, see interruptForToolBudget.)
           if (response.text === CLAUDE_CANCEL_SENTINEL_TEXT) {
             console.log(`[Voice] cancel-sentinel suppressed for ${sessionKey}`);
             if (streamingStarted) {
@@ -344,29 +342,24 @@ export async function handleVoice(ctx: Context): Promise<void> {
     }
 
     const isHardTimeout = error instanceof HardTimeoutError;
-    const isToolBudget = error instanceof ToolBudgetExceededError;
     let errorMessage: string;
     if (isHardTimeout) {
       errorMessage = '⏱️ Das hat zu lange gedauert und wurde abgebrochen. Schick die Nachricht bitte nochmal — gern etwas kürzer.';
       markDropped(inputLogRowId, 'voice_hard_timeout');
-    } else if (isToolBudget) {
-      errorMessage = TOOL_BUDGET_REPLY_TEXT;
-      markDropped(inputLogRowId, 'tool_budget_exceeded');
     } else {
       errorMessage = sanitizeError(error);
       markError(inputLogRowId, errorMessage.slice(0, 200));
     }
-    console.error('[Voice] Error:', isHardTimeout ? 'voice-hard-timeout' : isToolBudget ? 'tool-budget-exceeded' : errorMessage);
+    console.error('[Voice] Error:', isHardTimeout ? 'voice-hard-timeout' : errorMessage);
 
     // Codex re-review MEDIUM: if a streaming bubble was open when the hard-cap
-    // (or budget abort) fired, cancel it immediately so it does not hang as a
-    // partial-UI artefact while the (possibly stuck) SDK is still being torn
-    // down in the background.
+    // fired, cancel it immediately so it does not hang as a partial-UI artefact
+    // while the (possibly stuck) SDK is still being torn down in the background.
     if (streamingStarted) {
       try { await messageSender.cancelStreaming(ctx); } catch { /* best-effort */ }
     }
 
-    const plainReply = isHardTimeout || isToolBudget;
+    const plainReply = isHardTimeout;
     // Try to update ack message with error
     try {
       await ctx.api.editMessageText(

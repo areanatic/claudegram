@@ -4,8 +4,6 @@ import {
   sendLoopToAgent,
   clearConversation,
   CLAUDE_CANCEL_SENTINEL_TEXT,
-  ToolBudgetExceededError,
-  TOOL_BUDGET_REPLY_TEXT,
   StaleTurnError,
   type AgentUsage,
 } from '../../claude/agent.js';
@@ -428,16 +426,6 @@ export async function handleMessage(ctx: Context): Promise<void> {
       forgetInputLogRowId(chatId, messageId);
       return;
     }
-    // Schlachtplan Akt 1.3 Fix C (Codex BLOCKER 3): a tool-budget abort gets a
-    // specific, friendly reply — not the generic error bubble.
-    if (error instanceof ToolBudgetExceededError) {
-      console.warn(`[handleMessage] tool budget exceeded for ${sessionKey}: ${error.message}`);
-      markDropped(inputLogRowId, 'tool_budget_exceeded');
-      try {
-        await ctx.reply(TOOL_BUDGET_REPLY_TEXT, { parse_mode: undefined });
-      } catch { /* best-effort */ }
-      return;
-    }
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('Error handling message:', error);
     markError(inputLogRowId, errorMessage.slice(0, 200));
@@ -718,14 +706,6 @@ export async function handleAgentReply(
           '⏱ Timeout: Deine Anfrage hat zu lange in der Warteschlange gewartet. Bitte nochmal senden.',
           { parse_mode: undefined },
         );
-      } catch { /* best-effort */ }
-      return;
-    }
-    // Schlachtplan Akt 1.3 Fix C (Codex BLOCKER 3): tool-budget abort.
-    if (error instanceof ToolBudgetExceededError) {
-      console.warn(`[handleAgentReply ${mode}] tool budget exceeded for ${sessionKey}: ${error.message}`);
-      try {
-        await ctx.reply(TOOL_BUDGET_REPLY_TEXT, { parse_mode: undefined });
       } catch { /* best-effort */ }
       return;
     }

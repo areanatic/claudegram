@@ -88,21 +88,53 @@ export const CLAUDE_CANCEL_SENTINEL_TEXT =
   '✅ Successfully cancelled - no tools or agents in process.';
 
 /**
- * Schlachtplan Akt 1.3 Fix C (2026-05-21): dedicated error for a per-turn
- * tool-budget overrun. Distinct from a /cancel so handlers can tell the user
- * exactly what happened ("tool limit reached") instead of misrouting it
- * through the generic cancel-sentinel path. Carries the counts for logging.
+ * Tool-Budget cooperative stop (2026-05-22 crash-safe re-design).
+ *
+ * When a turn exceeds its per-turn tool budget we must NOT abort the SDK
+ * AbortController — that tore the claude-code subprocess apart mid-write and
+ * crashed the WHOLE bot process (`F1 "Operation aborted"`, observed
+ * 2026-05-22 14:35). Instead we ask the Query to stop cooperatively:
+ * `interrupt()` first, and only `close()` if the interrupt is not honoured
+ * within the timeout. Never touches `cancelledChats` (this is NOT a /cancel)
+ * and never calls `controller.abort()`.
  */
-export class ToolBudgetExceededError extends Error {
-  readonly name = 'ToolBudgetExceededError';
-  constructor(public readonly used: number, public readonly limit: number, public readonly voiceMode: boolean) {
-    super(`Tool limit exceeded (${used}/${limit}, voiceMode=${voiceMode}) — turn aborted`);
+const TOOL_BUDGET_INTERRUPT_TIMEOUT_MS = 5000; // allow-hardcoded: reason="SDK interrupt grace window before close()"
+
+async function interruptForToolBudget(
+  q: ReturnType<typeof query> | undefined,
+  sessionKey: string,
+): Promise<void> {
+  if (!q) return;
+  let interruptHonoured = false;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      q.interrupt().then(() => {
+        interruptHonoured = true;
+      }),
+      new Promise<void>((resolve) => {
+        timeoutHandle = setTimeout(() => {
+          console.warn(
+            `[ToolBudget] ${sessionKey} interrupt() exceeded ` +
+              `${TOOL_BUDGET_INTERRUPT_TIMEOUT_MS}ms — falling back to close()`,
+          );
+          resolve();
+        }, TOOL_BUDGET_INTERRUPT_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (err) {
+    console.warn(`[ToolBudget] ${sessionKey} interrupt() threw:`, err);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+  if (!interruptHonoured) {
+    try {
+      await q.close();
+    } catch (err) {
+      console.warn(`[ToolBudget] ${sessionKey} close() threw:`, err);
+    }
   }
 }
-
-/** User-facing reply for a tool-budget abort. Handlers send this verbatim. */
-export const TOOL_BUDGET_REPLY_TEXT =
-  '⚠️ Tool-Limit für diese Anfrage erreicht — der Turn wurde abgebrochen. Bitte stell die Aufgabe etwas enger oder kleiner.';
 
 /**
  * Schlachtplan Akt 1.3 (Codex round 7): thrown by `sendToAgent` at its very
@@ -170,6 +202,10 @@ Guidelines:
 - Show relevant code snippets when helpful, but keep them short
 - If a task requires multiple steps, execute them and summarize what you did
 - When you can't do something, explain why briefly
+
+Memory & Honesty:
+- When the user refers to something earlier ("hab ich dir geschickt", "haben wir besprochen", "letztes Mal", "gestern"), SEARCH FIRST before asking them to repeat: use the nexusgram_memory_search tool AND list the INBOX folder. Only ask the user once you have actually looked.
+- NEVER invent an explanation for missing data. If you cannot find something, say plainly what you searched and what you did not find — name the source. Do not guess why it is missing.
 
 Copy-Ready Content Rule:
 ONLY use [SPLIT] when the user EXPLICITLY asks for a text to copy — e.g. "write me a WhatsApp message", "give me an email", "what should I text", "gib mir einen Text zum Kopieren".
@@ -552,6 +588,10 @@ export async function sendToAgent(
   let fullText = '';
   const toolsUsed: string[] = [];
   let gotResult = false;
+  // Tool-Budget cooperative stop (2026-05-22): set true when the per-turn tool
+  // budget is hit. The turn then ends normally with the partial answer — no
+  // exception, no controller.abort(), no process crash.
+  let toolBudgetReached = false;
   let resultUsage: AgentUsage | undefined;
   let compactionEvent: { trigger: 'manual' | 'auto'; preTokens: number } | undefined;
   let initEvent: { model: string; sessionId: string } | undefined;
@@ -919,7 +959,7 @@ export async function sendToAgent(
     watchdog?.start();
 
     // Process response messages
-    for await (const responseMessage of response) {
+    responseLoop: for await (const responseMessage of response) {
       // Record activity for watchdog
       recordMessage(timer);
       watchdog?.recordActivity(responseMessage.type);
@@ -951,29 +991,23 @@ export async function sendToAgent(
                   : '';
             logAt('verbose', `[Claude] [${formatDuration(getElapsedMs(timer))}] Tool: ${block.name}${inputSummary ? ` → ${inputSummary}` : ''}`);
             toolsUsed.push(block.name);
-            // Schlachtplan Akt 1.3 Fix C: enforce the per-turn tool budget.
-            // Exceeding it is a CONTROLLED abort, NOT a /cancel: we abort the
-            // local AbortController (stops the SDK for this turn only) and
-            // throw a dedicated ToolBudgetExceededError. We deliberately do
-            // NOT call gracefulCancel here — that would set the process-global
-            // `cancelledChats` flag and the abort would be misrouted as a
-            // "Successfully cancelled" sentinel (Codex BLOCKER 3). The catch
-            // block re-throws ToolBudgetExceededError so the handler can send
-            // a clean, specific reply.
+            // Tool-Budget (Akt 1.3 Fix C / 2026-05-22 crash-safe re-design):
+            // exceeding the per-turn budget stops the turn COOPERATIVELY. We do
+            // NOT call controller.abort() — that tore the SDK subprocess apart
+            // mid-write and crashed the whole bot process (F1 "Operation
+            // aborted", 2026-05-22 14:35). Instead: interruptForToolBudget()
+            // (interrupt → close), set a flag, leave the loop cleanly and
+            // return the partial answer normally. No /cancel, no cancelledChats,
+            // no exception — the turn ends as a normal `done`.
             if (toolsUsed.length > maxToolsThisTurn) {
               watchdog?.stop();
               console.warn(
                 `[Claude] TOOL BUDGET EXCEEDED: ${toolsUsed.length}/${maxToolsThisTurn} ` +
-                  `(voiceMode=${!!voiceMode}) session:${sessionKey} — aborting turn`,
+                  `(voiceMode=${!!voiceMode}) session:${sessionKey} — stopping turn cooperatively`,
               );
-              if (!controller.signal.aborted) {
-                controller.abort(); // allow-hardcoded: reason="local tool-budget abort — not a /cancel, no global cancel flag set"
-              }
-              throw new ToolBudgetExceededError(
-                toolsUsed.length,
-                maxToolsThisTurn,
-                !!voiceMode,
-              );
+              toolBudgetReached = true;
+              await interruptForToolBudget(ownedQuery, sessionKey);
+              break responseLoop;
             }
             // Special logging for Task tool (subagents) - always log at basic level
             if (block.name === 'Task') {
@@ -1125,15 +1159,6 @@ export async function sendToAgent(
     }
   } catch (error) {
     watchdog?.stop();
-    // Schlachtplan Akt 1.3 Fix C (Codex BLOCKER 3): a tool-budget abort MUST be
-    // checked BEFORE the generic cancel branch. The budget code aborts the
-    // local controller, so `abortController.signal.aborted` is true here — but
-    // this is NOT a /cancel and must not become a cancel-sentinel. Re-throw the
-    // dedicated error so the handler sends the specific tool-limit reply.
-    if (error instanceof ToolBudgetExceededError) {
-      clearActiveQuery(sessionKey, ownedQuery);
-      throw error;
-    }
     // If cancelled via /cancel or /reset, return clean message (Telegram-side
     // handler detects CLAUDE_CANCEL_SENTINEL_TEXT and routes to cancel UI).
     if (isCancelled(sessionKey) || abortController?.signal.aborted) {
@@ -1162,6 +1187,17 @@ export async function sendToAgent(
     // Codex BLOCKER 1: ownership-guarded — only clear the slot if it still
     // holds OUR Query. A late teardown must not delete a newer turn's Query.
     clearActiveQuery(sessionKey, ownedQuery);
+  }
+
+  // Tool-Budget cooperative stop (2026-05-22): the turn produced a partial
+  // answer (or none). Apply the note/fallback HERE — BEFORE history, transcript
+  // and logConversationTurn — so the budget turn is recorded in memory exactly
+  // as the user sees it, including the empty-output fallback case (Codex
+  // Pattern-B finding, cross_review_nexusgram-kernfix-diff_2026-05-22).
+  if (toolBudgetReached) {
+    fullText = fullText.trim()
+      ? `⚠️ Ich habe das Tool-Limit für diese Anfrage erreicht — hier mein Zwischenstand:\n\n${fullText}`
+      : 'Diese Anfrage hat mein Tool-Limit gesprengt, bevor ich antworten konnte. Bitte stell sie etwas enger — am besten eine Sache nach der anderen.';
   }
 
   // Add assistant response to history and persist to transcript

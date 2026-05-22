@@ -97,8 +97,8 @@ export function buildRecentUploadsContext(workingDir: string, limit = 10): strin
     return `- ${u.ts} ${u.path}${captionFragment}`;
   });
   return (
-    `\n\nRecent image uploads in this project (newest first, last ${slice.length} of max ${MAX_ENTRIES}):\n` +
+    `\n\nRecent uploads in this project (newest first, last ${slice.length} of max ${MAX_ENTRIES}) — images AND documents (PDF etc.):\n` +
     lines.join('\n') +
-    `\nIf the user references one of these images (e.g. "das Bild von vorhin", "the screenshot"), use the Read tool with the absolute path.`
+    `\nIf the user references one of these (e.g. "das Bild von vorhin", "the screenshot", "das PDF", "der Brief den ich geschickt hab"), use the Read tool with the absolute path.`
   );
 }

@@ -39,9 +39,9 @@ async function main() {
   // Akt 1c boot-recovery: any input_log row still 'received'/'processing' is
   // orphaned from a previous process — mark it dropped BEFORE polling starts,
   // so it neither lingers as silent drift nor inflates the /health pending count.
-  const recovered = recoverOrphanedInputs();
-  if (recovered > 0) {
-    console.log(`[Startup] Boot-recovery: ${recovered} orphaned input(s) from a previous run marked dropped.`);
+  const recovery = recoverOrphanedInputs();
+  if (recovery.recovered > 0) {
+    console.log(`[Startup] Boot-recovery: ${recovery.recovered} orphaned input(s) from a previous run marked dropped.`);
   }
 
   // Start concurrent runner — updates are processed in parallel,
@@ -72,6 +72,34 @@ async function main() {
     },
   });
   console.log('[Runner] Grammy runner started, polling for updates...');
+
+  // FIX 4 (2026-05-22): tell users whose in-flight message was lost to a
+  // crash/restart. Only RECENT orphans (see RECENT_ORPHAN_WINDOW_MS) — old
+  // drift is dropped silently. Grouped per chat, capped at 3 snippets, best-effort.
+  if (recovery.recentOrphans.length > 0) {
+    const byChat = new Map<number, typeof recovery.recentOrphans>();
+    for (const orphan of recovery.recentOrphans) {
+      const list = byChat.get(orphan.chatId) ?? [];
+      list.push(orphan);
+      byChat.set(orphan.chatId, list);
+    }
+    for (const [chatId, orphans] of byChat) {
+      const snippets = orphans.slice(0, 3).map((o) => {
+        const preview = (o.rawContent || `(${o.inputType})`)
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 120);
+        return `• ${preview}`;
+      });
+      const notice =
+        '⚠️ Ich wurde gerade neu gestartet — deine letzte(n) Nachricht(en) sind ' +
+        'dabei evtl. nicht durchgekommen. Bitte nochmal senden:\n' +
+        snippets.join('\n');
+      try {
+        await bot.api.sendMessage(chatId, notice);
+      } catch { /* best-effort — startup continues regardless */ }
+    }
+  }
 
   // Graceful shutdown (guarded against duplicate signals)
   let shuttingDown = false;

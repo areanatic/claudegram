@@ -28,6 +28,7 @@ import {
   setAbortController,
 } from '../../claude/request-queue.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
+import { recordUpload } from '../../memory/recent-uploads.js';
 import { getStreamingMode } from './command.handler.js';
 import { downloadFileSecure, getTelegramFileUrl } from '../../utils/download.js';
 import { sanitizeError } from '../../utils/sanitize.js';
@@ -161,6 +162,20 @@ export async function handleDocument(ctx: Context): Promise<void> {
     saveMetadata(metadata);
 
     console.log(`[Document] Saved: ${metadata.savedFilename} (${formatFileSize(fileSizeBytes)})`);
+
+    // FIX 3 (2026-05-22): make the uploaded document visible to the agent.
+    // Without this the bot has no idea a document arrived — it would tell the
+    // user "nothing in INBOX" while the file sits right there. recent-uploads
+    // is read per agent cwd, so record it against the active session's
+    // workingDirectory (same pattern as photo.handler).
+    const docSession = sessionManager.getOrResumeSession(sessionKey);
+    if (docSession) {
+      recordUpload(docSession.workingDirectory, {
+        path: metadata.savedPath,
+        caption: metadata.caption || metadata.originalFilename,
+        ts: metadata.receivedAt,
+      });
+    }
 
     // ── Batch or immediate response ──
     await handleBatchOrImmediate(ctx, sessionKey, metadata);

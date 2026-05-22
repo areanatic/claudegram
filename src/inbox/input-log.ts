@@ -280,6 +280,27 @@ export function countPending(): number {
   }
 }
 
+/** A recent orphaned input surfaced by boot-recovery for user notification. */
+export interface OrphanInput {
+  chatId: number;
+  inputType: string;
+  rawContent: string | null;
+  receivedAt: string;
+}
+
+/**
+ * Boot-recovery result: how many rows were dropped, plus the recent subset
+ * (arrived <= RECENT_ORPHAN_WINDOW_MS before startup) worth notifying the user
+ * about. Old drift is still dropped, just not surfaced.
+ */
+export interface RecoveryResult {
+  recovered: number;
+  recentOrphans: OrphanInput[];
+}
+
+/** Orphans newer than this before boot are surfaced to the user (FIX 4). */
+const RECENT_ORPHAN_WINDOW_MS = 600_000; // allow-hardcoded: reason="10min boot-recovery user-notify window"
+
 /**
  * Boot-recovery (Akt 1c): on startup every row still 'received'/'processing'
  * is necessarily orphaned — the only processor is this bot, which just started
@@ -288,13 +309,27 @@ export function countPending(): number {
  * does not drift upward forever. MUST run before the runner starts polling, so
  * freshly-arriving inputs are never affected.
  *
- * Returns the number of rows recovered (0 if none, -1 if logging unavailable).
+ * FIX 4 (2026-05-22): also returns the RECENT orphans so the caller can tell
+ * the affected user their in-flight message was lost to the crash/restart.
  */
-export function recoverOrphanedInputs(): number {
+export function recoverOrphanedInputs(): RecoveryResult {
   const conn = getDb();
-  if (!conn) return -1;
+  if (!conn) return { recovered: 0, recentOrphans: [] };
   try {
-    const cutoff = new Date().toISOString();
+    const now = Date.now();
+    const cutoff = new Date(now).toISOString();
+    const recentCutoff = new Date(now - RECENT_ORPHAN_WINDOW_MS).toISOString();
+    // Capture recent orphans BEFORE the UPDATE so the caller can notify the
+    // user that their in-flight message was lost to a crash/restart.
+    const recentOrphans = conn
+      .prepare(
+        `SELECT chat_id AS chatId, input_type AS inputType,
+                raw_content AS rawContent, received_at AS receivedAt
+           FROM input_log
+          WHERE status IN ('received', 'processing')
+            AND received_at <= ? AND received_at >= ?`,
+      )
+      .all(cutoff, recentCutoff) as OrphanInput[];
     const info = conn
       .prepare(
         `UPDATE input_log
@@ -304,13 +339,14 @@ export function recoverOrphanedInputs(): number {
       .run(cutoff, cutoff);
     if (info.changes > 0) {
       console.log(
-        `[InputLog] boot-recovery: marked ${info.changes} orphaned input(s) dropped (startup_recovery)`,
+        `[InputLog] boot-recovery: marked ${info.changes} orphaned input(s) dropped ` +
+          `(startup_recovery), ${recentOrphans.length} recent`,
       );
     }
-    return info.changes;
+    return { recovered: info.changes, recentOrphans };
   } catch (err) {
     console.error('[InputLog] recoverOrphanedInputs failed:', err);
-    return -1;
+    return { recovered: 0, recentOrphans: [] };
   }
 }
 
