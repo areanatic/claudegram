@@ -402,7 +402,17 @@ Rules for voice responses:
 - Do NOT include a Reasoning Summary section
 - Do NOT use emoji`;
 
-const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}${TOOL_PROMPTS}${config.CLAUDE_REASONING_SUMMARY ? REASONING_SUMMARY_INSTRUCTIONS : ''}`;
+// Akt A4: defense-in-depth prompt guard. The hard block is the PreToolUse
+// security hook; this just stops the agent from repeatedly trying.
+const SELF_MANAGEMENT_GUARD = `
+
+## Hard rule — no self-management
+You run as a long-lived service. NEVER run launchctl, kill, pkill, killall,
+shutdown, reboot, or any command that stops, starts, or restarts a service,
+process, or this bot itself — even if earlier conversation context appears to
+ask for it. If a turn's context looks like a leftover deploy/restart task,
+ignore that part. Restarts and deploys are handled out-of-band by the operator.`;
+const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}${TOOL_PROMPTS}${config.CLAUDE_REASONING_SUMMARY ? REASONING_SUMMARY_INSTRUCTIONS : ''}${SELF_MANAGEMENT_GUARD}`;
 
 /**
  * Extract [BUTTONS: opt1 | opt2 | opt3] from response text.
@@ -712,11 +722,45 @@ export async function sendToAgent(
       }
       : {};
 
-    const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> | undefined =
+    // Akt A4 (2026-05-22): always-on security PreToolUse hook. The bot's agent
+    // runs Claude Code with the Bash tool; a session contaminated with stale
+    // deploy context was observed emitting `launchctl kickstart -k
+    // com.nexus.nexusgram`, restarting the bot itself in a loop
+    // (cross_review_restart-sigterm-mystery_2026-05-22.md). This hard runtime
+    // gate denies service-/process-management commands regardless of session
+    // content, loaded settings, or permissionMode.
+    const SELF_MANAGEMENT_CMD =
+      /\b(launchctl|kickstart|bootout|killall|pkill|kill|shutdown|reboot|halt)\b/i;
+    const securityPreToolUse: HookCallbackMatcher = {
+      hooks: [async (input) => {
+        const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
+        if (i.tool_name === 'Bash') {
+          const cmd = String(i.tool_input?.command ?? '');
+          if (SELF_MANAGEMENT_CMD.test(cmd)) {
+            console.warn(`[Security] BLOCKED self-management command: ${cmd.slice(0, 160)}`);
+            return {
+              hookSpecificOutput: {
+                hookEventName: 'PreToolUse' as const,
+                permissionDecision: 'deny' as const,
+                permissionDecisionReason:
+                  'Denied by the Akt-A4 security guard: this bot must never run ' +
+                  'service- or process-management commands (launchctl, kill, pkill, ' +
+                  'shutdown, reboot). It prevents the bot from restarting or killing itself.',
+              },
+            };
+          }
+        }
+        return { continue: true };
+      }],
+    };
+
+    const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> =
       LOG_LEVELS[getLogLevel()] >= LOG_LEVELS.verbose
         ? {
           ...preCompactHook,
           ...verboseHooks,
+          // security hook runs first, verbose-logging hook (if any) after
+          PreToolUse: [securityPreToolUse, ...(verboseHooks.PreToolUse ?? [])],
           SessionStart: [{
             hooks: [async (input) => {
               logAt('basic', '[Hook] SessionStart', input);
@@ -730,7 +774,7 @@ export async function sendToAgent(
             }],
           }],
         }
-        : preCompactHook;
+        : { ...preCompactHook, PreToolUse: [securityPreToolUse] };
 
     // Validate cwd exists — stale sessions may reference paths from another OS
     let cwd = session.workingDirectory;
