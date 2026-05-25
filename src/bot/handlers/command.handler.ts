@@ -1160,6 +1160,12 @@ export async function handleBrief(ctx: Context): Promise<void> {
       inputType: 'text',
       rawContent: briefedText,
       fileId: null,
+      // FIX 6+ Stage 2c: /brief is by definition "I want the bot to use this"
+      // — explicit public, even if the session is currently in `/private on`.
+      // The whole point of the command is to put context where the next agent
+      // turn (via nexusgram_input_log_search, which runs in public mode) can
+      // find it.
+      privacy: 'public',
     });
     if (rowId != null) markDone(rowId);
   } catch (err) {

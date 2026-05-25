@@ -29,6 +29,7 @@ import Database from 'better-sqlite3';
 import * as path from 'path';
 import * as fs from 'fs';
 import { config } from '../config.js';
+import { isPrivate as isSessionPrivate } from '../memory/privacy-state.js';
 
 export type InputType = 'text' | 'voice' | 'audio' | 'photo' | 'document' | 'other';
 export type InputStatus = 'received' | 'processing' | 'done' | 'dropped' | 'error';
@@ -112,14 +113,66 @@ function getDb(): Database.Database | null {
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_input_log_msg ON input_log(chat_id, message_id)',
     );
 
-    // FIX 6+ Step 2 (2026-05-25): privacy column + FTS5 retrieval layer.
-    // Codex Pre-Review (cross_review_codex-fix6-plus-build-prereview): without
-    // a privacy column an unscoped MCP search would leak private rows. Default
-    // 'private' is fail-CLOSED — caller must opt into public (or session-scope
-    // is automatically applied by searchInputLog).
+    // FIX 6+ Stage 2c (2026-05-25): privacy column with default 'public'.
+    //
+    // Stage 2b shipped this column with default 'private' (fail-CLOSED at the
+    // DB level). Codex Pattern-B Re-Review (conf 0.66 — RESTART-BLOCK) showed
+    // the resulting Public-Search blindness: searchInputLog correctly filters
+    // privacy='public', but the writer (recordInput) never set privacy, so the
+    // DEFAULT 'private' applied to BOTH historical 109 rows AND every new
+    // row. Net effect: MCP `nexusgram_input_log_search` (which never sets
+    // includePrivate) returned 0 hits even for the killer-test row 87.
+    //
+    // Stage 2c flips the default to 'public' and pairs it with two writer-side
+    // guarantees below:
+    //   (1) recordInput() now ALWAYS sets privacy explicitly — either from the
+    //       sessionKey's privacy-state cache (`/private on` → 'private') or
+    //       from an explicit caller override.
+    //   (2) The migration backfills any pre-existing rows that were captured
+    //       under the Stage 2b 'private'-default to 'public' (one-shot
+    //       UPDATE), so the killer-test row 87 becomes searchable again.
+    //
+    // Rationale for default='public': the user is writing to their own bot in
+    // their own chat. The expectation is "bot may use this". Privacy is an
+    // explicit opt-in via the existing `/private on` command (see
+    // src/memory/privacy-state.ts), and the writer honours that state below.
     if (!cols.includes('privacy')) {
-      console.log('[InputLog] migrating: adding column privacy (default private)');
-      conn.exec(`ALTER TABLE input_log ADD COLUMN privacy TEXT NOT NULL DEFAULT 'private'`);
+      console.log('[InputLog] migrating: adding column privacy (default public)');
+      conn.exec(`ALTER TABLE input_log ADD COLUMN privacy TEXT NOT NULL DEFAULT 'public'`);
+    }
+
+    // Stage 2c backfill: any row that still has privacy='private' from a
+    // Stage 2b-style migration (or was inserted without an explicit privacy
+    // value while the default was 'private') is promoted to 'public'. This
+    // is intentional: pre-FIX-6+ traffic was captured under "bot may use
+    // this" semantics, there was no privacy gate yet, and demoting that
+    // history to 'private' would hide the killer-test rows and any prior
+    // briefing-equivalent context from the agent.
+    //
+    // Idempotent: re-running on an already-backfilled DB updates 0 rows.
+    // After Stage 2c, true privacy is established by `/private on` BEFORE
+    // a message is sent — the writer sets privacy='private' at INSERT time,
+    // so the backfill never reclassifies a deliberately-private row.
+    try {
+      const stale = conn
+        .prepare(
+          "SELECT COUNT(*) AS n FROM input_log WHERE privacy IS NULL OR privacy = '' OR privacy = 'private'",
+        )
+        .get() as { n: number };
+      if (stale.n > 0) {
+        const result = conn
+          .prepare(
+            "UPDATE input_log SET privacy = 'public' WHERE privacy IS NULL OR privacy = '' OR privacy = 'private'",
+          )
+          .run();
+        console.log(
+          `[InputLog] Stage 2c backfill: ${result.changes} historical row(s) → privacy='public'`,
+        );
+      }
+    } catch (backfillErr) {
+      // Non-fatal: a failed backfill leaves historical rows invisible to
+      // public-mode search but does not corrupt the DB. Log loudly.
+      console.error('[InputLog] Stage 2c backfill failed (non-fatal):', backfillErr);
     }
 
     // FTS5 virtual table (contentless, sync via triggers). Indexes raw_content
@@ -212,6 +265,14 @@ export interface RecordInputOptions {
   rawContent?: string | null;
   /** Telegram file_id for media inputs. */
   fileId?: string | null;
+  /**
+   * FIX 6+ Stage 2c: explicit privacy classification. When omitted, the
+   * writer consults the per-session privacy-state cache (`isPrivate(sessionKey)`)
+   * and falls back to 'public'. Callers that have an authoritative answer
+   * (e.g. `/brief` — always public; future `/private-once` — explicitly
+   * private) should set this field instead of relying on session state.
+   */
+  privacy?: 'public' | 'private';
 }
 
 /**
@@ -228,10 +289,36 @@ export function recordInput(opts: RecordInputOptions): number | null {
   if (!conn) return null;
   try {
     const now = new Date().toISOString();
+    // FIX 6+ Stage 2c: privacy is now WRITER-DETERMINED, not DB-default.
+    //
+    // Resolution order:
+    //   1. Explicit `opts.privacy` (callers like /brief that have ground truth).
+    //   2. `isSessionPrivate(sessionKey)` — honours `/private on` per session.
+    //   3. Default 'public' — matches user expectation ("bot may use this").
+    //
+    // This is the inverse policy from Stage 2b (DEFAULT 'private', fail-CLOSED
+    // at DB level). The fail-CLOSED guarantee is preserved at the READ side
+    // (searchInputLog filters privacy='public' unless an in-process caller
+    // opts in via includePrivate). At write time, classifying every captured
+    // turn as private (Stage 2b) made even the killer-test row 87 invisible
+    // to the MCP tool; Stage 2c routes the classification through the
+    // existing per-session privacy-state instead.
+    let privacy: 'public' | 'private';
+    if (opts.privacy === 'private' || opts.privacy === 'public') {
+      privacy = opts.privacy;
+    } else {
+      try {
+        privacy = isSessionPrivate(opts.sessionKey) ? 'private' : 'public';
+      } catch {
+        // privacy-state cache is best-effort — never crash the input-log on
+        // a state-store error. Fall back to public (matches Stage 2c default).
+        privacy = 'public';
+      }
+    }
     const stmt = conn.prepare(`
       INSERT INTO input_log
-        (received_at, message_id, chat_id, session_key, input_type, raw_content, file_id, status, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'received', ?)
+        (received_at, message_id, chat_id, session_key, input_type, raw_content, file_id, status, updated_at, privacy)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'received', ?, ?)
       ON CONFLICT(chat_id, message_id) DO NOTHING
     `);
     const info = stmt.run(
@@ -243,6 +330,7 @@ export function recordInput(opts: RecordInputOptions): number | null {
       opts.rawContent ?? null,
       opts.fileId ?? null,
       now,
+      privacy,
     );
     if (info.changes > 0) {
       return Number(info.lastInsertRowid);
