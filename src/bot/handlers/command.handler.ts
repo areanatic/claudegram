@@ -1151,6 +1151,14 @@ export async function handleBrief(ctx: Context): Promise<void> {
   // hits sort it to the top for any related question.
   const briefedText = `[BRIEF] ${text}`;
   let rowId: number | null = null;
+  // FIX 6+ Stage 2d: /brief is now privacy-mode-aware. When the session is in
+  // `/private on`, the brief inherits 'private' so it never leaks via the
+  // public MCP search path. The user must explicitly `/private off` (or never
+  // turn it on) to get the public-search-findable brief that Stage 2c shipped.
+  // Rationale: consistent with `recordInput()`-Resolution and the `/private`
+  // UX promise ("new turns will be tagged private"). Public-mode users (the
+  // overwhelming default) still get the same Stage 2c behaviour.
+  const briefIsPrivate = isPrivate(sessionKey);
   try {
     const { recordInput, markDone } = await import('../../inbox/input-log.js');
     rowId = recordInput({
@@ -1160,12 +1168,7 @@ export async function handleBrief(ctx: Context): Promise<void> {
       inputType: 'text',
       rawContent: briefedText,
       fileId: null,
-      // FIX 6+ Stage 2c: /brief is by definition "I want the bot to use this"
-      // — explicit public, even if the session is currently in `/private on`.
-      // The whole point of the command is to put context where the next agent
-      // turn (via nexusgram_input_log_search, which runs in public mode) can
-      // find it.
-      privacy: 'public',
+      privacy: briefIsPrivate ? 'private' : 'public',
     });
     if (rowId != null) markDone(rowId);
   } catch (err) {
@@ -1189,8 +1192,13 @@ export async function handleBrief(ctx: Context): Promise<void> {
   const dailyPath = `/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/daily/${today}.md`;
   const dailyPresent = fs.existsSync(dailyPath);
 
+  const briefScopeLabel = briefIsPrivate
+    ? 'private (session ist in `/private on` — Brief NICHT via public MCP-Search findbar; nutze ihn direkt in der Folgefrage oder `/private off` vor `/brief`)'
+    : 'public (Brief ist via input_log_search für den nächsten Agent-Turn findbar)';
+
   const lines: string[] = [
     `✅ Brief gespeichert${rowId != null ? ` (input_log id=${rowId})` : ''}`,
+    `   Scope: ${briefScopeLabel}`,
     '',
     '*Was ich sehe:*',
     `- input_log letzte 10 Inputs: ${recentCount}${droppedCount > 0 ? ` (davon ${droppedCount} dropped — über input_log_search abrufbar)` : ''}`,

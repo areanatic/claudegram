@@ -141,38 +141,66 @@ function getDb(): Database.Database | null {
       conn.exec(`ALTER TABLE input_log ADD COLUMN privacy TEXT NOT NULL DEFAULT 'public'`);
     }
 
-    // Stage 2c backfill: any row that still has privacy='private' from a
-    // Stage 2b-style migration (or was inserted without an explicit privacy
-    // value while the default was 'private') is promoted to 'public'. This
-    // is intentional: pre-FIX-6+ traffic was captured under "bot may use
-    // this" semantics, there was no privacy gate yet, and demoting that
-    // history to 'private' would hide the killer-test rows and any prior
-    // briefing-equivalent context from the agent.
+    // FIX 6+ Stage 2d (2026-05-25): one-time backfill via migration marker.
     //
-    // Idempotent: re-running on an already-backfilled DB updates 0 rows.
-    // After Stage 2c, true privacy is established by `/private on` BEFORE
-    // a message is sent — the writer sets privacy='private' at INSERT time,
-    // so the backfill never reclassifies a deliberately-private row.
+    // Codex Pattern-B Re-Re-Review (conf 0.62 — RESTART-BLOCK) flagged a
+    // hard privacy regression in the Stage 2c backfill: the original UPDATE
+    // matched `privacy IS NULL OR privacy='' OR privacy='private'` and ran
+    // on EVERY boot. As soon as a user activated `/private on` and sent an
+    // input, the writer correctly stored `privacy='private'` — but on the
+    // next bot restart the always-on backfill demoted that legitimate
+    // private row to `'public'`. Privacy leak across the restart boundary.
+    //
+    // Stage 2d wraps the backfill in a marker-table guard so it runs
+    // EXACTLY ONCE per DB. After the first successful run, future boots
+    // skip the UPDATE entirely — `/private on` rows are then immutable.
+    //
+    // Trade-off: a DB whose Stage 2b traffic genuinely included
+    // user-intended private rows cannot be disambiguated from
+    // Stage-2b-default-private rows; this one-time backfill assumes the
+    // entire pre-Stage-2c population is migration-artefact. On the current
+    // Mac-Mini production DB (Stage 2b was never live per Codex report)
+    // that is correct. Future deployments with real Stage 2b history must
+    // restore from backup before the first Stage 2c+2d boot.
     try {
-      const stale = conn
-        .prepare(
-          "SELECT COUNT(*) AS n FROM input_log WHERE privacy IS NULL OR privacy = '' OR privacy = 'private'",
+      conn.exec(`
+        CREATE TABLE IF NOT EXISTS input_log_migrations (
+          name TEXT PRIMARY KEY,
+          applied_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
-        .get() as { n: number };
-      if (stale.n > 0) {
-        const result = conn
+      `);
+      const migrationName = 'stage_2c_privacy_default_backfill_2026-05-25';
+      const alreadyApplied = conn
+        .prepare(`SELECT 1 FROM input_log_migrations WHERE name = ?`)
+        .get(migrationName);
+      if (!alreadyApplied) {
+        const stale = conn
           .prepare(
-            "UPDATE input_log SET privacy = 'public' WHERE privacy IS NULL OR privacy = '' OR privacy = 'private'",
+            "SELECT COUNT(*) AS n FROM input_log WHERE privacy IS NULL OR privacy = '' OR privacy = 'private'",
           )
-          .run();
+          .get() as { n: number };
+        const tx = conn.transaction(() => {
+          const result = conn
+            .prepare(
+              "UPDATE input_log SET privacy = 'public' WHERE privacy IS NULL OR privacy = '' OR privacy = 'private'",
+            )
+            .run();
+          conn.prepare(`INSERT INTO input_log_migrations (name) VALUES (?)`).run(migrationName);
+          return result.changes;
+        });
+        const changes = tx();
         console.log(
-          `[InputLog] Stage 2c backfill: ${result.changes} historical row(s) → privacy='public'`,
+          `[InputLog] Stage 2d one-time backfill applied: ${changes} historical row(s) → privacy='public' (stale=${stale.n}, marker '${migrationName}' stored)`,
+        );
+      } else {
+        console.log(
+          '[InputLog] Stage 2d backfill already applied — skipping (legitimate /private rows preserved across restart)',
         );
       }
     } catch (backfillErr) {
       // Non-fatal: a failed backfill leaves historical rows invisible to
       // public-mode search but does not corrupt the DB. Log loudly.
-      console.error('[InputLog] Stage 2c backfill failed (non-fatal):', backfillErr);
+      console.error('[InputLog] Stage 2d backfill failed (non-fatal):', backfillErr);
     }
 
     // FTS5 virtual table (contentless, sync via triggers). Indexes raw_content
