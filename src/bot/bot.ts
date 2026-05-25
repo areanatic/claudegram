@@ -57,6 +57,7 @@ import {
   handleWiki,
   handlePrivate,
   handleHealth,
+  handleBrief,
 } from './handlers/command.handler.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
@@ -119,6 +120,7 @@ export async function createBot(): Promise<Bot> {
   const t = minimalCommands[lang];
   const commandList = config.BOT_MINIMAL_COMMANDS ? [
     { command: 'start', description: t.start },
+    { command: 'brief', description: '📝 Topic-Brief speichern (durchsuchbar)' },
     { command: 'clear', description: t.clear },
     { command: 'cancel', description: t.cancel },
     { command: 'tts', description: t.tts },
@@ -127,6 +129,7 @@ export async function createBot(): Promise<Bot> {
     { command: 'status', description: t.status },
   ] : [
     { command: 'start', description: '🚀 Show help and getting started' },
+    { command: 'brief', description: '📝 Save topic brief (searchable input_log)' },
     { command: 'project', description: '📁 Set working directory' },
     { command: 'nexus', description: '🧠 Open the NEXUS repo in bridge mode' },
     { command: 'status', description: '📊 Show current session status' },
@@ -271,6 +274,11 @@ export async function createBot(): Promise<Bot> {
   }
   bot.command('wiki', handleWiki);
   bot.command('private', handlePrivate);
+
+  // FIX 6+ Step 5 (2026-05-25): /brief — explicit topic briefing entry-point
+  // that bypasses the input-log middleware's "skip slash-commands" rule by
+  // calling recordInput() directly in the handler. See handleBrief docstring.
+  bot.command('brief', handleBrief);
 
   // Callback query handler for inline keyboards
   bot.on('callback_query:data', async (ctx) => {

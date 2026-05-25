@@ -112,6 +112,70 @@ function getDb(): Database.Database | null {
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_input_log_msg ON input_log(chat_id, message_id)',
     );
 
+    // FIX 6+ Step 2 (2026-05-25): privacy column + FTS5 retrieval layer.
+    // Codex Pre-Review (cross_review_codex-fix6-plus-build-prereview): without
+    // a privacy column an unscoped MCP search would leak private rows. Default
+    // 'private' is fail-CLOSED — caller must opt into public (or session-scope
+    // is automatically applied by searchInputLog).
+    if (!cols.includes('privacy')) {
+      console.log('[InputLog] migrating: adding column privacy (default private)');
+      conn.exec(`ALTER TABLE input_log ADD COLUMN privacy TEXT NOT NULL DEFAULT 'private'`);
+    }
+
+    // FTS5 virtual table (contentless, sync via triggers). Indexes raw_content
+    // for full-text search; session_key / chat_id / input_type / status are
+    // UNINDEXED columns so they round-trip through MATCH results without being
+    // tokenized.
+    conn.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS input_log_fts USING fts5(
+        raw_content,
+        session_key UNINDEXED,
+        chat_id UNINDEXED,
+        input_type UNINDEXED,
+        status UNINDEXED,
+        content='input_log',
+        content_rowid='id'
+      );
+    `);
+
+    // Sync triggers — keep FTS in lockstep with input_log. The UPDATE trigger
+    // fires only when raw_content or status changes (raw_content because
+    // voice transcripts are attached AFTER the initial INSERT; status because
+    // operators search "all dropped voice last 24h" patterns).
+    conn.exec(`
+      CREATE TRIGGER IF NOT EXISTS input_log_ai AFTER INSERT ON input_log BEGIN
+        INSERT INTO input_log_fts(rowid, raw_content, session_key, chat_id, input_type, status)
+        VALUES (new.id, new.raw_content, new.session_key, new.chat_id, new.input_type, new.status);
+      END;
+      CREATE TRIGGER IF NOT EXISTS input_log_ad AFTER DELETE ON input_log BEGIN
+        INSERT INTO input_log_fts(input_log_fts, rowid, raw_content, session_key, chat_id, input_type, status)
+        VALUES ('delete', old.id, old.raw_content, old.session_key, old.chat_id, old.input_type, old.status);
+      END;
+      CREATE TRIGGER IF NOT EXISTS input_log_au AFTER UPDATE ON input_log
+      WHEN old.raw_content IS NOT new.raw_content OR old.status IS NOT new.status
+      BEGIN
+        INSERT INTO input_log_fts(input_log_fts, rowid, raw_content, session_key, chat_id, input_type, status)
+        VALUES ('delete', old.id, old.raw_content, old.session_key, old.chat_id, old.input_type, old.status);
+        INSERT INTO input_log_fts(rowid, raw_content, session_key, chat_id, input_type, status)
+        VALUES (new.id, new.raw_content, new.session_key, new.chat_id, new.input_type, new.status);
+      END;
+    `);
+
+    // Backfill: index any pre-existing rows whose raw_content is non-null but
+    // who never went through the INSERT trigger (i.e. existed before this
+    // migration). One-time cost; subsequent INSERTs are handled by triggers.
+    const ftsCount = (conn.prepare('SELECT COUNT(*) AS n FROM input_log_fts').get() as { n: number }).n;
+    if (ftsCount === 0) {
+      const backfilled = conn.prepare(
+        `INSERT INTO input_log_fts(rowid, raw_content, session_key, chat_id, input_type, status)
+         SELECT id, raw_content, session_key, chat_id, input_type, status FROM input_log
+         WHERE raw_content IS NOT NULL`,
+      ).run();
+      if (backfilled.changes > 0) {
+        console.log(`[InputLog] FTS5 backfill: indexed ${backfilled.changes} pre-existing rows`);
+      }
+    }
+
     db = conn;
     return db;
   } catch (err) {
@@ -359,5 +423,165 @@ export function closeInputLog(): void {
       /* ignore */
     }
     db = null;
+  }
+}
+
+// ── FIX 6+ Step 2 (2026-05-25): retrieval layer ──────────────────────────────
+
+/** A row returned by searchInputLog / getLatestInputLog — UI-shaped. */
+export interface InputLogSearchResult {
+  id: number;
+  received_at: string;
+  session_key: string;
+  chat_id: number | null;
+  input_type: string;
+  status: string;
+  dropped_reason: string | null;
+  raw_content_snippet: string;
+}
+
+const SNIPPET_MAX_CHARS = 240; // allow-hardcoded: reason="UI snippet truncation, not a timeout"
+const DEFAULT_SEARCH_LIMIT = 10; // allow-hardcoded: reason="default MCP result limit, not a timeout"
+const SEARCH_LIMIT_CAP = 50; // allow-hardcoded: reason="hard upper bound on MCP result limit"
+
+function toSnippet(raw: string | null): string {
+  if (!raw) return '';
+  if (raw.length <= SNIPPET_MAX_CHARS) return raw;
+  return raw.slice(0, SNIPPET_MAX_CHARS) + '…';
+}
+
+/**
+ * Sanitize an FTS5 MATCH query — strip control chars and double-quote each
+ * token so user input cannot accidentally invoke FTS5 syntax (NEAR, AND, etc).
+ * Phrase-search first, fallback to ORed token-search if phrase yields nothing.
+ */
+function buildFtsQuery(raw: string): { phrase: string; tokens: string } {
+  const cleaned = raw.replace(/[" -]/g, ' ').trim();
+  const phrase = `"${cleaned}"`;
+  const tokens = cleaned
+    .split(/\s+/)
+    .filter((t) => t.length > 0)
+    .map((t) => `"${t}"`)
+    .join(' OR ');
+  return { phrase, tokens };
+}
+
+/**
+ * Search input_log via FTS5. Session-scoped when sessionKey is provided
+ * (privacy-safe default for the MCP tool). Without sessionKey only rows
+ * marked privacy='public' are returned (no row currently is — fail-CLOSED).
+ *
+ * Phrase-match first, falls back to OR-of-tokens when the phrase has 0 hits.
+ */
+export function searchInputLog(opts: {
+  query: string;
+  sessionKey?: string;
+  since?: string;
+  limit?: number;
+}): InputLogSearchResult[] {
+  const conn = getDb();
+  if (!conn) return [];
+  const limit = Math.min(SEARCH_LIMIT_CAP, Math.max(1, opts.limit ?? DEFAULT_SEARCH_LIMIT));
+  const since = opts.since ?? null;
+  const { phrase, tokens } = buildFtsQuery(opts.query);
+  if (!tokens) return [];
+
+  const scopeWhere = opts.sessionKey
+    ? `il.session_key = @sessionKey`
+    : `il.privacy = 'public'`;
+  const sinceWhere = since ? `AND il.received_at >= @since` : '';
+
+  const sql = `
+    SELECT il.id, il.received_at, il.session_key, il.chat_id,
+           il.input_type, il.status, il.dropped_reason, il.raw_content
+      FROM input_log_fts fts
+      JOIN input_log il ON il.id = fts.rowid
+     WHERE fts.raw_content MATCH @match
+       AND ${scopeWhere}
+       ${sinceWhere}
+     ORDER BY il.received_at DESC
+     LIMIT @limit
+  `;
+  try {
+    const params: Record<string, unknown> = { match: phrase, limit };
+    if (opts.sessionKey) params.sessionKey = opts.sessionKey;
+    if (since) params.since = since;
+
+    let rows = conn.prepare(sql).all(params) as Array<{
+      id: number;
+      received_at: string;
+      session_key: string;
+      chat_id: number | null;
+      input_type: string;
+      status: string;
+      dropped_reason: string | null;
+      raw_content: string | null;
+    }>;
+
+    // Phrase yielded nothing — retry with tokens-OR. Cheaper than running both
+    // unconditionally; phrase-match wins relevance for the common case.
+    if (rows.length === 0) {
+      params.match = tokens;
+      rows = conn.prepare(sql).all(params) as typeof rows;
+    }
+
+    return rows.map((r) => ({
+      id: r.id,
+      received_at: r.received_at,
+      session_key: r.session_key,
+      chat_id: r.chat_id,
+      input_type: r.input_type,
+      status: r.status,
+      dropped_reason: r.dropped_reason,
+      raw_content_snippet: toSnippet(r.raw_content),
+    }));
+  } catch (err) {
+    console.error('[InputLog] searchInputLog failed:', err);
+    return [];
+  }
+}
+
+/**
+ * Return the N most recent input_log rows for a session (independent of FTS).
+ * Used by the Context Availability Prompt-Block to render "last user input"
+ * freshness without a query string.
+ */
+export function getLatestInputLog(sessionKey: string, limit = 5): InputLogSearchResult[] {
+  const conn = getDb();
+  if (!conn) return [];
+  const cappedLimit = Math.min(SEARCH_LIMIT_CAP, Math.max(1, limit));
+  try {
+    const rows = conn
+      .prepare(
+        `SELECT id, received_at, session_key, chat_id, input_type, status,
+                dropped_reason, raw_content
+           FROM input_log
+          WHERE session_key = ?
+          ORDER BY received_at DESC
+          LIMIT ?`,
+      )
+      .all(sessionKey, cappedLimit) as Array<{
+      id: number;
+      received_at: string;
+      session_key: string;
+      chat_id: number | null;
+      input_type: string;
+      status: string;
+      dropped_reason: string | null;
+      raw_content: string | null;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      received_at: r.received_at,
+      session_key: r.session_key,
+      chat_id: r.chat_id,
+      input_type: r.input_type,
+      status: r.status,
+      dropped_reason: r.dropped_reason,
+      raw_content_snippet: toSnippet(r.raw_content),
+    }));
+  } catch (err) {
+    console.error('[InputLog] getLatestInputLog failed:', err);
+    return [];
   }
 }

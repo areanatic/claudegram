@@ -32,6 +32,7 @@ import { injectContext, saveMemory } from '../memory/nexus-memory.js';
 import { logConversationTurn } from '../memory/conversation-logger.js';
 import { isPrivate } from '../memory/privacy-state.js';
 import { buildRecentUploadsContext } from '../memory/recent-uploads.js';
+import { getLatestInputLog } from '../inbox/input-log.js';
 
 /**
  * Privacy Mode Phase 1 — neutralizing system-prompt suffix.
@@ -529,6 +530,78 @@ function logDangerousModeOperation(sessionKey: string, operation: string, detail
   console.log(`[DANGEROUS_MODE] ${timestamp} session:${sessionKey} ${operation}${detailStr}`);
 }
 
+// ── FIX 6+ Step 6 (2026-05-25): Context Availability Prompt-Block ──────────
+//
+// Codex Pre-Review §4: keep this as a PROMPT-BLOCK, not a subsystem. Renders
+// a small runtime-fact snapshot (~30 LOC of source) that gets appended to the
+// system prompt right before each agent turn. When the bot has thin context,
+// it MUST stop and ask instead of guessing — same pattern as the existing
+// Memory & Honesty rule, but with a maschinenlesbare runtime signal instead
+// of a static instruction.
+//
+// Why here and not as middleware: middleware runs before sendToAgent, but the
+// only consumer of the snapshot IS the agent prompt. Inlining keeps the data
+// fresh (every turn) and avoids carrying state across the handler chain.
+
+const NEXUS_DAILY_DIR = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/daily';
+const NEXUS_OMI_AUDIT_DIR = '/Volumes/AstronOne/shared-memory/omi/raw/_audit';
+const CONTEXT_INPUT_AGE_RECENT_MIN = 30; // allow-hardcoded: reason="UI threshold for 'recent input', not a timeout"
+
+function buildContextAvailabilityPrompt(sessionKey: string): string {
+  const lines: string[] = ['', '## Context Availability (this turn, runtime-checked):'];
+
+  // 1. Today's daily log
+  const today = new Date().toISOString().slice(0, 10);
+  const dailyPath = `${NEXUS_DAILY_DIR}/${today}.md`;
+  try {
+    lines.push(`- Daily ${today}: ${fs.existsSync(dailyPath) ? 'present' : 'MISSING'}`);
+  } catch {
+    lines.push(`- Daily ${today}: check failed`);
+  }
+
+  // 2. input_log freshness for THIS session
+  try {
+    const recent = getLatestInputLog(sessionKey, 5);
+    if (recent.length === 0) {
+      lines.push('- input_log: EMPTY for this session — likely NEW SESSION. Ask for a 1-sentence briefing before guessing the topic.');
+    } else {
+      const newest = recent[0];
+      const ageMin = Math.max(0, Math.round((Date.now() - new Date(newest.received_at).getTime()) / 60000));
+      const ageStr = ageMin < CONTEXT_INPUT_AGE_RECENT_MIN ? `${ageMin}min ago` : `${ageMin}min ago (stale)`;
+      lines.push(`- Last user input: ${ageStr} (${newest.input_type}, status=${newest.status})`);
+      const dropped = recent.filter((r) => r.status === 'dropped');
+      if (dropped.length > 0) {
+        const reasons = Array.from(new Set(dropped.map((r) => r.dropped_reason ?? 'unknown'))).join(', ');
+        lines.push(`- WARNING: ${dropped.length}/5 recent inputs were DROPPED (reasons: ${reasons}). Use nexusgram_input_log_search to recover them before answering "I have no record of that".`);
+      }
+    }
+  } catch {
+    lines.push('- input_log: read error');
+  }
+
+  // 3. OMI latest pull (best-effort: filename pattern pull-log-YYYY-MM-DD_*.jsonl)
+  try {
+    if (fs.existsSync(NEXUS_OMI_AUDIT_DIR)) {
+      const files = fs.readdirSync(NEXUS_OMI_AUDIT_DIR)
+        .filter((f) => f.startsWith('pull-log-') && f.endsWith('.jsonl'))
+        .sort();
+      const latest = files[files.length - 1];
+      if (latest) {
+        const m = latest.match(/pull-log-(\d{4}-\d{2}-\d{2})_/);
+        if (m) lines.push(`- OMI: latest pull-log ${m[1]}`);
+      }
+    }
+  } catch {
+    /* skip — OMI availability is informational */
+  }
+
+  lines.push('');
+  lines.push('Honesty contract: if the snapshot above is empty/stale for the topic at hand, STOP and ask the user for a 1-sentence briefing instead of guessing. Use nexusgram_input_log_search / nexusgram_read_daily / nexusgram_read_l1 to look BEFORE asking.');
+  lines.push('');
+
+  return lines.join('\n');
+}
+
 export async function sendToAgent(
   sessionKey: string,
   message: string,
@@ -851,6 +924,10 @@ export async function sendToAgent(
     const todayContext = existingSessionId ? '' : loadTodayTranscript(sessionKey);
     // Recent image uploads — survives compaction so the bot can recover paths.
     const recentUploadsContext = buildRecentUploadsContext(cwd);
+    // FIX 6+ Step 6 (2026-05-25): runtime snapshot of what the bot actually
+    // sees this turn (daily, input_log freshness, OMI latest). Honesty-Gate
+    // against the 2026-05-25 Apple-Watch failure pattern (raten statt fragen).
+    const contextAvailabilityContext = buildContextAvailabilityPrompt(sessionKey);
 
     const queryOptions: Parameters<typeof query>[0]['options'] = {
       cwd,
@@ -861,7 +938,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${todayContext}${previousDayContext}${recentUploadsContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
+        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${todayContext}${previousDayContext}${recentUploadsContext}${contextAvailabilityContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
       },
       settingSources: ['project', 'user'] as SettingSource[],
       model: effectiveModel,

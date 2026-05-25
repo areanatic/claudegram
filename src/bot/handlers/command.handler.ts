@@ -1108,6 +1108,103 @@ export async function handlePing(ctx: Context): Promise<void> {
   await replyMd(ctx, `🏓 Pong\\!\n\nUptime: ${esc(uptime)}`);
 }
 
+/**
+ * FIX 6+ Step 5 (2026-05-25): /brief — explicit topic briefing entry-point.
+ *
+ * Problem this solves (Codex Pre-Review §5 + 2026-05-25 daily):
+ *   - The input-log middleware SKIPS slash-commands (control vs durable input).
+ *   - Voice notes can be dropped (voice_hard_timeout) before they reach the
+ *     agent — the user thinks they briefed the bot, the bot saw nothing.
+ *   - In a fresh session the agent has no honest signal whether context is
+ *     thin or rich; it just guesses based on the message text.
+ *
+ * /brief <text> bypasses both gotchas:
+ *   1. Calls recordInput() EXPLICITLY so the briefing lands in input_log
+ *      and the FTS index immediately, prefixed [BRIEF] for quick filtering.
+ *   2. Replies with a Context-Availability snapshot so the user (and any
+ *      next agent turn) sees exactly what is and is not visible right now.
+ *   3. Does NOT trigger an agent turn — the user follows up with a normal
+ *      message and the agent picks up the briefing via input_log_search.
+ */
+export async function handleBrief(ctx: Context): Promise<void> {
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (!keyInfo) return;
+  const { sessionKey } = keyInfo;
+  const chatId = ctx.chat?.id;
+  const messageId = ctx.message?.message_id;
+
+  // grammY puts the arg-text after `/brief ` into ctx.match for command handlers.
+  const rawArg = typeof ctx.match === 'string' ? ctx.match : '';
+  const text = rawArg.trim();
+  if (!text) {
+    await ctx.reply(
+      'Nutze: `/brief <Topic + Stand>` — z.B.\n' +
+        '`/brief Apple Watch 4 Setup für Alina, kann nicht anrufen, ChatGPT-Verlauf von 17h gestern auf MacBook`\n\n' +
+        'Der Brief landet sofort durchsuchbar im input_log und der Bot kann ihn als Kontext für die nächste Frage ziehen.',
+      { parse_mode: 'Markdown' },
+    );
+    return;
+  }
+
+  // Explicit recordInput — the middleware skipped this command, so we own the
+  // durability invariant for this row. Prefix [BRIEF] so input_log_search
+  // hits sort it to the top for any related question.
+  const briefedText = `[BRIEF] ${text}`;
+  let rowId: number | null = null;
+  try {
+    const { recordInput, markDone } = await import('../../inbox/input-log.js');
+    rowId = recordInput({
+      messageId,
+      chatId: chatId ?? 0,
+      sessionKey,
+      inputType: 'text',
+      rawContent: briefedText,
+      fileId: null,
+    });
+    if (rowId != null) markDone(rowId);
+  } catch (err) {
+    console.error('[Brief] recordInput failed:', err);
+  }
+
+  // Context-Availability snapshot — same signal the agent gets in its prompt
+  // (Step 6), surfaced to the user so they can decide whether to add more.
+  let recentCount = 0;
+  let droppedCount = 0;
+  try {
+    const { getLatestInputLog } = await import('../../inbox/input-log.js');
+    const recent = getLatestInputLog(sessionKey, 10);
+    recentCount = recent.length;
+    droppedCount = recent.filter((r) => r.status === 'dropped').length;
+  } catch (err) {
+    console.error('[Brief] getLatestInputLog failed:', err);
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const dailyPath = `/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/daily/${today}.md`;
+  const dailyPresent = fs.existsSync(dailyPath);
+
+  const lines: string[] = [
+    `✅ Brief gespeichert${rowId != null ? ` (input_log id=${rowId})` : ''}`,
+    '',
+    '*Was ich sehe:*',
+    `- input_log letzte 10 Inputs: ${recentCount}${droppedCount > 0 ? ` (davon ${droppedCount} dropped — über input_log_search abrufbar)` : ''}`,
+    `- Daily ${today}: ${dailyPresent ? 'vorhanden' : 'noch nicht angelegt'}`,
+    '',
+    '*Was ich NICHT sehe:*',
+    '- ChatGPT-Sessions auf MacBook (keine Capture-Pipeline)',
+    '- Andere Apps ausserhalb NEXUS (Notes, Mail, Browser, etc.)',
+    '',
+    'Stelle deine Frage jetzt — ich nehme den Brief als Kontext.',
+  ];
+
+  try {
+    await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+  } catch {
+    // Markdown parse can fail on stray chars — fall back to plain text.
+    await ctx.reply(lines.join('\n'));
+  }
+}
+
 export async function handleContext(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
   if (!keyInfo) return;

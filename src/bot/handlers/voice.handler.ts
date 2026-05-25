@@ -143,6 +143,14 @@ export async function handleVoice(ctx: Context): Promise<void> {
 
     console.log(`[Voice] Transcript received (${transcript.length} chars, lang=${detectedLanguage})`);
 
+    // FIX 6+ Step 1 (2026-05-25): RESCUE-FIRST. Attach transcript to the
+    // durable Input-Log row BEFORE any confidence-gate / agent-turn so that
+    // even a low-confidence reject, a hard-cap timeout, or a /cancel still
+    // leaves the raw transcript searchable via nexusgram_input_log_search.
+    // Pre-fix, attachContent ran AFTER the confidence-gate — a dropped voice
+    // (e.g. 2026-05-24 21:39 ChatGPT briefing) lost its content forever.
+    attachContent(inputLogRowId, transcript);
+
     // A2 confidence gate: a hallucinated transcript (low Whisper confidence, or
     // a language the user does not speak — e.g. German audio mis-read as
     // Korean) must NOT reach the agent. Ask for a resend instead.
@@ -158,7 +166,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
       const hint = !languageOk
         ? `Ich hab dich als "${detectedLanguage}" verstanden — das passt nicht. `
         : 'Das Audio war zu leise, zu kurz oder unklar. ';
-      const askResend = `🎤 ${hint}Schick die Sprachnachricht bitte nochmal — oder tipp sie kurz.`;
+      const askResend = `🎤 ${hint}Schick die Sprachnachricht bitte nochmal — oder tipp sie kurz.\n📝 Falls verwertbar: dein Transkript ist gespeichert (input_log).`;
       try {
         await ctx.api.editMessageText(chatId, ackMsg.message_id, askResend, { parse_mode: undefined });
       } catch {
@@ -166,10 +174,6 @@ export async function handleVoice(ctx: Context): Promise<void> {
       }
       return;
     }
-
-    // Attach the transcript to the durable Input-Log row — the original
-    // INSERT only had the file_id (transcription happens after receive).
-    attachContent(inputLogRowId, transcript);
 
     // Activate voice-first mode (if enabled in config) and store detected language
     if (config.VOICE_FIRST_MODE_ENABLED) {
@@ -344,7 +348,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
     const isHardTimeout = error instanceof HardTimeoutError;
     let errorMessage: string;
     if (isHardTimeout) {
-      errorMessage = '⏱️ Das hat zu lange gedauert und wurde abgebrochen. Schick die Nachricht bitte nochmal — gern etwas kürzer.';
+      // FIX 6+ Step 1 (2026-05-25): explicit Transcript-Rescue acknowledgement.
+      // Pre-fix reply hid the fact that the transcript is in input_log and
+      // can be recovered via nexusgram_input_log_search — user thought the
+      // briefing was lost (2026-05-24 21:39 ChatGPT-briefing voice_hard_timeout).
+      errorMessage = '⏱️ Das hat zu lange gedauert und wurde abgebrochen.\n📝 Dein Transkript ist gespeichert (input_log) und ich kann später drauf zugreifen.\nWenn du eine Antwort brauchst, schick die Frage nochmal — gern etwas kürzer.';
       markDropped(inputLogRowId, 'voice_hard_timeout');
     } else {
       errorMessage = sanitizeError(error);

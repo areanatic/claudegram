@@ -15,6 +15,7 @@ import { config } from '../config.js';
 import { sessionManager } from './session-manager.js';
 import { getWorkspaceRoot, isPathWithinRoot } from '../utils/workspace-guard.js';
 import { searchMemoryReadOnly } from '../memory/nexus-memory.js';
+import { searchInputLog } from '../inbox/input-log.js';
 
 // Lazy imports to avoid circular deps and unnecessary module loading
 async function importInbox() {
@@ -92,6 +93,13 @@ function buildToolList(toolsCtx: McpToolsContext) {
 
   tools.push(sendFileTool(toolsCtx));
   tools.push(nexusMemorySearchTool(toolsCtx));
+
+  // FIX 6+ Step 3 + Step 4 (2026-05-25): retrieval tools that the
+  // Codex Pre-Review demanded be kept SEPARATE from nexusgram_memory_search
+  // (different privacy model, different ranking, allowlisted reads only).
+  tools.push(nexusgramInputLogSearchTool(toolsCtx));
+  tools.push(nexusgramReadDailyTool());
+  tools.push(nexusgramReadL1Tool());
 
   return tools;
 }
@@ -513,6 +521,194 @@ function sendFileTool(toolsCtx: McpToolsContext) {
  *  - Phrase-search first, falls back to token-search when 0 hits
  *  - Output stripped to {content, tags, project, score} — no file_path/source/privacy
  */
+// ── FIX 6+ Step 3 (2026-05-25): Telegram input-log retrieval ────────────────
+//
+// SEPARATE tool from nexusgram_memory_search (Codex Pre-Review §2):
+//   - memory_search returns L2 long-term memories (FTS5 over `memories` table,
+//     public-only, no source path, neutral wording).
+//   - input_log_search returns RAW Telegram inputs (text + voice transcripts +
+//     photo captions), INCLUDING dropped / failed turns. Session-scoped by
+//     default (privacy-safe). The killer-use-case: "ich hab dir gestern was
+//     gesagt, aber du hast nicht geantwortet" — was the briefing received or
+//     not, and what did it say?
+
+function nexusgramInputLogSearchTool(toolsCtx: McpToolsContext) {
+  return tool(
+    'nexusgram_input_log_search',
+    'Search past Telegram inputs (text, voice transcripts, photo captions) ' +
+      'INCLUDING dropped or failed inputs. Use when the user refers to ' +
+      'something they sent earlier ("hab ich dir gesagt", "letzte ' +
+      'Sprachnachricht", "vorher hab ich…"). Returns matching input-log rows ' +
+      'with snippet, status (received/processing/done/dropped/error), ' +
+      'drop reason, timestamp. Scope: this Telegram session only.',
+    {
+      query: z.string().min(1).describe('FTS5 search query, e.g. "ChatGPT briefing" or "Apple Watch"'),
+      since: z.string().optional().describe('ISO date floor (e.g. "2026-05-20T00:00:00Z"). Omit for all-time.'),
+      limit: z.number().int().min(1).max(50).optional().describe('Max results (1-50, default 10).'),
+    },
+    async ({ query, since, limit }) => {
+      try {
+        const sessionKey = toolsCtx.sessionKey;
+        const rows = searchInputLog({ query, sessionKey, since, limit });
+        if (rows.length === 0) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `No input-log rows matched "${query}"${since ? ` since ${since}` : ''} for this session.`,
+            }],
+          };
+        }
+        const lines = rows.map((r, i) => {
+          const statusTag = r.status === 'dropped'
+            ? `dropped:${r.dropped_reason ?? 'unknown'}`
+            : r.status;
+          return `[${i + 1}] ${r.received_at} · ${r.input_type} · ${statusTag}\n    ${r.raw_content_snippet || '(no content)'}`;
+        });
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Found ${rows.length} input-log row${rows.length === 1 ? '' : 's'} for "${query}":\n\n${lines.join('\n\n')}`,
+          }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Input-log search error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+}
+
+// ── FIX 6+ Step 4 (2026-05-25): allowlisted L1 reads ─────────────────────────
+//
+// Codex Pre-Review §2: no arbitrary read_file(path). The bot gets two narrow,
+// allowlisted entry points so it can answer "what does soul.md say about X"
+// or "what was in the daily log on 2026-05-22" WITHOUT a full filesystem tool.
+
+const DAILY_LOG_DIR = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/daily';
+const DAILY_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_L1_CHARS = 8000; // allow-hardcoded: reason="Telegram-bubble safety cap for L1 reads, not a timeout"
+
+function truncateForReply(content: string): string {
+  if (content.length <= MAX_L1_CHARS) return content;
+  return content.slice(0, MAX_L1_CHARS) + '\n\n…[truncated — file longer than allowed]';
+}
+
+function nexusgramReadDailyTool() {
+  return tool(
+    'nexusgram_read_daily',
+    'Read a NEXUS daily log by date (YYYY-MM-DD). Use when the user asks ' +
+      'about a specific day ("wann haben wir X gemacht", "was war am ' +
+      'Sonntag", "schau in den Daily von gestern"). Returns the markdown ' +
+      'content, optionally a single ## section. Truncated at 8000 chars.',
+    {
+      date: z.string().describe('Date in YYYY-MM-DD format (e.g. "2026-05-25").'),
+      section: z.string().optional().describe('Optional ## or ### section header to extract (e.g. "Apple Watch 4 Setup").'),
+    },
+    async ({ date, section }) => {
+      try {
+        if (!DAILY_DATE_REGEX.test(date)) {
+          return {
+            content: [{ type: 'text' as const, text: `Invalid date "${date}" — expected YYYY-MM-DD.` }],
+            isError: true,
+          };
+        }
+        const filename = `${date}.md`;
+        const filepath = path.join(DAILY_LOG_DIR, filename);
+        // Defense-in-depth: ensure resolved path stays inside DAILY_LOG_DIR.
+        const resolved = path.resolve(filepath);
+        if (!resolved.startsWith(path.resolve(DAILY_LOG_DIR) + path.sep)) {
+          return {
+            content: [{ type: 'text' as const, text: `Path traversal blocked for "${date}".` }],
+            isError: true,
+          };
+        }
+        if (!fs.existsSync(resolved)) {
+          return {
+            content: [{ type: 'text' as const, text: `No daily log found for ${date}.` }],
+          };
+        }
+        let content = fs.readFileSync(resolved, 'utf-8');
+        if (section) {
+          // Match a section header (## or ###) whose text contains `section`
+          // (case-insensitive, whitespace-tolerant). Capture up to the next
+          // sibling/higher header.
+          const escSection = section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+          const sectionRegex = new RegExp(
+            `^(##+\\s+[^\\n]*${escSection}[^\\n]*\\n[\\s\\S]*?)(?=^##\\s|\\Z)`,
+            'im',
+          );
+          const match = content.match(sectionRegex);
+          if (match) content = match[1];
+          else content = `Section "${section}" not found in daily ${date}.\n\n--- Full file ---\n\n${content}`;
+        }
+        return {
+          content: [{ type: 'text' as const, text: truncateForReply(content) }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `read_daily error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+}
+
+// Layer-1 reference files. Allowlist only — Codex Pre-Review explicitly
+// forbade arbitrary read_file(path). Each entry must point to a stable,
+// agent-readable truth file. Missing files surface as "L1 file not available".
+const L1_ALLOWLIST: Record<string, string> = {
+  'soul.md': '/Volumes/AstronOne/NEXUS_miniM_13-03-26/soul.md',
+  'memory.md': '/Volumes/AstronOne/shared-memory/nexus/MEMORY.md',
+  'bot-glossary': '/Volumes/AstronOne/shared-memory/nexus/wiki/00-bot-glossary-truth.md',
+  'arash-profile': '/Volumes/AstronOne/shared-memory/nexus/wiki/arash-profile-truth.md',
+  'projects': '/Volumes/AstronOne/shared-memory/nexus/wiki/projects-truth.md',
+  'decisions': '/Volumes/AstronOne/shared-memory/nexus/wiki/decisions-truth.md',
+  'nexus-system': '/Volumes/AstronOne/shared-memory/nexus/wiki/nexus-system-truth.md',
+};
+
+function nexusgramReadL1Tool() {
+  const allowedNames = Object.keys(L1_ALLOWLIST) as [string, ...string[]];
+  return tool(
+    'nexusgram_read_l1',
+    'Read a NEXUS Layer-1 reference file (truth files: soul.md, MEMORY.md, ' +
+      'bot-glossary, arash-profile, projects, decisions, nexus-system). ' +
+      'Use when the user asks about identity ("wer bin ich", "was steht in ' +
+      'soul.md"), bot inventory, or canonical project / decision state. ' +
+      'Allowlisted — no arbitrary filesystem reads. Truncated at 8000 chars.',
+    {
+      name: z.enum(allowedNames).describe('Allowlisted L1 file alias.'),
+    },
+    async ({ name }) => {
+      try {
+        const filepath = L1_ALLOWLIST[name];
+        if (!filepath) {
+          return {
+            content: [{ type: 'text' as const, text: `L1 alias "${name}" not in allowlist.` }],
+            isError: true,
+          };
+        }
+        if (!fs.existsSync(filepath)) {
+          return {
+            content: [{ type: 'text' as const, text: `L1 file "${name}" not available on disk (${filepath}).` }],
+          };
+        }
+        const content = fs.readFileSync(filepath, 'utf-8');
+        return {
+          content: [{ type: 'text' as const, text: truncateForReply(content) }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `read_l1 error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+}
+
 function nexusMemorySearchTool(_toolsCtx: McpToolsContext) {
   return tool(
     'nexusgram_memory_search',
