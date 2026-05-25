@@ -175,6 +175,18 @@ interface AgentOptions {
    * default to "still owner".
    */
   turnEpoch?: number;
+  /**
+   * FIX 6+ Stage 2b (Codex Pattern-B F-03): id of the durable input_log row
+   * for THIS user turn. The input-log middleware writes the row before
+   * sequentialize, so by the time we reach `sendToAgent` it already exists.
+   * Used by `buildContextAvailabilityPrompt` to EXCLUDE the current message
+   * from the "prior context" snapshot — otherwise the snapshot always sees
+   * at least one row and the "EMPTY → ask for briefing" branch can never
+   * fire. Optional: callers that don't have a row id (test paths,
+   * follow-up-button dispatches) pass undefined and the snapshot falls back
+   * to the old behaviour.
+   */
+  currentInputLogRowId?: number | null;
 }
 
 interface LoopOptions extends AgentOptions {
@@ -547,7 +559,10 @@ const NEXUS_DAILY_DIR = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/d
 const NEXUS_OMI_AUDIT_DIR = '/Volumes/AstronOne/shared-memory/omi/raw/_audit';
 const CONTEXT_INPUT_AGE_RECENT_MIN = 30; // allow-hardcoded: reason="UI threshold for 'recent input', not a timeout"
 
-function buildContextAvailabilityPrompt(sessionKey: string): string {
+function buildContextAvailabilityPrompt(
+  sessionKey: string,
+  currentInputLogRowId?: number | null,
+): string {
   const lines: string[] = ['', '## Context Availability (this turn, runtime-checked):'];
 
   // 1. Today's daily log
@@ -559,20 +574,30 @@ function buildContextAvailabilityPrompt(sessionKey: string): string {
     lines.push(`- Daily ${today}: check failed`);
   }
 
-  // 2. input_log freshness for THIS session
+  // 2. input_log freshness for THIS session — EXCLUDING the current turn.
+  //
+  // FIX 6+ Stage 2b (Codex Pattern-B F-03): the input-log middleware writes
+  // the user's just-arrived message into `input_log` *before* sequentialize
+  // and sendToAgent run. Without exclusion the snapshot always sees the
+  // current message as "prior context", with age=0min, so the
+  // "EMPTY → ask for briefing" branch never fires for a genuinely new
+  // session. By passing the current row id through AgentOptions and skipping
+  // it here we get the correct "prior turns only" view.
   try {
-    const recent = getLatestInputLog(sessionKey, 5);
+    const recent = getLatestInputLog(sessionKey, 5, {
+      excludeRowId: currentInputLogRowId ?? null,
+    });
     if (recent.length === 0) {
-      lines.push('- input_log: EMPTY for this session — likely NEW SESSION. Ask for a 1-sentence briefing before guessing the topic.');
+      lines.push('- input_log: EMPTY for this session (excluding current message) — likely NEW SESSION. Ask for a 1-sentence briefing before guessing the topic.');
     } else {
       const newest = recent[0];
       const ageMin = Math.max(0, Math.round((Date.now() - new Date(newest.received_at).getTime()) / 60000));
       const ageStr = ageMin < CONTEXT_INPUT_AGE_RECENT_MIN ? `${ageMin}min ago` : `${ageMin}min ago (stale)`;
-      lines.push(`- Last user input: ${ageStr} (${newest.input_type}, status=${newest.status})`);
+      lines.push(`- Last prior user input: ${ageStr} (${newest.input_type}, status=${newest.status})`);
       const dropped = recent.filter((r) => r.status === 'dropped');
       if (dropped.length > 0) {
         const reasons = Array.from(new Set(dropped.map((r) => r.dropped_reason ?? 'unknown'))).join(', ');
-        lines.push(`- WARNING: ${dropped.length}/5 recent inputs were DROPPED (reasons: ${reasons}). Use nexusgram_input_log_search to recover them before answering "I have no record of that".`);
+        lines.push(`- WARNING: ${dropped.length}/5 recent prior inputs were DROPPED (reasons: ${reasons}). Use nexusgram_input_log_search to recover them before answering "I have no record of that".`);
       }
     }
   } catch {
@@ -927,7 +952,15 @@ export async function sendToAgent(
     // FIX 6+ Step 6 (2026-05-25): runtime snapshot of what the bot actually
     // sees this turn (daily, input_log freshness, OMI latest). Honesty-Gate
     // against the 2026-05-25 Apple-Watch failure pattern (raten statt fragen).
-    const contextAvailabilityContext = buildContextAvailabilityPrompt(sessionKey);
+    //
+    // Stage 2b F-03: pass the current input_log row id so the snapshot can
+    // exclude THIS turn's prompt from the "prior context" view — otherwise
+    // a genuinely new session never sees `EMPTY` and the briefing-clarify
+    // branch can't trigger. Optional; undefined falls back to old behaviour.
+    const contextAvailabilityContext = buildContextAvailabilityPrompt(
+      sessionKey,
+      options.currentInputLogRowId ?? null,
+    );
 
     const queryOptions: Parameters<typeof query>[0]['options'] = {
       cwd,

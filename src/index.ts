@@ -5,7 +5,7 @@ import { config } from './config.js';
 import { preventSleep, allowSleep } from './utils/caffeinate.js';
 import { stopCleanup } from './telegram/deduplication.js';
 import { closeMemoryDb } from './memory/nexus-memory.js';
-import { closeInputLog, recoverOrphanedInputs } from './inbox/input-log.js';
+import { closeInputLog, ensureInputLogInitialized, recoverOrphanedInputs } from './inbox/input-log.js';
 import { acquireLock, releaseLock } from './utils/pid-lock.js';
 import { cancelAllRequests, getActiveSessionKeys } from './claude/request-queue.js';
 import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
@@ -35,6 +35,14 @@ async function main() {
   await bot.init();
   console.log(`✅ Bot started as @${bot.botInfo.username}`);
   console.log('📱 Send /start in Telegram to begin');
+
+  // FIX 6+ Stage 2b (Codex Pattern-B F-04): force eager input-log init at
+  // boot, BEFORE any user-input pathway can demand it. Without this the lazy
+  // `getDb()` would fire during the first agent prompt-build (via
+  // `buildContextAvailabilityPrompt → getLatestInputLog`), running the
+  // migration + FTS rebuild while a parallel session held a connection.
+  // Deterministic boot-time init removes that lock-risk surface.
+  ensureInputLogInitialized();
 
   // Akt 1c boot-recovery: any input_log row still 'received'/'processing' is
   // orphaned from a previous process — mark it dropped BEFORE polling starts,

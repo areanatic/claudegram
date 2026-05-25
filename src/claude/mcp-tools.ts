@@ -634,9 +634,17 @@ function nexusgramReadDailyTool() {
           // Match a section header (## or ###) whose text contains `section`
           // (case-insensitive, whitespace-tolerant). Capture up to the next
           // sibling/higher header.
+          //
+          // FIX 6+ Stage 2b (Codex Pattern-B F-06): the original `\Z`
+          // end-of-string anchor is Perl/Python syntax — JavaScript regex does
+          // NOT treat `\Z` as EOF, it matches the literal letter Z. The last
+          // section in a file therefore failed to match. Replaced with
+          // `$(?![\s\S])` — `$` with a negative lookahead asserting "no
+          // character follows", which is the JS-native way to spell true EOF
+          // (independent of the `m` flag's per-line `$` semantics).
           const escSection = section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
           const sectionRegex = new RegExp(
-            `^(##+\\s+[^\\n]*${escSection}[^\\n]*\\n[\\s\\S]*?)(?=^##\\s|\\Z)`,
+            `^(##+\\s+[^\\n]*${escSection}[^\\n]*\\n[\\s\\S]*?)(?=^##\\s|$(?![\\s\\S]))`,
             'im',
           );
           const match = content.match(sectionRegex);
@@ -662,6 +670,12 @@ function nexusgramReadDailyTool() {
 const L1_ALLOWLIST: Record<string, string> = {
   'soul.md': '/Volumes/AstronOne/NEXUS_miniM_13-03-26/soul.md',
   'memory.md': '/Volumes/AstronOne/shared-memory/nexus/MEMORY.md',
+  // FIX 6+ Stage 2b (Codex Pattern-B F-05): added CLAUDE.md + AGENTS.md as
+  // explicit canonical Layer-1 truth files. Both exist at project root and
+  // contain agent-routing rules / file-placement contracts the bot should be
+  // able to quote verbatim when asked "was steht in CLAUDE.md zu X".
+  'claude.md': '/Volumes/AstronOne/NEXUS_miniM_13-03-26/CLAUDE.md',
+  'agents.md': '/Volumes/AstronOne/NEXUS_miniM_13-03-26/AGENTS.md',
   'bot-glossary': '/Volumes/AstronOne/shared-memory/nexus/wiki/00-bot-glossary-truth.md',
   'arash-profile': '/Volumes/AstronOne/shared-memory/nexus/wiki/arash-profile-truth.md',
   'projects': '/Volumes/AstronOne/shared-memory/nexus/wiki/projects-truth.md',
@@ -673,11 +687,12 @@ function nexusgramReadL1Tool() {
   const allowedNames = Object.keys(L1_ALLOWLIST) as [string, ...string[]];
   return tool(
     'nexusgram_read_l1',
-    'Read a NEXUS Layer-1 reference file (truth files: soul.md, MEMORY.md, ' +
-      'bot-glossary, arash-profile, projects, decisions, nexus-system). ' +
-      'Use when the user asks about identity ("wer bin ich", "was steht in ' +
-      'soul.md"), bot inventory, or canonical project / decision state. ' +
-      'Allowlisted — no arbitrary filesystem reads. Truncated at 8000 chars.',
+    'Read a NEXUS Layer-1 reference file (truth files: soul.md, memory.md, ' +
+      'claude.md, agents.md, bot-glossary, arash-profile, projects, decisions, ' +
+      'nexus-system). Use when the user asks about identity ("wer bin ich", ' +
+      '"was steht in soul.md"), agent routing rules ("was sagt CLAUDE.md zu X"), ' +
+      'bot inventory, or canonical project / decision state. Allowlisted — no ' +
+      'arbitrary filesystem reads. Truncated at 8000 chars.',
     {
       name: z.enum(allowedNames).describe('Allowlisted L1 file alias.'),
     },

@@ -161,19 +161,37 @@ function getDb(): Database.Database | null {
       END;
     `);
 
-    // Backfill: index any pre-existing rows whose raw_content is non-null but
-    // who never went through the INSERT trigger (i.e. existed before this
-    // migration). One-time cost; subsequent INSERTs are handled by triggers.
-    const ftsCount = (conn.prepare('SELECT COUNT(*) AS n FROM input_log_fts').get() as { n: number }).n;
-    if (ftsCount === 0) {
-      const backfilled = conn.prepare(
-        `INSERT INTO input_log_fts(rowid, raw_content, session_key, chat_id, input_type, status)
-         SELECT id, raw_content, session_key, chat_id, input_type, status FROM input_log
-         WHERE raw_content IS NOT NULL`,
-      ).run();
-      if (backfilled.changes > 0) {
-        console.log(`[InputLog] FTS5 backfill: indexed ${backfilled.changes} pre-existing rows`);
-      }
+    // FIX 6+ Stage 2b (Codex Pattern-B F-01): the previous "is the FTS index
+    // empty?" gate used `SELECT COUNT(*) FROM input_log_fts`. For an FTS5
+    // external-content table that COUNT returns the size of the *content*
+    // table (here: input_log), NOT the size of the inverted MATCH index. On a
+    // production DB with 109 pre-existing rows the gate would therefore see
+    // `count=109` and SKIP the backfill — every old row would remain
+    // unsearchable via MATCH. Codex reproduced this against the live DB and
+    // demonstrated `match_before_rebuild=0`.
+    //
+    // The SQLite-native fix for external-content FTS5 is the documented
+    // `'rebuild'` command — it deletes and re-derives the inverted index from
+    // the current content table. It is idempotent: safe to call on an empty
+    // or already-populated index. At 109 rows this is trivial; if the table
+    // grows past ~100k rows in the future this rebuild should be moved behind
+    // a one-shot migration flag stored in `sqlite_user_version` / a marker
+    // row, but for the current ~hundreds-of-rows scale the always-on rebuild
+    // is the simplest correct option and runs once per process boot.
+    //
+    // Pair the rebuild with `synchronous=NORMAL` (default since WAL anyway,
+    // but stated explicitly for documentation) so the bulk rebuild does not
+    // pay an `fsync()` per page on machines where pragma defaults drifted.
+    conn.pragma('synchronous = NORMAL');
+    try {
+      conn.exec(`INSERT INTO input_log_fts(input_log_fts) VALUES('rebuild')`);
+      console.log('[InputLog] FTS5 rebuild: inverted index regenerated from input_log content');
+    } catch (rebuildErr) {
+      // Rebuild failure must not poison the whole DB-init. Log loudly so the
+      // operator notices, but keep the connection usable — searches will
+      // simply return 0 hits, which fails CLOSED (no privacy leak via stale
+      // index).
+      console.error('[InputLog] FTS5 rebuild failed (search disabled this boot):', rebuildErr);
     }
 
     db = conn;
@@ -467,9 +485,24 @@ function buildFtsQuery(raw: string): { phrase: string; tokens: string } {
 }
 
 /**
- * Search input_log via FTS5. Session-scoped when sessionKey is provided
- * (privacy-safe default for the MCP tool). Without sessionKey only rows
- * marked privacy='public' are returned (no row currently is — fail-CLOSED).
+ * Search input_log via FTS5.
+ *
+ * Privacy contract (FIX 6+ Stage 2b — Codex Pattern-B F-02):
+ *  - The previous implementation treated `sessionKey` and `privacy` as an
+ *    XOR scope: providing `sessionKey` REPLACED the privacy filter entirely,
+ *    so a public-mode MCP search inside an otherwise-private session would
+ *    surface that session's `privacy='private'` rows. Codex' privacy-killer
+ *    test relied on this and failed-OPEN.
+ *  - New contract:
+ *      (a) `privacy='public'` is enforced by default ALWAYS, even when a
+ *          sessionKey is provided.
+ *      (b) A caller MAY opt into private rows by passing
+ *          `includePrivate: true` AND a sessionKey — and then only rows of
+ *          *that* session are returned regardless of privacy. Public-mode
+ *          callers (in particular the MCP tool `nexusgram_input_log_search`)
+ *          MUST NOT set `includePrivate=true`.
+ *      (c) Without a sessionKey only `privacy='public'` rows are visible —
+ *          unchanged from before, kept as fail-CLOSED default.
  *
  * Phrase-match first, falls back to OR-of-tokens when the phrase has 0 hits.
  */
@@ -478,6 +511,12 @@ export function searchInputLog(opts: {
   sessionKey?: string;
   since?: string;
   limit?: number;
+  /**
+   * Stage 2b F-02 opt-in: include rows with `privacy='private'`. Only
+   * honoured when `sessionKey` is also set — global private-scan is never
+   * allowed. Default false. The MCP-exposed tool must leave this unset.
+   */
+  includePrivate?: boolean;
 }): InputLogSearchResult[] {
   const conn = getDb();
   if (!conn) return [];
@@ -486,9 +525,21 @@ export function searchInputLog(opts: {
   const { phrase, tokens } = buildFtsQuery(opts.query);
   if (!tokens) return [];
 
-  const scopeWhere = opts.sessionKey
-    ? `il.session_key = @sessionKey`
-    : `il.privacy = 'public'`;
+  // Build the scope WHERE clause from independent conditions. Privacy is
+  // enforced unless the caller explicitly opted into private rows AND
+  // bound the search to a single session.
+  const conditions: string[] = [];
+  if (opts.sessionKey) {
+    conditions.push(`il.session_key = @sessionKey`);
+  }
+  const privateAllowed = opts.includePrivate === true && !!opts.sessionKey;
+  if (!privateAllowed) {
+    conditions.push(`il.privacy = 'public'`);
+  }
+  // `conditions` is guaranteed non-empty: either privacy=public is added, or
+  // (sessionKey + includePrivate) is present and `il.session_key=@sessionKey`
+  // was already added — both cases produce a valid WHERE fragment.
+  const scopeWhere = conditions.join(' AND ');
   const sinceWhere = since ? `AND il.received_at >= @since` : '';
 
   const sql = `
@@ -545,22 +596,43 @@ export function searchInputLog(opts: {
  * Return the N most recent input_log rows for a session (independent of FTS).
  * Used by the Context Availability Prompt-Block to render "last user input"
  * freshness without a query string.
+ *
+ * FIX 6+ Stage 2b (Codex Pattern-B F-03): the input-log middleware writes the
+ * current user message into `input_log` BEFORE `sendToAgent()` runs. Without
+ * an exclusion the Context Availability snapshot saw exactly the row of the
+ * just-arrived prompt as "prior context", and the "EMPTY → ask for briefing"
+ * branch could never fire. `excludeRowId` lets the prompt-builder ask
+ * specifically for *prior* turns — the current turn's input_log row id is
+ * threaded down from the message handler through AgentOptions.
  */
-export function getLatestInputLog(sessionKey: string, limit = 5): InputLogSearchResult[] {
+export function getLatestInputLog(
+  sessionKey: string,
+  limit = 5,
+  opts: { excludeRowId?: number | null } = {},
+): InputLogSearchResult[] {
   const conn = getDb();
   if (!conn) return [];
   const cappedLimit = Math.min(SEARCH_LIMIT_CAP, Math.max(1, limit));
+  const excludeRowId = opts.excludeRowId ?? null;
   try {
-    const rows = conn
-      .prepare(
-        `SELECT id, received_at, session_key, chat_id, input_type, status,
+    const sql = excludeRowId != null
+      ? `SELECT id, received_at, session_key, chat_id, input_type, status,
+                dropped_reason, raw_content
+           FROM input_log
+          WHERE session_key = ?
+            AND id <> ?
+          ORDER BY received_at DESC
+          LIMIT ?`
+      : `SELECT id, received_at, session_key, chat_id, input_type, status,
                 dropped_reason, raw_content
            FROM input_log
           WHERE session_key = ?
           ORDER BY received_at DESC
-          LIMIT ?`,
-      )
-      .all(sessionKey, cappedLimit) as Array<{
+          LIMIT ?`;
+    const params: unknown[] = excludeRowId != null
+      ? [sessionKey, excludeRowId, cappedLimit]
+      : [sessionKey, cappedLimit];
+    const rows = conn.prepare(sql).all(...params) as Array<{
       id: number;
       received_at: string;
       session_key: string;
@@ -584,4 +656,24 @@ export function getLatestInputLog(sessionKey: string, limit = 5): InputLogSearch
     console.error('[InputLog] getLatestInputLog failed:', err);
     return [];
   }
+}
+
+/**
+ * FIX 6+ Stage 2b (Codex Pattern-B F-04): force eager initialization of the
+ * input-log DB at process boot. The lazy `getDb()` defers migration and FTS
+ * rebuild until the first caller — and the first caller in the live system
+ * turned out to be `getLatestInputLog()` inside `buildContextAvailabilityPrompt`,
+ * i.e. the prompt-build path. That meant DB migration could run during a
+ * user turn while a parallel session (Family-Bot, Master-Bot worker, /health
+ * call) was already holding a connection, which is a lock-risk surface.
+ *
+ * Calling `ensureInputLogInitialized()` from `index.ts:main()` BEFORE the
+ * Grammy runner starts polling guarantees the migration completes once,
+ * deterministically, with no concurrent user-input pressure. Idempotent: a
+ * second call is a no-op once initialization has completed (or failed and
+ * been marked).
+ */
+export function ensureInputLogInitialized(): void {
+  if (db || initFailed) return;
+  getDb();
 }

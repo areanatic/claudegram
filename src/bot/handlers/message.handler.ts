@@ -378,9 +378,9 @@ export async function handleMessage(ctx: Context): Promise<void> {
     await queueRequest(sessionKey, text, async (turnEpoch) => {
       markProcessing(inputLogRowId);
       if (getStreamingMode() === 'streaming') {
-        await handleStreamingResponse(ctx, sessionKey, text, turnEpoch);
+        await handleStreamingResponse(ctx, sessionKey, text, turnEpoch, inputLogRowId);
       } else {
-        await handleWaitResponse(ctx, sessionKey, chatId, text, turnEpoch);
+        await handleWaitResponse(ctx, sessionKey, chatId, text, turnEpoch, inputLogRowId);
       }
     });
     markDone(inputLogRowId);
@@ -787,6 +787,7 @@ async function handleStreamingResponse(
   sessionKey: string,
   message: string,
   turnEpoch: number,
+  inputLogRowId: number | null,
 ): Promise<void> {
   await messageSender.startStreaming(ctx);
 
@@ -815,6 +816,7 @@ async function handleStreamingResponse(
       abortController,
       telegramCtx: ctx,
       turnEpoch,
+      currentInputLogRowId: inputLogRowId,
     });
 
     // Stage 2c (2026-05-12): cancel-sentinel guard.
@@ -906,6 +908,7 @@ async function handleWaitResponse(
   chatId: number,
   message: string,
   turnEpoch: number,
+  inputLogRowId: number | null,
 ): Promise<void> {
   // Start continuous typing indicator (every 4s)
   const keyInfo = getSessionKeyFromCtx(ctx);
@@ -926,6 +929,7 @@ async function handleWaitResponse(
         abortController,
         telegramCtx: ctx,
         turnEpoch,
+        currentInputLogRowId: inputLogRowId,
       });
     } catch (error) {
       const isAbort =
