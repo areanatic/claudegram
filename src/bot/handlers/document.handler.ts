@@ -18,7 +18,7 @@ import { Context } from 'grammy';
 import * as fs from 'fs';
 import * as path from 'path';
 import { config } from '../../config.js';
-import { sendToAgent, StaleTurnError } from '../../claude/agent.js';
+import { sendToAgent, StaleTurnError, assertTurnIsCurrent } from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -278,6 +278,9 @@ async function sendSingleFileConfirmation(
 
     try {
       await queueRequest(sessionKey, agentPrompt, async (turnEpoch) => {
+        // D0 Hardening Item 1 / Amendment A (2026-05-27): close pre-side-effect
+        // race-window before startStreaming/setAbortController/sendToAgent.
+        assertTurnIsCurrent(sessionKey, turnEpoch);
         if (getStreamingMode() === 'streaming') {
           await messageSender.startStreaming(ctx);
           const abortController = new AbortController();

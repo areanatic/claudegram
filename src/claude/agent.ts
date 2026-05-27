@@ -14,6 +14,7 @@ import {
 import * as fs from 'fs';
 import { sessionManager } from './session-manager.js';
 import { setActiveQuery, clearActiveQuery, isCancelled, clearCancelled, gracefulCancel, isCurrentTurnEpoch } from './request-queue.js';
+import { getActiveContextsForSession } from '../handler/request-registry.js';
 import type { Context } from 'grammy';
 import { config } from '../config.js';
 import { AgentWatchdog } from './agent-watchdog.js';
@@ -150,6 +151,24 @@ export class StaleTurnError extends Error {
   readonly name = 'StaleTurnError';
   constructor(public readonly sessionKey: string, public readonly turnEpoch: number) {
     super(`Turn epoch ${turnEpoch} is stale for session=${sessionKey} — a newer turn took over`);
+  }
+}
+
+/**
+ * D0 Hardening Item 1 (2026-05-27): throw `StaleTurnError` if `turnEpoch` is no
+ * longer the current turn for this session. Use as the FIRST statement in every
+ * `queueRequest` handler, BEFORE any side-effect (streaming UI, registry
+ * insert, abort-controller setter). Closes the dequeue→createRequestContext
+ * race window (5-50ms in production).
+ *
+ * Outer handlers in the bot/handlers/* layer already catch `StaleTurnError`
+ * and mark the input-log row as `dropped/superseded`. See Codex Pattern-A
+ * Pre-Review confidence 0.74:
+ *   shared-memory/nexus/cross_review_d0-fix-now-prereview_2026-05-27.md
+ */
+export function assertTurnIsCurrent(sessionKey: string, turnEpoch: number): void {
+  if (!isCurrentTurnEpoch(sessionKey, turnEpoch)) {
+    throw new StaleTurnError(sessionKey, turnEpoch);
   }
 }
 
@@ -1045,6 +1064,22 @@ export async function sendToAgent(
           },
           onTimeout: () => {
             logAt('basic', `[Claude] WATCHDOG: Query timeout reached, clearing stale session and gracefulCancel: ${sessionKey}`);
+            // D0 Hardening Item 3 (2026-05-27, Codex Conf 0.74): RequestContext-
+            // Observability-Sync. The watchdog is a defense-in-depth SDK-stuck
+            // detector. The primary user-facing timeout is RequestContext.onHardCap.
+            // If RequestContext already terminated (state ∈ {TIMED_OUT, CANCELLED,
+            // RESPONDED}), gracefulCancel is still safe (idempotent SDK-teardown)
+            // and chatSessionIds.delete() is still needed (disposeRequestContext
+            // does NOT clear chatSessionIds — verified 2026-05-27 grep audit).
+            // Pure observability log here so /health and post-mortem can correlate
+            // watchdog firings with RequestContext terminal-state.
+            const liveContexts = getActiveContextsForSession(sessionKey);
+            if (liveContexts.length === 0) {
+              logAt('basic',
+                `[Claude] WATCHDOG: RequestContext already terminal for ${sessionKey} — ` +
+                `proceeding with idempotent teardown (no user-reply emitted by watchdog).`
+              );
+            }
             // Codex BLOCKER 1 (Akt 1.3 round 3): turn-ownership guard for the
             // session-state cleanup. A stale watchdog from an old turn must not
             // wipe a NEWER turn's claudeSessionId. Only clear if the active

@@ -8,6 +8,7 @@ import {
   isDangerousMode,
   getCachedUsage,
   StaleTurnError,
+  assertTurnIsCurrent,
 } from '../../claude/agent.js';
 import { config } from '../../config.js';
 import { messageSender } from '../../telegram/message-sender.js';
@@ -2327,6 +2328,8 @@ export async function handleRedditActionCallback(ctx: Context): Promise<void> {
         // 3. Queue a streaming response
         try {
           await queueRequest(sessionKey, prompt, async (turnEpoch) => {
+            // D0 Hardening Item 1 / Amendment A (2026-05-27): Reddit pre-side-effect guard.
+            assertTurnIsCurrent(sessionKey, turnEpoch);
             if (getStreamingMode() === 'streaming') {
               await messageSender.startStreaming(ctx);
               const abortController = new AbortController();
@@ -2851,6 +2854,8 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
 
     try {
     await queueRequest(sessionKey, transcript, async (turnEpoch) => {
+      // D0 Hardening Item 1 / Amendment A (2026-05-27): Audio pre-side-effect guard.
+      assertTurnIsCurrent(sessionKey, turnEpoch);
       if (isVoiceActive(sessionKey)) {
         await ctx.replyWithChatAction('typing');
         const abortController = new AbortController();

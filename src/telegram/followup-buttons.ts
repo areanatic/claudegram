@@ -2,7 +2,7 @@ import { Context } from 'grammy';
 import { config } from '../config.js';
 import { getSessionKeyFromCtx } from '../utils/session-key.js';
 import { queueRequest, setAbortController } from '../claude/request-queue.js';
-import { sendToAgent, StaleTurnError } from '../claude/agent.js';
+import { sendToAgent, StaleTurnError, assertTurnIsCurrent } from '../claude/agent.js';
 import { messageSender } from './message-sender.js';
 import { maybeSendVoiceReply } from '../tts/voice-reply.js';
 import { sanitizeError } from '../utils/sanitize.js';
@@ -116,6 +116,8 @@ export async function handleFollowUpCallback(ctx: Context): Promise<void> {
   // Send the button label as user message to Claude
   try {
     await queueRequest(sessionKey, label, async (turnEpoch) => {
+      // D0 Hardening Item 1 / Amendment A (2026-05-27): pre-side-effect epoch guard.
+      assertTurnIsCurrent(sessionKey, turnEpoch);
       await messageSender.startStreaming(ctx);
       const abortController = new AbortController();
       setAbortController(sessionKey, abortController, turnEpoch);

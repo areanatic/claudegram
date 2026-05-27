@@ -5,6 +5,7 @@ import {
   clearConversation,
   CLAUDE_CANCEL_SENTINEL_TEXT,
   StaleTurnError,
+  assertTurnIsCurrent,
   type AgentUsage,
 } from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
@@ -376,6 +377,9 @@ export async function handleMessage(ctx: Context): Promise<void> {
     // receives `turnEpoch` (the dequeue-bound ownership token) and threads it
     // into sendToAgent so a late old turn cannot corrupt a newer turn's state.
     await queueRequest(sessionKey, text, async (turnEpoch) => {
+      // D0 Hardening Item 1 / Codex Amendment B (2026-05-27): close the
+      // dequeue→createRequestContext race-window BEFORE any side-effect.
+      assertTurnIsCurrent(sessionKey, turnEpoch);
       markProcessing(inputLogRowId);
       if (getStreamingMode() === 'streaming') {
         await handleStreamingResponse(ctx, sessionKey, text, turnEpoch, inputLogRowId);
@@ -575,6 +579,8 @@ export async function handleAgentReply(
 
   try {
     await queueRequest(sessionKey, trimmedInput, async (turnEpoch) => {
+      // D0 Hardening Item 1 (2026-05-27): pre-RequestContext epoch guard.
+      assertTurnIsCurrent(sessionKey, turnEpoch);
       await messageSender.startStreaming(ctx);
 
       const abortController = new AbortController();
@@ -789,6 +795,10 @@ async function handleStreamingResponse(
   turnEpoch: number,
   inputLogRowId: number | null,
 ): Promise<void> {
+  // D0 Hardening Item 1 (2026-05-27): defense-in-depth epoch guard. Primary
+  // guard is in handleMessage's queueRequest callback before markProcessing;
+  // this one catches any direct caller that bypassed that path.
+  assertTurnIsCurrent(sessionKey, turnEpoch);
   await messageSender.startStreaming(ctx);
 
   const abortController = new AbortController();
@@ -910,6 +920,9 @@ async function handleWaitResponse(
   turnEpoch: number,
   inputLogRowId: number | null,
 ): Promise<void> {
+  // D0 Hardening Item 1 (2026-05-27): defense-in-depth epoch guard, see
+  // handleStreamingResponse.
+  assertTurnIsCurrent(sessionKey, turnEpoch);
   // Start continuous typing indicator (every 4s)
   const keyInfo = getSessionKeyFromCtx(ctx);
   const typingInterval = messageSender.startTypingIndicator(ctx.api, chatId, keyInfo?.threadId);

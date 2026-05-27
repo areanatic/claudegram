@@ -7,6 +7,7 @@ import {
   sendToAgent,
   CLAUDE_CANCEL_SENTINEL_TEXT,
   StaleTurnError,
+  assertTurnIsCurrent,
 } from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
@@ -236,6 +237,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
     // Feed transcript into agent. The queue handler receives `turnEpoch` —
     // the dequeue-bound ownership token — and threads it into sendToAgent.
     await queueRequest(sessionKey, transcript, async (turnEpoch) => {
+      // D0 Hardening Item 1 / Amendment A (2026-05-27): close pre-side-effect
+      // race-window. Voice handler runs replyWithChatAction + setAbortController
+      // + withHardTimeout BEFORE the existing sendToAgent epoch-guard would
+      // fire. Same pattern as message.handler.
+      assertTurnIsCurrent(sessionKey, turnEpoch);
       // Input-Log: turn has been dequeued and is now actually running.
       markProcessing(inputLogRowId);
 
