@@ -3687,15 +3687,32 @@ export async function handlePrivate(ctx: Context): Promise<void> {
   }
 
   if (arg === 'on') {
+    const wasPrivate = isPrivate(sessionKey);
     const rec = setPrivate(sessionKey);
+
+    // Privacy Bug-Fix 2026-05-27 (Pfad-B Bug-2): toggling `/private on` must
+    // also forget the resumable Claude-Code session and roll the turn epoch.
+    // Without this the next user message resumes the prior session whose
+    // in-memory context still contains the private rows the operator just
+    // asked us to scrub — i.e. /private on would leak past the next prompt.
+    // Mirrors Stage 2 cancel-HARD-rollback semantics, scoped to a fresh
+    // toggle (avoid wiping continuity if user re-toggles an already-on chat).
+    if (!wasPrivate) {
+      invalidateCurrentTurn(sessionKey, 'private-toggle-on');
+      forgetChatSession(sessionKey);
+      sessionManager.forceFreshSession(sessionKey);
+      discardCancelledTurnState(sessionKey);
+    }
+
     await replyMd(
       ctx,
       `🔒 *Privacy Mode: ON*\n\n` +
       `This chat is now private since ${esc(rec.since)}\\.\n\n` +
       `• new memories will be tagged \`private\` and stay out of the wiki\n` +
       `• conversation log goes to a \\.private\\.log file \\(skipped by synthesizer\\)\n` +
-      `• the bot will avoid personal references in replies\n\n` +
-      `Send /private off to return to public mode\\.`,
+      `• the bot will avoid personal references in replies\n` +
+      (wasPrivate ? '' : `• prior session context cleared — next message starts fresh\n`) +
+      `\nSend /private off to return to public mode\\.`,
     );
     return;
   }
