@@ -18,7 +18,11 @@ import {
   searchMemoryReadOnly,
   readMemoryPolicyFromEnv,
   searchTasks,
+  searchPersonTimeline,
+  searchEntities,
   type MemoryRetrievalPolicy,
+  type TimelineHit,
+  type EntitySearchHit,
 } from '../memory/nexus-memory.js';
 import { isPrivate } from '../memory/privacy-state.js';
 import { searchInputLog } from '../inbox/input-log.js';
@@ -106,12 +110,18 @@ function buildToolList(toolsCtx: McpToolsContext) {
   // does not try to call it.
   tools.push(omiTaskSearchTool(toolsCtx));
 
+  // Phase 7.5 (2026-05-27): operator-private person timeline + entity search
+  // backed by NER mentions (Phase 7.3). Both gated same way as omi_task_search.
+  // Codex pre-review: cross_review_phase-7-5-context-mcp-tools-architecture_2026-05-27.md (0.78)
+  tools.push(omiPersonTimelineTool(toolsCtx));
+  tools.push(omiEntitySearchTool(toolsCtx));
+
   // FIX 6+ Step 3 + Step 4 (2026-05-25): retrieval tools that the
   // Codex Pre-Review demanded be kept SEPARATE from nexusgram_memory_search
   // (different privacy model, different ranking, allowlisted reads only).
   tools.push(nexusgramInputLogSearchTool(toolsCtx));
-  tools.push(nexusgramReadDailyTool());
-  tools.push(nexusgramReadL1Tool());
+  tools.push(nexusgramReadDailyTool(toolsCtx));
+  tools.push(nexusgramReadL1Tool(toolsCtx));
 
   return tools;
 }
@@ -607,19 +617,44 @@ function truncateForReply(content: string): string {
   return content.slice(0, MAX_L1_CHARS) + '\n\n…[truncated — file longer than allowed]';
 }
 
-function nexusgramReadDailyTool() {
-  return tool(
-    'nexusgram_read_daily',
-    'Read a NEXUS daily log by date (YYYY-MM-DD). Use when the user asks ' +
+function nexusgramReadDailyTool(toolsCtx?: McpToolsContext) {
+  // Phase 7.5 Privacy fix (2026-05-27): NEXUS daily-logs are operator-private
+  // journal entries (mention Simone/Yeva/Alina/colleagues/health/finances).
+  // Family/Test/public bots must NOT read them. /private on must also gate
+  // them. Boot-time gate + per-turn /private check mirror omi_task_search.
+  const bootPolicy = readMemoryPolicyFromEnv();
+  const safePolicy: MemoryRetrievalPolicy = bootPolicy.scope === 'operator_all'
+    ? { ...bootPolicy, scope: 'public' }
+    : bootPolicy;
+  const isOperator =
+    safePolicy.scope === 'self_private' &&
+    safePolicy.trustedPrivateSources.includes('omi-bridge');
+
+  const description = isOperator
+    ? 'Read a NEXUS daily log by date (YYYY-MM-DD). Use when the user asks ' +
       'about a specific day ("wann haben wir X gemacht", "was war am ' +
       'Sonntag", "schau in den Daily von gestern"). Returns the markdown ' +
-      'content, optionally a single ## section. Truncated at 8000 chars.',
+      'content, optionally a single ## section. Truncated at 8000 chars. ' +
+      'Not available in family/test/public scope or while /private is on.'
+    : 'NEXUS daily log access. Not available in this bot context.';
+
+  return tool(
+    'nexusgram_read_daily',
+    description,
     {
       date: z.string().describe('Date in YYYY-MM-DD format (e.g. "2026-05-25").'),
       section: z.string().optional().describe('Optional ## or ### section header to extract (e.g. "Apple Watch 4 Setup").'),
     },
     async ({ date, section }) => {
       try {
+        // Per-turn scope-gate: fail-closed for non-operator + /private on
+        const sessionIsPrivate = toolsCtx ? isPrivate(toolsCtx.sessionKey) : false;
+        if (!isOperator || sessionIsPrivate) {
+          const reason = !isOperator
+            ? 'daily-log access not exposed in this bot scope'
+            : 'daily-log access is intentionally unavailable while /private is on — turn /private off to query';
+          return { content: [{ type: 'text' as const, text: `Daily log unavailable (${reason}).` }] };
+        }
         if (!DAILY_DATE_REGEX.test(date)) {
           return {
             content: [{ type: 'text' as const, text: `Invalid date "${date}" — expected YYYY-MM-DD.` }],
@@ -695,21 +730,45 @@ const L1_ALLOWLIST: Record<string, string> = {
   'nexus-system': '/Volumes/AstronOne/shared-memory/nexus/wiki/nexus-system-truth.md',
 };
 
-function nexusgramReadL1Tool() {
+function nexusgramReadL1Tool(toolsCtx?: McpToolsContext) {
+  // Phase 7.5 Privacy fix (2026-05-27): L1 truth-files include arash-profile,
+  // MEMORY.md, decisions/projects/bot-glossary — all operator-private context.
+  // Same scope-gate as nexusgram_read_daily.
+  const bootPolicy = readMemoryPolicyFromEnv();
+  const safePolicy: MemoryRetrievalPolicy = bootPolicy.scope === 'operator_all'
+    ? { ...bootPolicy, scope: 'public' }
+    : bootPolicy;
+  const isOperator =
+    safePolicy.scope === 'self_private' &&
+    safePolicy.trustedPrivateSources.includes('omi-bridge');
+
   const allowedNames = Object.keys(L1_ALLOWLIST) as [string, ...string[]];
-  return tool(
-    'nexusgram_read_l1',
-    'Read a NEXUS Layer-1 reference file (truth files: soul.md, memory.md, ' +
+  const description = isOperator
+    ? 'Read a NEXUS Layer-1 reference file (truth files: soul.md, memory.md, ' +
       'claude.md, agents.md, bot-glossary, arash-profile, projects, decisions, ' +
       'nexus-system). Use when the user asks about identity ("wer bin ich", ' +
       '"was steht in soul.md"), agent routing rules ("was sagt CLAUDE.md zu X"), ' +
       'bot inventory, or canonical project / decision state. Allowlisted — no ' +
-      'arbitrary filesystem reads. Truncated at 8000 chars.',
+      'arbitrary filesystem reads. Truncated at 8000 chars. ' +
+      'Not available in family/test/public scope or while /private is on.'
+    : 'NEXUS Layer-1 reference files. Not available in this bot context.';
+
+  return tool(
+    'nexusgram_read_l1',
+    description,
     {
       name: z.enum(allowedNames).describe('Allowlisted L1 file alias.'),
     },
     async ({ name }) => {
       try {
+        // Per-turn scope-gate: fail-closed for non-operator + /private on
+        const sessionIsPrivate = toolsCtx ? isPrivate(toolsCtx.sessionKey) : false;
+        if (!isOperator || sessionIsPrivate) {
+          const reason = !isOperator
+            ? 'L1 reference access not exposed in this bot scope'
+            : 'L1 reference access is intentionally unavailable while /private is on — turn /private off to query';
+          return { content: [{ type: 'text' as const, text: `L1 file unavailable (${reason}).` }] };
+        }
         const filepath = L1_ALLOWLIST[name];
         if (!filepath) {
           return {
@@ -770,6 +829,170 @@ function nexusMemorySearchTool(_toolsCtx: McpToolsContext) {
 }
 
 
+
+// ── Phase 7.5 — Context MCP-Tools (Person Timeline + Entity Search) ─────────
+// Codex pre-review: cross_review_phase-7-5-context-mcp-tools-architecture_2026-05-27.md (0.78)
+//
+// Both tools share the omi_task_search pattern:
+//   1. read boot policy + downgrade operator_all → public for MCP
+//   2. compute isOperator at boot for gated description (so the LLM does not try
+//      to call when unavailable)
+//   3. per-turn override: if /private on → effectivePolicy.scope='public' → 0 hits
+//   4. service function (searchPersonTimeline / searchEntities) enforces
+//      privacy gate again — fail-closed in the helper, NOT in the tool wrapper
+
+function formatTimelineLine(hit: TimelineHit, i: number): string {
+  const date = hit.source_created_at_utc ? hit.source_created_at_utc.slice(0, 16).replace('T', ' ') : 'unknown';
+  const kindLabel = hit.source_kind === 'omi_memories' ? 'OMI memory'
+    : hit.source_kind === 'omi_transcription_segments' ? 'OMI segment'
+    : 'memory.db';
+  return `[${i + 1}] ${date} ${kindLabel} (${hit.field_name}): ${hit.snippet}`;
+}
+
+function omiPersonTimelineTool(toolsCtx: McpToolsContext) {
+  const bootPolicy = readMemoryPolicyFromEnv();
+  const safePolicy: MemoryRetrievalPolicy = bootPolicy.scope === 'operator_all'
+    ? { ...bootPolicy, scope: 'public' }
+    : bootPolicy;
+  const isOperator =
+    safePolicy.scope === 'self_private' &&
+    safePolicy.trustedPrivateSources.includes('omi-bridge');
+
+  const description = isOperator
+    ? 'Search Arash\'s local operator-private person timeline (OMI memories + segments + memory.db, joined via Apple-NL NER mentions). Use when the user asks "wann letztes Mal mit Y", "welche Meetings mit Simone", "was gab es mit Kira diese Woche", or asks for chronological mentions of a SPECIFIC person. Returns dated source snippets. Default: last 30 days, 10 results, max 20. Not available in family/test/public scope or while /private is on. For "mit wem habe ich am 17.04. gesprochen?" use omi_entity_search instead (it accepts an empty query + date window).'
+    : 'Operator-private person timeline. Not available in this bot context (returns 0 results).';
+
+  return tool(
+    'omi_person_timeline',
+    description,
+    {
+      person: z.string().describe('Person name (canonical or alias). Examples: "Simone", "Kira", "Tim Zähres".'),
+      from: z.string().optional().describe('ISO date floor, e.g. "2026-04-17T00:00:00Z". Omit to default to last 30 days.'),
+      to: z.string().optional().describe('ISO date ceiling.'),
+      limit: z.number().int().min(1).max(20).optional().describe('Max results (1-20, default 10).'),
+    },
+    async ({ person, from, to, limit }) => {
+      try {
+        const sessionIsPrivate = isPrivate(toolsCtx.sessionKey);
+        const effectivePolicy: MemoryRetrievalPolicy = sessionIsPrivate
+          ? { ...safePolicy, scope: 'public' }
+          : safePolicy;
+        const result = searchPersonTimeline({ person, from, to, limit, policy: effectivePolicy });
+
+        if (result.scope_denied) {
+          const reason = !isOperator
+            ? 'person timeline not exposed in this bot scope'
+            : sessionIsPrivate
+              ? 'person timeline is intentionally unavailable while /private is on — turn /private off to query stored context'
+              : 'scope denied';
+          return { content: [{ type: 'text' as const, text: `No timeline results (${reason}).` }] };
+        }
+
+        if (result.resolution.status === 'ignored') {
+          return { content: [{ type: 'text' as const, text: `"${person}" is marked as an ignored Apple-NL false-positive (not a real person in our index).` }] };
+        }
+        if (!result.resolution.personId) {
+          if (result.resolution.suggestions.length > 0) {
+            const sugg = result.resolution.suggestions.map(s => `${s.label} (${s.mention_count}×${s.source === 'unresolved' ? ' unresolved' : ''})`).join(', ');
+            return { content: [{ type: 'text' as const, text: `No exact match for "${person}". Did you mean: ${sugg}?` }] };
+          }
+          return { content: [{ type: 'text' as const, text: `No person matches "${person}" in the index. Try omi_entity_search for free-text lookup.` }] };
+        }
+        if (result.hits.length === 0) {
+          return { content: [{ type: 'text' as const, text: `0 timeline hits for "${result.resolution.canonicalName}" in the requested window.` }] };
+        }
+
+        const header = `Found ${result.hits.length} timeline hit${result.hits.length === 1 ? '' : 's'} for ${result.resolution.canonicalName}${result.more_available ? ' (more_available=true)' : ''}:`;
+        const body = result.hits.map(formatTimelineLine).join('\n');
+        return { content: [{ type: 'text' as const, text: `${header}\n\n${body}` }] };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Person timeline error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+function formatEntityLine(hit: EntitySearchHit, i: number): string {
+  const date = hit.source_created_at_utc ? hit.source_created_at_utc.slice(0, 16).replace('T', ' ') : 'unknown';
+  const kindLabel = hit.source_kind === 'omi_memories' ? 'OMI memory'
+    : hit.source_kind === 'omi_transcription_segments' ? 'OMI segment'
+    : 'memory.db';
+  const resolvedTag = hit.resolved_canonical_name ? `→${hit.resolved_canonical_name}` : '(unresolved)';
+  return `[${i + 1}] ${date} ${kindLabel} ${hit.entity_kind} "${hit.canonical_text}"${resolvedTag}: ${hit.snippet}`;
+}
+
+function omiEntitySearchTool(toolsCtx: McpToolsContext) {
+  const bootPolicy = readMemoryPolicyFromEnv();
+  const safePolicy: MemoryRetrievalPolicy = bootPolicy.scope === 'operator_all'
+    ? { ...bootPolicy, scope: 'public' }
+    : bootPolicy;
+  const isOperator =
+    safePolicy.scope === 'self_private' &&
+    safePolicy.trustedPrivateSources.includes('omi-bridge');
+
+  const description = isOperator
+    ? 'Search Arash\'s local operator-private entity mentions (persons + organizations + places) extracted from OMI + memory.db via Apple-NL NER. Use when the user asks "was hat sich diese Woche bei DexHub getan", "mit wem habe ich am 17.04. gesprochen" (query empty + date), "alle Erwähnungen von Aura". Returns dated source snippets. When `query` is omitted AND a date window is given, the tool returns the TOP entities in that window grouped by canonical/resolved entity. Resolved seed-persons collapse aliases; unresolved canonicals are also surfaced (Codex P0-5). Not available in family/test/public scope or while /private is on.'
+    : 'Operator-private entity index. Not available in this bot context (returns 0 results).';
+
+  return tool(
+    'omi_entity_search',
+    description,
+    {
+      query: z.string().optional().describe('Free-text query against alias/canonical/unresolved-text. OPTIONAL when from/to is provided (returns top entities in window).'),
+      entity_kind: z.enum(['person', 'organization', 'place', 'any']).optional().describe('Filter by entity kind (default: any).'),
+      from: z.string().optional().describe('ISO date floor, e.g. "2026-04-17T00:00:00Z".'),
+      to: z.string().optional().describe('ISO date ceiling.'),
+      limit: z.number().int().min(1).max(20).optional().describe('Max results (1-20, default 10).'),
+    },
+    async ({ query, entity_kind, from, to, limit }) => {
+      try {
+        const sessionIsPrivate = isPrivate(toolsCtx.sessionKey);
+        const effectivePolicy: MemoryRetrievalPolicy = sessionIsPrivate
+          ? { ...safePolicy, scope: 'public' }
+          : safePolicy;
+        const result = searchEntities({ query, entity_kind, from, to, limit, policy: effectivePolicy });
+
+        if (result.scope_denied) {
+          const reason = !isOperator
+            ? 'entity search not exposed in this bot scope'
+            : sessionIsPrivate
+              ? 'entity search is intentionally unavailable while /private is on — turn /private off to query stored context'
+              : 'scope denied';
+          return { content: [{ type: 'text' as const, text: `No entity results (${reason}).` }] };
+        }
+
+        // Aggregation branch: empty query + window
+        if (!query && (from || to) && result.top_entities_in_window.length > 0) {
+          const winLabel = `${from ?? '*'}..${to ?? '*'}`;
+          const kindLabel = entity_kind && entity_kind !== 'any' ? ` ${entity_kind}s` : ' entities';
+          const lines = result.top_entities_in_window.map((e, i) => {
+            const label = e.resolved_canonical_name ?? e.canonical_text;
+            const tag = e.resolved_canonical_name ? '' : ' (unresolved)';
+            return `[${i + 1}] ${label} (${e.entity_kind}) — ${e.mention_count} mention${e.mention_count === 1 ? '' : 's'}${tag}`;
+          });
+          return { content: [{ type: 'text' as const, text: `Top${kindLabel} in window ${winLabel}:\n\n${lines.join('\n')}` }] };
+        }
+
+        if (result.hits.length === 0) {
+          const qLabel = query ?? '(empty)';
+          return { content: [{ type: 'text' as const, text: `0 entity hits for query="${qLabel}" kind=${entity_kind ?? 'any'} from=${from ?? '*'} to=${to ?? '*'}.` }] };
+        }
+
+        const header = `Found ${result.hits.length} entity hit${result.hits.length === 1 ? '' : 's'} for query="${query ?? '(empty)'}"${result.more_available ? ' (more_available=true)' : ''}:`;
+        const body = result.hits.map(formatEntityLine).join('\n');
+        return { content: [{ type: 'text' as const, text: `${header}\n\n${body}` }] };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Entity search error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
 
 function omiTaskSearchTool(toolsCtx: McpToolsContext) {
   const bootPolicy = readMemoryPolicyFromEnv();

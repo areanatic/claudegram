@@ -114,6 +114,17 @@ class SessionManager {
         this.sessions.delete(sessionKey);
         return this.createSession(sessionKey, workDir);
       }
+      // Phase 7.5 Privacy fix (2026-05-27): non-operator bots (Family/Test/public)
+      // must NOT resume claude-code-sdk session jsonls. The jsonl store under
+      // ~/.claude/projects/<workspace-hash>/<sessionId>.jsonl is keyed by
+      // project path, not by bot DATA_DIR — so a Family resume would replay
+      // private context the Master had previously generated for that project.
+      // Drop the claudeSessionId so the SDK starts a fresh transcript while
+      // preserving our own conversationId for bot-level continuity.
+      if (config.NEXUS_MEMORY_SCOPE !== 'self_private' && resumed.claudeSessionId) {
+        console.log(`[AutoResume] Dropping resumed claudeSessionId for non-operator bot (scope=${config.NEXUS_MEMORY_SCOPE ?? 'public'}) — preventing private-transcript leak`);
+        resumed.claudeSessionId = undefined;
+      }
       console.log(`[AutoResume] Restored session for ${sessionKey}: ${resumed.workingDirectory}`);
       return resumed;
     }

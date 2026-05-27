@@ -58,6 +58,7 @@ import {
   handlePrivate,
   handleHealth,
   handleBrief,
+  handleWith,
 } from './handlers/command.handler.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
@@ -158,6 +159,7 @@ export async function createBot(): Promise<Bot> {
     { command: 'terminalui', description: '🖥️ Toggle terminal-style display' },
     { command: 'tts', description: '🔊 Toggle voice replies' },
     { command: 'health', description: '🩺 Compliance + observability dashboard' },
+    { command: 'with', description: '🧠 Show recent OMI/memory mentions for a person' },
     { command: 'commands', description: '📜 List all commands' },
   ];
 

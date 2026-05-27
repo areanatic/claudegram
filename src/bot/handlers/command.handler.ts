@@ -3658,6 +3658,89 @@ export async function executeExtract(ctx: Context, url: string, mode: ExtractMod
 }
 
 /**
+ * /with <person> — Phase 7.5 person-timeline slash alias.
+ *
+ * Wraps `searchPersonTimeline` (the same service function the MCP tool
+ * `omi_person_timeline` uses) so the user gets deterministic, token-cheap
+ * timeline lines without an LLM round-trip. Operator-only and /private-aware
+ * (delegated to the helper).
+ *
+ * Codex pre-review: cross_review_phase-7-5-context-mcp-tools-architecture_2026-05-27.md
+ */
+export async function handleWith(ctx: Context): Promise<void> {
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (!keyInfo) return;
+  const { sessionKey } = keyInfo;
+
+  const rawArg = typeof ctx.match === 'string' ? ctx.match : '';
+  const person = rawArg.trim();
+  if (!person) {
+    await ctx.reply(
+      'Nutze: `/with <Person>` — z.B.\n' +
+        '`/with Simone`  oder  `/with Tim Zähres`\n\n' +
+        'Liefert eine chronologische Liste der jüngsten Mentions aus OMI + Memory mit Datum + Quelle. ' +
+        'Nicht verfügbar in /private-on oder in Family/Test-Bot-Kontext.',
+      { parse_mode: 'Markdown' },
+    );
+    return;
+  }
+
+  try {
+    const { searchPersonTimeline, readMemoryPolicyFromEnv } = await import('../../memory/nexus-memory.js');
+    const bootPolicy = readMemoryPolicyFromEnv();
+    const sessionIsPrivate = isPrivate(sessionKey);
+    const effectivePolicy = sessionIsPrivate
+      ? { ...bootPolicy, scope: 'public' as const }
+      : bootPolicy.scope === 'operator_all'
+        ? { ...bootPolicy, scope: 'public' as const }
+        : bootPolicy;
+
+    const result = searchPersonTimeline({ person, limit: 10, policy: effectivePolicy });
+
+    if (result.scope_denied) {
+      const reason = sessionIsPrivate
+        ? '/private is on — turn /private off and retry'
+        : 'this bot scope does not expose the person timeline';
+      await ctx.reply(`No timeline available (${reason}).`);
+      return;
+    }
+    if (result.resolution.status === 'ignored') {
+      await ctx.reply(`"${person}" is marked as an ignored Apple-NL false-positive (not a real person in the index).`);
+      return;
+    }
+    if (!result.resolution.personId) {
+      if (result.resolution.suggestions.length > 0) {
+        const sugg = result.resolution.suggestions
+          .map((s) => `${s.label} (${s.mention_count}×${s.source === 'unresolved' ? ' unresolved' : ''})`)
+          .join(', ');
+        await ctx.reply(`No exact match for "${person}". Did you mean: ${sugg}?`);
+      } else {
+        await ctx.reply(`No person matches "${person}". Try a different spelling, or ask the bot to use omi_entity_search.`);
+      }
+      return;
+    }
+    if (result.hits.length === 0) {
+      await ctx.reply(`0 timeline hits for "${result.resolution.canonicalName}".`);
+      return;
+    }
+
+    const lines = result.hits.map((h, i) => {
+      const date = h.source_created_at_utc ? h.source_created_at_utc.slice(0, 16).replace('T', ' ') : 'unknown';
+      const kindLabel =
+        h.source_kind === 'omi_memories' ? 'OMI memory'
+        : h.source_kind === 'omi_transcription_segments' ? 'OMI segment'
+        : 'memory.db';
+      return `${i + 1}. ${date} ${kindLabel}\n   ${h.snippet}`;
+    });
+    const header = `Timeline for ${result.resolution.canonicalName} (${result.hits.length} hit${result.hits.length === 1 ? '' : 's'}${result.more_available ? ', more_available' : ''}):\n\n`;
+    await ctx.reply(header + lines.join('\n\n'));
+  } catch (err) {
+    console.error('[/with] handler error:', err);
+    await ctx.reply(`/with error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
  * /private on | off | status — Privacy Mode Phase 1
  *
  * Per-chat (and per-forum-topic) toggle. When `on`:
