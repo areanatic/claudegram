@@ -322,6 +322,16 @@ const envSchema = z.object({
   FOLLOWUP_BUTTONS_ENABLED: z.string().default('true').transform(toBool),
   // Local Telegram Bot API Server (optional — raises file limit from 20MB to 2GB)
   TELEGRAM_API_SERVER_URL: z.string().optional(),
+  // Phase 7.1 (2026-05-27) — NEXUS memory retrieval scope.
+  // Validated separately below; kept here so missing-scope on master fails fast.
+  NEXUS_MEMORY_SCOPE: z.enum(['public', 'self_private', 'operator_all']).optional(),
+  // Phase 7.x Scanner-Pro Master-Bot Watcher (2026-05-27).
+  // Codex pre-review: cross_review_scanner-watcher-architecture_2026-05-27.md (0.76)
+  // Triple-gated: only effective when ENABLED + BOT_NAME='Nexusgram' + NEXUS_MEMORY_SCOPE='self_private'.
+  SCANNER_PRO_WATCHER_ENABLED: z.string().default('false').transform(toBool),
+  // Codex P1-2: validated interval — min 60s prevents NaN/0 spawn-loop on env typo.
+  SCANNER_PRO_WATCHER_INTERVAL_MS: z.coerce.number().int().min(60_000).max(86_400_000).default(300_000),
+  SCANNER_PRO_SCRIPT_PATH: z.string().default('/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/scanner-pro-sync.sh'),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -333,5 +343,19 @@ if (!parsed.success) {
 }
 
 export const config = parsed.data;
+
+// Phase 7.1 boot-assertion: master-bot must explicitly declare its scope.
+// Family-/test-bot default-fail-closed to 'public' (no assertion needed).
+// Identifier: BOT_NAME='Nexusgram' is the master-bot per master .env.
+if (config.BOT_NAME === 'Nexusgram' && config.NEXUS_MEMORY_SCOPE !== 'self_private') {
+  console.error(
+    '❌ Master-bot boot-assertion failed (Phase 7.1):\n' +
+    `   BOT_NAME='${config.BOT_NAME}' but NEXUS_MEMORY_SCOPE='${config.NEXUS_MEMORY_SCOPE ?? '(unset)'}'.\n` +
+    "   Master must explicitly set NEXUS_MEMORY_SCOPE='self_private' to access\n" +
+    '   operator-owned private memories. Set it in the .env file.\n' +
+    '   Family-/test-bot can leave it unset (defaults to public).'
+  );
+  process.exit(1);
+}
 
 export type Config = typeof config;

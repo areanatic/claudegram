@@ -960,7 +960,13 @@ export async function sendToAgent(
     // In private mode we still allow the bot to see private memories the user
     // has stored in this same session, but we exclude them from retrieval when
     // the session is public. The tone-neutralizer below further prevents leakage.
-    const memoryContext = injectContext(prompt, config.BOT_MEMORY_PROJECT, sessionIsPrivate);
+    // Phase 7.1 (2026-05-27): turn-start memory injection stays PUBLIC-ONLY,
+    // regardless of /private on. Codex pre-review confirmed the old behaviour
+    // (sessionIsPrivate→includePrivate=true) was a global private-retrieval leak,
+    // not a session-scoped one. Operator-owned private OMI memories are reachable
+    // exclusively via the scope-aware MCP tool nexusgram_memory_search, where the
+    // master-bot's NEXUS_MEMORY_SCOPE=self_private gates them.
+    const memoryContext = injectContext(prompt, config.BOT_MEMORY_PROJECT, false);
     // Load previous day's transcript for context continuity (only on fresh sessions)
     const previousDayContext = existingSessionId ? '' : loadPreviousDayTranscript(sessionKey);
     // Load today's transcript for context recovery after a bot restart.

@@ -9,6 +9,7 @@ import { closeInputLog, ensureInputLogInitialized, recoverOrphanedInputs } from 
 import { acquireLock, releaseLock } from './utils/pid-lock.js';
 import { cancelAllRequests, getActiveSessionKeys } from './claude/request-queue.js';
 import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
+import { startScannerProWatcher, stopScannerProWatcher } from './scanners/scanner-pro-watcher.js';
 
 async function main() {
   // Clear CLAUDECODE so claude subprocesses can start even when launched
@@ -81,6 +82,12 @@ async function main() {
   });
   console.log('[Runner] Grammy runner started, polling for updates...');
 
+  // Phase 7.x (2026-05-27): in-process Scanner-Pro sync scheduler. Triple-gated
+  // inside startScannerProWatcher — only runs when BOT_NAME='Nexusgram',
+  // NEXUS_MEMORY_SCOPE='self_private' AND SCANNER_PRO_WATCHER_ENABLED=true.
+  // No-op on Family/Mom/Dad/Test bots.
+  startScannerProWatcher();
+
   // FIX 4 (2026-05-22): tell users whose in-flight message was lost to a
   // crash/restart. Only RECENT orphans (see RECENT_ORPHAN_WINDOW_MS) — old
   // drift is dropped silently. Grouped per chat, capped at 3 snippets, best-effort.
@@ -150,7 +157,12 @@ async function main() {
     // 4. Wait for runner to finish
     try { await stopPromise; } catch { /* ignore */ }
 
-    // 5. Cleanup
+    // 5. Stop scanner-pro watcher (terminates child + waits up to 8s grace).
+    // Phase 7.x (2026-05-27): mirrors startScannerProWatcher gate — no-op on
+    // bots where the watcher was never started.
+    try { await stopScannerProWatcher(); } catch { /* ignore */ }
+
+    // 6. Cleanup
     releaseLock(config.BOT_NAME);
     allowSleep();
     stopCleanup();

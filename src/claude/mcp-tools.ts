@@ -14,7 +14,13 @@ import * as path from 'path';
 import { config } from '../config.js';
 import { sessionManager } from './session-manager.js';
 import { getWorkspaceRoot, isPathWithinRoot } from '../utils/workspace-guard.js';
-import { searchMemoryReadOnly } from '../memory/nexus-memory.js';
+import {
+  searchMemoryReadOnly,
+  readMemoryPolicyFromEnv,
+  searchTasks,
+  type MemoryRetrievalPolicy,
+} from '../memory/nexus-memory.js';
+import { isPrivate } from '../memory/privacy-state.js';
 import { searchInputLog } from '../inbox/input-log.js';
 
 // Lazy imports to avoid circular deps and unnecessary module loading
@@ -93,6 +99,12 @@ function buildToolList(toolsCtx: McpToolsContext) {
 
   tools.push(sendFileTool(toolsCtx));
   tools.push(nexusMemorySearchTool(toolsCtx));
+
+  // Phase 7.2 (2026-05-27): operator-private task index from omi-bridge-task.
+  // Gated by NEXUS_MEMORY_SCOPE — Master ('self_private') gets full description,
+  // Family/Test ('public') gets degraded "not available" description so the LLM
+  // does not try to call it.
+  tools.push(omiTaskSearchTool(toolsCtx));
 
   // FIX 6+ Step 3 + Step 4 (2026-05-25): retrieval tools that the
   // Codex Pre-Review demanded be kept SEPARATE from nexusgram_memory_search
@@ -750,6 +762,79 @@ function nexusMemorySearchTool(_toolsCtx: McpToolsContext) {
       } catch (error) {
         return {
           content: [{ type: 'text' as const, text: `Memory search error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+
+
+function omiTaskSearchTool(toolsCtx: McpToolsContext) {
+  const bootPolicy = readMemoryPolicyFromEnv();
+  // operator_all downgrades to public for MCP (consistent with nexus_memory_search)
+  const safePolicy: MemoryRetrievalPolicy = bootPolicy.scope === 'operator_all'
+    ? { ...bootPolicy, scope: 'public' }
+    : bootPolicy;
+
+  const isOperator =
+    safePolicy.scope === 'self_private' &&
+    safePolicy.trustedPrivateSources.includes('omi-bridge-task');
+
+  const description = isOperator
+    ? 'Search Arash\'s operator-private task index (OMI action_items + staged_tasks). Use when the user asks "what are my todos this week", "open tasks", "what did I have to do for X", or any deadline/priority/category query. Returns structured rows with description + due_at_utc + priority + category + completed flag + age_days. Default: open tasks only, sorted by due date asc then priority. Do NOT use for general memory search — use nexusgram_memory_search for that.'
+    : 'Operator-private task index. Not available in this bot context (returns 0 results).';
+
+  return tool(
+    'omi_task_search',
+    description,
+    {
+      status: z.enum(['open', 'completed', 'all']).optional().describe('Filter by task status (default: open).'),
+      from: z.string().optional().describe('ISO date floor for due_at_utc, e.g. "2026-05-27T00:00:00Z".'),
+      to: z.string().optional().describe('ISO date ceiling for due_at_utc, e.g. "2026-06-03T23:59:59Z".'),
+      priority: z.enum(['high', 'medium', 'low']).optional().describe('Filter by priority.'),
+      category: z.string().optional().describe('Filter by category tag (e.g. "work", "personal").'),
+      limit: z.number().int().min(1).max(50).optional().describe('Max results (1-50, default 20).'),
+    },
+    async ({ status, from, to, priority, category, limit }) => {
+      try {
+        const sessionIsPrivate = isPrivate(toolsCtx.sessionKey);
+        const effectivePolicy: MemoryRetrievalPolicy = sessionIsPrivate
+          ? { ...safePolicy, scope: 'public' }
+          : safePolicy;
+        const hits = searchTasks({
+          status, from, to, priority, category, limit,
+          policy: effectivePolicy,
+        });
+        if (hits.length === 0) {
+          const reason = !isOperator
+            ? 'task index not exposed in this bot scope'
+            : sessionIsPrivate
+              ? 'persisted task search is intentionally unavailable while /private is on — turn /private off to query stored tasks'
+              : 'no matching tasks';
+          return {
+            content: [{ type: 'text' as const, text: `No tasks found (${reason}).` }],
+          };
+        }
+        const lines = hits.map((t, i) => {
+          const due = t.due_at_utc ? t.due_at_utc.slice(0, 16).replace('T', ' ') : 'no due';
+          const prio = t.priority ?? '-';
+          const cat = t.category ?? '-';
+          const completed = t.completed ? '✓ ' : '  ';
+          const age = t.age_days != null ? ` ${t.age_days}d` : '';
+          return `[${i + 1}] ${completed}due=${due} prio=${prio} cat=${cat}${age}\n    ${t.description}`;
+        });
+        const statusLabel = status ?? 'open';
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Found ${hits.length} task${hits.length === 1 ? '' : 's'} (status=${statusLabel}):\n\n${lines.join('\n\n')}`,
+          }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Task search error: ${error instanceof Error ? error.message : String(error)}` }],
           isError: true,
         };
       }

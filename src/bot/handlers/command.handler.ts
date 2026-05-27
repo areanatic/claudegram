@@ -26,6 +26,7 @@ import {
   getActiveSessionKeys,
   invalidateCurrentTurn,
 } from '../../claude/request-queue.js';
+import { getScannerWatcherStatus } from '../../scanners/scanner-pro-watcher.js';
 import { createTelegraphFromFile, createTelegraphPage } from '../../telegram/telegraph.js';
 import { isMediumUrl, fetchMediumArticle, FreediumArticle } from '../../medium/freedium.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
@@ -3678,7 +3679,12 @@ export async function handlePrivate(ctx: Context): Promise<void> {
   const raw = (ctx.message?.text || '').trim();
   // Strip leading "/private" (and optional @botname suffix) + args
   const afterCmd = raw.replace(/^\/private(@\S+)?\s*/i, '').trim().toLowerCase();
-  const arg = afterCmd.split(/\s+/)[0] || 'status';
+  const rawArg = afterCmd.split(/\s+/)[0] || '';
+  // UX 2026-05-27: `/private` alone now toggles. Explicit on/off/status still work.
+  let arg = rawArg;
+  if (!rawArg) {
+    arg = getStatus(sessionKey)?.mode === 'private' ? 'off' : 'on';
+  }
 
   if (arg === 'on') {
     const rec = setPrivate(sessionKey);
@@ -3830,6 +3836,20 @@ export async function handleHealth(ctx: Context): Promise<void> {
     `*Hard\\-cap base:* ${Math.round(config.AGENT_RESPONSE_TIMEOUT_MS / 60000)} min`, // allow-hardcoded: reason="ms→min display conversion"
     `*Capability ledger:* \`${esc(ledgerPath)}\``,
   );
+
+  // Phase 7.x — Scanner-Pro watcher status (one compact line per Codex P1-3).
+  // Codex P0-1 fix: the entire payload after the label is run through esc() so
+  // reserved chars (=, (), ., -, etc.) cannot break MarkdownV2 parsing.
+  const sw = getScannerWatcherStatus();
+  if (sw.enabled) {
+    const last = sw.lastRunAt
+      ? `${sw.lastExitCode === 0 ? '✓' : '✗'}exit=${sw.lastExitCode ?? 'n/a'} ${sw.lastDurationMs ?? '?'}ms`
+      : 'no-run-yet';
+    const status = `runs=${sw.totalRuns}(ok=${sw.totalSuccessRuns}) ${last} fails=${sw.consecutiveFailures}${sw.running ? ' (running)' : ''}`;
+    lines.push(`*Scanner\\-Pro Watcher:* ${esc(status)}`);
+  } else if (sw.reason) {
+    lines.push(`*Scanner\\-Pro Watcher:* ${esc(`disabled (${sw.reason})`)}`);
+  }
 
   const body = lines.join('\n');
   // Telegram MarkdownV2 single-bubble cap (4096); we self-cap at 1500 per Codex spec.
