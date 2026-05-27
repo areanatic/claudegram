@@ -137,8 +137,13 @@ export async function handleVoice(ctx: Context): Promise<void> {
       throw new Error('Voice note has no audio data (only OGG headers) — known Telegram Web/Desktop bug. Try sending from the native iOS/Android app, or just send again.');
     }
 
-    // Transcribe using Groq Whisper API with auto language detection
-    const transcribeResult = await transcribeFileWithLanguage(tempFilePath);
+    // Transcribe using Groq Whisper API with auto language detection.
+    // Codex Pattern-B Review Residual #2 (2026-05-28): allowEmpty:true so a
+    // genuinely empty Whisper return surfaces as qualityFlag='empty_or_silent'
+    // (drop-reason 'voice_empty_silent') instead of being thrown out of
+    // transcribeFileWithLanguage as a generic Error and falling into the
+    // outer catch where it gets logged as a sanitised error message.
+    const transcribeResult = await transcribeFileWithLanguage(tempFilePath, { allowEmpty: true });
     const transcript = transcribeResult.text;
     const detectedLanguage = transcribeResult.languageCode;
 
@@ -152,21 +157,42 @@ export async function handleVoice(ctx: Context): Promise<void> {
     // (e.g. 2026-05-24 21:39 ChatGPT briefing) lost its content forever.
     attachContent(inputLogRowId, transcript);
 
-    // A2 confidence gate: a hallucinated transcript (low Whisper confidence, or
-    // a language the user does not speak — e.g. German audio mis-read as
-    // Korean) must NOT reach the agent. Ask for a resend instead.
+    // Stage 2 Voice-Quality-Gate (2026-05-28): differentiated drop-reasons.
+    // qualityFlag from transcribe.ts already classifies empty / hollow-bitrate
+    // / loop-hallucination / low-confidence. Language-mismatch stays a handler
+    // concern (config.VOICE_ALLOWED_LANGUAGES is policy, not signal quality).
     const allowedLangs = config.VOICE_ALLOWED_LANGUAGES;
     const languageOk = allowedLangs.length === 0 || allowedLangs.includes(detectedLanguage);
-    if (transcribeResult.lowConfidence || !languageOk || transcript.length < 2) {
+    const qualityFlag = transcribeResult.qualityFlag;
+
+    if (qualityFlag !== 'ok' || !languageOk) {
+      const dropReason = !languageOk
+        ? 'language_mismatch'
+        : qualityFlag === 'empty_or_silent'
+          ? 'voice_empty_silent'
+          : qualityFlag === 'low_bitrate_hollow'
+            ? 'low_quality_voice'
+            : qualityFlag === 'loop_hallucination'
+              ? 'loop_hallucination'
+              : 'low_confidence_transcript';
+
       console.warn(
-        `[Voice] transcript rejected by confidence gate: lang=${detectedLanguage} ` +
-        `languageOk=${languageOk} lowConfidence=${transcribeResult.lowConfidence} ` +
+        `[Voice] transcript rejected: lang=${detectedLanguage} languageOk=${languageOk} ` +
+        `qualityFlag=${qualityFlag} dropReason=${dropReason} ` +
+        `bytesPerSec=${transcribeResult.bytesPerSec ?? 'n/a'} durationSec=${transcribeResult.durationSec ?? 'n/a'} ` +
         `len=${transcript.length} avg_logprob=${transcribeResult.avgLogprob ?? 'n/a'}`,
       );
-      markDropped(inputLogRowId, 'low_confidence_transcript');
+      markDropped(inputLogRowId, dropReason);
+
       const hint = !languageOk
         ? `Ich hab dich als "${detectedLanguage}" verstanden — das passt nicht. `
-        : 'Das Audio war zu leise, zu kurz oder unklar. ';
+        : qualityFlag === 'empty_or_silent'
+          ? 'Das war zu kurz oder leise. '
+          : qualityFlag === 'low_bitrate_hollow'
+            ? '⚠️ Die Sprachnachricht klingt hohl/leer (oft ein Telegram-Upload-Bug). '
+            : qualityFlag === 'loop_hallucination'
+              ? '⚠️ Das Audio hat keine erkennbare Sprache enthalten (Whisper hat halluziniert). '
+              : 'Das Audio war zu leise, zu kurz oder unklar. ';
       const askResend = `🎤 ${hint}Schick die Sprachnachricht bitte nochmal — oder tipp sie kurz.\n📝 Falls verwertbar: dein Transkript ist gespeichert (input_log).`;
       try {
         await ctx.api.editMessageText(chatId, ackMsg.message_id, askResend, { parse_mode: undefined });

@@ -9,6 +9,8 @@ import {
   getCachedUsage,
   StaleTurnError,
   assertTurnIsCurrent,
+  forgetChatSession,
+  discardCancelledTurnState,
 } from '../../claude/agent.js';
 import { config } from '../../config.js';
 import { messageSender } from '../../telegram/message-sender.js';
@@ -22,6 +24,7 @@ import {
   queueRequest,
   setAbortController,
   getActiveSessionKeys,
+  invalidateCurrentTurn,
 } from '../../claude/request-queue.js';
 import { createTelegraphFromFile, createTelegraphPage } from '../../telegram/telegraph.js';
 import { isMediumUrl, fetchMediumArticle, FreediumArticle } from '../../medium/freedium.js';
@@ -1399,8 +1402,37 @@ export async function handleCancel(ctx: Context): Promise<void> {
     }
   }
 
+  // Stage 2 M-024 Cancel-HARD-Rollback (2026-05-28, Codex Iterate-Patch B):
+  // Bump the turn epoch BEFORE cancelRequest so a late `success` message from
+  // the cancelled turn cannot pass `isStillOwnerTurn()` in agent.ts and
+  // re-store the stale Claude-session-ID we are about to forget below. This is
+  // the missing piece the original handler lacked: markCancelled finalises the
+  // RequestContext but the turn-epoch ownership-guards in agent.ts were still
+  // satisfied for the cancelled turn until the next dequeue.
+  invalidateCurrentTurn(sessionKey, 'user-cancel');
+
   const cancelled = await cancelRequest(sessionKey);
   const clearedCount = clearQueue(sessionKey);
+
+  // Stage 2 M-024 Cancel-HARD-Rollback (2026-05-28): destroy the resumable
+  // Claude-Code session-ID. The torn SDK transcript must NOT be reused — even
+  // a clean `query.interrupt()` leaves it in an unpredictable state. Combined
+  // with `forceFreshSession` (resets `session.claudeSessionId` + history entry)
+  // the next user message starts a brand-new Claude-Code session, so a /cancel
+  // mid-Phase-D-explanation cannot leak into a follow-up `ping`.
+  // discardCancelledTurnState prunes the cancelled user turn from local
+  // conversationHistory so the new session does not echo it back.
+  //
+  // Codex Pattern-B Review Residual #1 (2026-05-28, Conf 0.74→0.80): only
+  // hard-rollback when something was actually cancelled. A no-op /cancel
+  // (user pressed cancel while nothing was active) must NOT rotate the
+  // Claude-Code session — that would silently destroy continuity.
+  const hardRollback = cancelled || clearedCount > 0 || activeContexts.length > 0 || wasProcessing;
+  if (hardRollback) {
+    forgetChatSession(sessionKey);
+    sessionManager.forceFreshSession(sessionKey);
+    discardCancelledTurnState(sessionKey);
+  }
 
   if (cancelled || clearedCount > 0 || activeContexts.length > 0) {
     let message = '🛑 Cancelled\\.';

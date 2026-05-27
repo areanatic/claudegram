@@ -77,6 +77,27 @@ export function isCurrentTurnEpoch(sessionKey: string, epoch: number): boolean {
 }
 
 /**
+ * Stage 2 M-024 Cancel-HARD-Rollback (2026-05-28, Codex Iterate-Patch B):
+ *
+ * Advance the turn epoch WITHOUT dequeueing a new request. After /cancel, the
+ * currently-running turn (or a recently-released failsafe turn) still holds
+ * the live epoch until `processQueue` dequeues the next item — wide enough for
+ * a late `success` message from the cancelled turn to slip past
+ * `isStillOwnerTurn()` in agent.ts and re-write `chatSessionIds` /
+ * `claudeSessionId` with the stale Claude-session-ID we are deliberately
+ * destroying. Calling this from `handleCancel` makes all ownership-guards
+ * downstream consider the cancelled turn stale immediately.
+ *
+ * Returns the new epoch (mostly for logging).
+ */
+export function invalidateCurrentTurn(sessionKey: string, reason: string): number {
+  const newEpoch = (turnEpochs.get(sessionKey) ?? 0) + 1;
+  turnEpochs.set(sessionKey, newEpoch);
+  console.log(`[request-queue] invalidateCurrentTurn ${sessionKey} reason=${reason} newEpoch=${newEpoch}`);
+  return newEpoch;
+}
+
+/**
  * Hard ceiling for handler completion. Stage 2b Action 3 / Action 10:
  *
  * Pure internal failsafe — NOT a user-facing timer. The single source of

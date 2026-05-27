@@ -1496,6 +1496,58 @@ export function clearConversation(sessionKey: string): void {
   chatUsageCache.delete(sessionKey);
 }
 
+/**
+ * Stage 2 M-024 Cancel-HARD-Rollback (2026-05-28, Codex Iterate-Patch B):
+ *
+ * Drop the cached Claude-Code session id for this chat without touching
+ * conversationHistory. Combined with `sessionManager.forceFreshSession`, this
+ * guarantees the NEXT `sendToAgent` call cannot pass `resume:` and lands in a
+ * brand-new Claude-Code transcript — required to escape a torn SDK session
+ * after `/cancel`. Cheaper than `clearConversation` because the local user/
+ * assistant history (used for PreCompact and memory) survives the reset.
+ */
+export function forgetChatSession(sessionKey: string): void {
+  chatSessionIds.delete(sessionKey);
+}
+
+/**
+ * Stage 2 M-024 Cancel-HARD-Rollback (2026-05-28, Codex Iterate-Patch B):
+ *
+ * After /cancel, prune the cancelled user turn from the local conversation
+ * history so the next prompt does not echo the dropped message back to Claude
+ * when history is reconstructed for a brand-new session (post-`/cancel` resume).
+ *
+ * Rules:
+ *  - history ends with role:user → pop it (the user message we just cancelled)
+ *  - history ends with role:assistant === CLAUDE_CANCEL_SENTINEL_TEXT and the
+ *    prior is role:user → pop both (sentinel + the user turn that produced it)
+ *  - otherwise no-op (don't blast away older completed assistant answers)
+ */
+export function discardCancelledTurnState(sessionKey: string): void {
+  const history = conversationHistory.get(sessionKey);
+  if (!history || history.length === 0) return;
+
+  const last = history[history.length - 1];
+  if (last.role === 'user') {
+    history.pop();
+    conversationHistory.set(sessionKey, history);
+    logAt('basic', `[discardCancelledTurnState] dropped trailing user turn for ${sessionKey}`);
+    return;
+  }
+  if (
+    last.role === 'assistant' &&
+    typeof last.content === 'string' &&
+    last.content === CLAUDE_CANCEL_SENTINEL_TEXT &&
+    history.length >= 2 &&
+    history[history.length - 2].role === 'user'
+  ) {
+    history.pop(); // assistant sentinel
+    history.pop(); // user turn
+    conversationHistory.set(sessionKey, history);
+    logAt('basic', `[discardCancelledTurnState] dropped cancel-sentinel + user turn for ${sessionKey}`);
+  }
+}
+
 export function setModel(sessionKey: string, model: string): void {
   chatModels.set(sessionKey, model);
 }
