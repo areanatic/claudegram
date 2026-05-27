@@ -38,13 +38,22 @@ import Database from 'better-sqlite3';
 import { config } from '../config.js';
 
 const NEXUS_MEMORY_DB = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/memory.db';
+const OMI_BRIDGE_DB = '/Volumes/AstronOne/shared-memory/omi-bridge/indexed/omi_bridge.db';
 const WATCHER_LOG = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/omi-bridge-sync.log';
 const STATE_FILE = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/omi-bridge-watcher-state.json';
 const ORCHESTRATOR_LOCK_DIR = '/Volumes/AstronOne/shared-memory/omi-bridge/.locks/orchestrator.lock';
 const PIPELINE_LOCK_DIR = '/Volumes/AstronOne/shared-memory/omi-bridge/.locks/pipeline.lock';
 const OCR_LOCK_DIR = '/Volumes/AstronOne/shared-memory/omi-bridge/.locks/ocr.lock';
 
-const TRUSTED_PRIVATE_SOURCES = ['omi', 'omi-bridge', 'omi-bridge-task', 'scanner-pro'] as const;
+const BOOT_RECOVERY_STALE_THRESHOLD_MS = 30 * 60 * 1000;  // 30min — anything older is definitely dead
+
+// Must stay in sync with DEFAULT_TRUSTED_PRIVATE_SOURCES in src/memory/nexus-memory.ts.
+// Used by privacy postcondition only — checks that writer-phases never leave
+// trusted-private source rows tagged as public.
+const TRUSTED_PRIVATE_SOURCES = [
+  'omi', 'omi-bridge', 'omi-bridge-task', 'omi-synthesis',
+  'scanner-pro', 'nexusgram', 'link-inbox', 'auto-index',
+] as const;
 
 const SIGTERM_GRACE_MS = 8_000;
 const INITIAL_DELAY_MS = 120_000;
@@ -387,6 +396,68 @@ async function tick(): Promise<void> {
   }
 }
 
+/** Codex P1-4: at watcher boot, mark any `running` runs older than 30min as
+ *  `aborted`. They are leftovers from a previous Master process that got
+ *  SIGTERMed (e.g. during a deploy). Without cleanup, /health stats lie and
+ *  the failure-counter can over-trigger.
+ *
+ *  Tables:
+ *   - omi_bridge.db.export_runs (P1+P2)
+ *   - omi_bridge.db.ocr_runs (P3)
+ *   - memory.db.entity_extraction_runs (P7.3 NER)
+ */
+function bootRecovery(): void {
+  const cutoff = new Date(Date.now() - BOOT_RECOVERY_STALE_THRESHOLD_MS).toISOString();
+  const summary: string[] = [];
+
+  // memory.db NER runs
+  try {
+    const conn = new Database(NEXUS_MEMORY_DB, { fileMustExist: true });
+    try {
+      conn.pragma('busy_timeout = 5000');
+      const result = conn.prepare(
+        "UPDATE entity_extraction_runs SET status='aborted', " +
+        "error=COALESCE(error,'') || ' [boot-recovery: marked aborted, started before ' || ? || ']', " +
+        "finished_at_utc=strftime('%Y-%m-%dT%H:%M:%SZ', 'now') " +
+        "WHERE status='running' AND started_at_utc < ?"
+      ).run(cutoff, cutoff);
+      if (result.changes > 0) summary.push(`ner:${result.changes}`);
+    } finally { conn.close(); }
+  } catch (err) {
+    watcherLog(`boot-recovery memory.db error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // omi_bridge.db export + ocr runs
+  try {
+    const conn = new Database(OMI_BRIDGE_DB, { fileMustExist: true });
+    try {
+      conn.pragma('busy_timeout = 5000');
+      const exportResult = conn.prepare(
+        "UPDATE export_runs SET status='aborted', " +
+        "error=COALESCE(error,'') || ' [boot-recovery: marked aborted, started before ' || ? || ']', " +
+        "finished_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now') " +
+        "WHERE status='running' AND started_at < ?"
+      ).run(cutoff, cutoff);
+      if (exportResult.changes > 0) summary.push(`export:${exportResult.changes}`);
+
+      const ocrResult = conn.prepare(
+        "UPDATE ocr_runs SET status='aborted', " +
+        "error=COALESCE(error,'') || ' [boot-recovery: marked aborted, started before ' || ? || ']', " +
+        "finished_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now') " +
+        "WHERE status='running' AND started_at < ?"
+      ).run(cutoff, cutoff);
+      if (ocrResult.changes > 0) summary.push(`ocr:${ocrResult.changes}`);
+    } finally { conn.close(); }
+  } catch (err) {
+    watcherLog(`boot-recovery omi_bridge.db error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (summary.length > 0) {
+    watcherLog(`boot-recovery: aborted stale 'running' runs older than ${cutoff} — ${summary.join(', ')}`);
+    watcherJsonl({ event: 'boot_recovery', aborted: summary.join(','), cutoff });
+  }
+}
+
 export function startOmiBridgeWatcher(): void {
   const gate = gateOk();
   if (!gate.ok) {
@@ -399,6 +470,9 @@ export function startOmiBridgeWatcher(): void {
     watcherLog(`startup: state.disabled=true reason="${state.disabled_reason ?? 'unknown'}" — NOT scheduling. Operator must clear state-file to re-enable.`);
     return;
   }
+
+  // Phase 7.7 v1.1 (Codex P1-4): mark stale running runs as aborted before scheduling
+  bootRecovery();
 
   const intervalMs = config.OMI_BRIDGE_WATCHER_INTERVAL_MS;
   watcherLog(`enabled (interval=${intervalMs}ms initial_delay=${INITIAL_DELAY_MS}ms)`);

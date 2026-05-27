@@ -45,7 +45,10 @@ export interface MemoryRetrievalPolicy {
  *  considered operator-owned and therefore visible under scope='self_private'.
  *  Verified 2026-05-27: omi=194, omi-bridge=111, omi-bridge-task=413,
  *  omi-synthesis=21, scanner-pro=20. nexusgram/link-inbox currently public-only
- *  but pre-authorized. omi-bridge-task added Phase 7.2 (2026-05-27). */
+ *  but pre-authorized. omi-bridge-task added Phase 7.2 (2026-05-27).
+ *  auto-index added Phase 7.5 P0 follow-up (2026-05-28): NEXUS internal memory
+ *  representations (User Profile, Memory Architecture, Session Logs, etc.) are
+ *  operator-private journaling and must not leak to Family/Test bots. */
 export const DEFAULT_TRUSTED_PRIVATE_SOURCES: readonly string[] = Object.freeze([
   'omi',
   'omi-bridge',
@@ -54,6 +57,7 @@ export const DEFAULT_TRUSTED_PRIVATE_SOURCES: readonly string[] = Object.freeze(
   'nexusgram',
   'scanner-pro',
   'link-inbox',
+  'auto-index',
 ]);
 
 /** Sanity-bound for trusted sources to avoid pathological IN-lists. */
