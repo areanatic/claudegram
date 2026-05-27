@@ -332,6 +332,25 @@ const envSchema = z.object({
   // Codex P1-2: validated interval — min 60s prevents NaN/0 spawn-loop on env typo.
   SCANNER_PRO_WATCHER_INTERVAL_MS: z.coerce.number().int().min(60_000).max(86_400_000).default(300_000),
   SCANNER_PRO_SCRIPT_PATH: z.string().default('/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/scanner-pro-sync.sh'),
+
+  // Phase 7.7 (2026-05-28) — OMI-Bridge Auto-Orchestrator.
+  // Codex pre-review: cross_review_phase-7-7-auto-orchestrator-architecture_2026-05-27.md (0.82 CONDITIONAL-GO)
+  // Triple-gated like Scanner-Pro: ENABLED + BOT_NAME='Nexusgram' + NEXUS_MEMORY_SCOPE='self_private'.
+  OMI_BRIDGE_WATCHER_ENABLED: z.string().default('false').transform(toBool),
+  // Watcher tick interval. Default 15min per Codex P1-1. Min 60s (typo-safety).
+  OMI_BRIDGE_WATCHER_INTERVAL_MS: z.coerce.number().int().min(60_000).max(86_400_000).default(900_000),
+  // Per-phase minimum intervals (default cadences from Codex review). The watcher
+  // ticks every 15min, but each phase only runs when its last-success is older
+  // than these thresholds. Keeps network/CPU load bounded.
+  OMI_BRIDGE_PIPELINE_MIN_INTERVAL_MS: z.coerce.number().int().min(60_000).max(86_400_000).default(7_200_000),   // 120min
+  OMI_BRIDGE_OCR_MIN_INTERVAL_MS: z.coerce.number().int().min(60_000).max(86_400_000).default(3_600_000),       // 60min
+  OMI_BRIDGE_NER_MIN_INTERVAL_MS: z.coerce.number().int().min(60_000).max(86_400_000).default(3_600_000),       // 60min
+  OMI_BRIDGE_TASKS_MIN_INTERVAL_MS: z.coerce.number().int().min(60_000).max(86_400_000).default(3_600_000),     // 60min
+  // Script paths (Codex P2-4: separated so tests can point them at fixtures).
+  OMI_BRIDGE_PIPELINE_SCRIPT_PATH: z.string().default('/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/omi-bridge/omi_bridge_pipeline.sh'),
+  OMI_BRIDGE_OCR_SCRIPT_PATH: z.string().default('/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/omi-bridge/omi_bridge_ocr.sh'),
+  OMI_BRIDGE_NER_SCRIPT_PATH: z.string().default('/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/omi-bridge/phase7_ner_import.py'),
+  OMI_BRIDGE_TASKS_SCRIPT_PATH: z.string().default('/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/omi-bridge/phase7_tasks_import.py'),
 });
 
 const parsed = envSchema.safeParse(process.env);

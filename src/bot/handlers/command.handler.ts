@@ -27,6 +27,7 @@ import {
   invalidateCurrentTurn,
 } from '../../claude/request-queue.js';
 import { getScannerWatcherStatus } from '../../scanners/scanner-pro-watcher.js';
+import { getOmiBridgeWatcherStatus } from '../../scanners/omi-bridge-watcher.js';
 import { createTelegraphFromFile, createTelegraphPage } from '../../telegram/telegraph.js';
 import { isMediumUrl, fetchMediumArticle, FreediumArticle } from '../../medium/freedium.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
@@ -3949,6 +3950,21 @@ export async function handleHealth(ctx: Context): Promise<void> {
     lines.push(`*Scanner\\-Pro Watcher:* ${esc(status)}`);
   } else if (sw.reason) {
     lines.push(`*Scanner\\-Pro Watcher:* ${esc(`disabled (${sw.reason})`)}`);
+  }
+
+  // Phase 7.7 — OMI-Bridge auto-orchestrator status line. Same compact pattern
+  // as Scanner-Pro, escaped for MarkdownV2. Codex P2-2 (keep /health under 1500).
+  const ow = getOmiBridgeWatcherStatus();
+  if (ow.enabled) {
+    const lastPhase = ow.last_pipeline_at || ow.last_ner_at || ow.last_tasks_at || ow.last_ocr_at;
+    const last = ow.last_run_started_at
+      ? `${ow.last_run_duration_ms ?? '?'}ms last=${lastPhase ? lastPhase.slice(0, 16).replace('T', ' ') : 'never'}`
+      : 'no-run-yet';
+    const phaseLabel = ow.current_phase ? ` (running:${ow.current_phase})` : '';
+    const status = `runs=${ow.total_runs}(ok=${ow.total_success_runs}) ${last} fails=${ow.consecutive_failures}${phaseLabel}`;
+    lines.push(`*OMI\\-Bridge Watcher:* ${esc(status)}`);
+  } else if (ow.reason) {
+    lines.push(`*OMI\\-Bridge Watcher:* ${esc(`disabled (${ow.reason})`)}`);
   }
 
   const body = lines.join('\n');

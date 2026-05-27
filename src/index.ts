@@ -10,6 +10,7 @@ import { acquireLock, releaseLock } from './utils/pid-lock.js';
 import { cancelAllRequests, getActiveSessionKeys } from './claude/request-queue.js';
 import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
 import { startScannerProWatcher, stopScannerProWatcher } from './scanners/scanner-pro-watcher.js';
+import { startOmiBridgeWatcher, stopOmiBridgeWatcher } from './scanners/omi-bridge-watcher.js';
 
 async function main() {
   // Clear CLAUDECODE so claude subprocesses can start even when launched
@@ -88,6 +89,14 @@ async function main() {
   // No-op on Family/Mom/Dad/Test bots.
   startScannerProWatcher();
 
+  // Phase 7.7 (2026-05-28): in-process OMI-Bridge auto-orchestrator. Mirrors
+  // Scanner-Pro's triple-gate (ENABLED + BOT_NAME=Nexusgram + scope=self_private)
+  // so Family/Test bots get a no-op. Wraps omi_bridge_pipeline.sh + ocr.sh +
+  // phase7_ner_import.py + phase7_tasks_import.py with cross-process locking,
+  // persistent failure-state, and a privacy postcondition SQL check.
+  // Codex pre-review: 0.82 CONDITIONAL-GO with all 5 P0s addressed.
+  startOmiBridgeWatcher();
+
   // FIX 4 (2026-05-22): tell users whose in-flight message was lost to a
   // crash/restart. Only RECENT orphans (see RECENT_ORPHAN_WINDOW_MS) — old
   // drift is dropped silently. Grouped per chat, capped at 3 snippets, best-effort.
@@ -161,6 +170,11 @@ async function main() {
     // Phase 7.x (2026-05-27): mirrors startScannerProWatcher gate — no-op on
     // bots where the watcher was never started.
     try { await stopScannerProWatcher(); } catch { /* ignore */ }
+
+    // Phase 7.7 shutdown: SIGTERM the orchestrator's process-group so any
+    // running child (ssh/rsync/python/ffmpeg descendants) gets the signal
+    // together, with 8s grace before SIGKILL.
+    try { await stopOmiBridgeWatcher(); } catch { /* ignore */ }
 
     // 6. Cleanup
     releaseLock(config.BOT_NAME);
