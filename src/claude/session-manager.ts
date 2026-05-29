@@ -51,7 +51,11 @@ class SessionManager {
    */
   private isOversized(session: Session): boolean {
     if (!session.claudeSessionId) return false;
-    const MB20 = 20 * 1024 * 1024;
+    // Bug-A boot-airbag: 20 MB fired far too late — a 9.5 MB JSONL was already
+    // at ~196.8k tokens (death-spiral). 7 MB ≈ 80% of the 200k window for
+    // text-dense transcripts. Primary guard is the usage-based rotation in
+    // agent.ts (maybeRotateAfterContextPressure); this is the second line.
+    const MB_LIMIT = 7 * 1024 * 1024; // allow-hardcoded: reason="Bug-A boot-airbag ~80% of 200k for text-dense JSONL; primary guard is usage-based in agent.ts; tunable via config later"
     const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
     if (!fs.existsSync(claudeProjectsDir)) return false;
     try {
@@ -60,7 +64,7 @@ class SessionManager {
         const sessionFile = path.join(claudeProjectsDir, dir, `${session.claudeSessionId}.jsonl`);
         if (fs.existsSync(sessionFile)) {
           const { size } = fs.statSync(sessionFile);
-          if (size > MB20) {
+          if (size > MB_LIMIT) {
             console.log(`[SessionRotation] JSONL oversized: ${Math.round(size / 1024 / 1024)}MB`);
             return true;
           }

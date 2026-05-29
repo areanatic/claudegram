@@ -6,6 +6,7 @@ import {
   CLAUDE_CANCEL_SENTINEL_TEXT,
   StaleTurnError,
   assertTurnIsCurrent,
+  maybeRotateAfterContextPressure,
   type AgentUsage,
 } from '../../claude/agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
@@ -96,6 +97,29 @@ async function sendUsageFooter(
   const bar = getProgressBar(pct);
   const footer = `${bar} ${pct}% context · ${fmtTokens(u.inputTokens + u.outputTokens + u.cacheReadTokens)}/${fmtTokens(u.contextWindow)} · $${u.totalCostUsd.toFixed(4)} · ${u.numTurns} turns`;
   await ctx.reply(footer, { parse_mode: undefined });
+}
+
+/**
+ * Bug-A guard: after the usage footer, rotate to a fresh Claude session for the
+ * NEXT turn if the context window is filling up (>= 90%). Informs the operator
+ * once, transparently. Must never throw into the reply path.
+ */
+async function applyContextGuard(
+  ctx: Context,
+  sessionKey: string,
+  usage: AgentUsage | undefined,
+): Promise<void> {
+  try {
+    const pressure = maybeRotateAfterContextPressure(sessionKey, usage);
+    if (pressure === 'rotated') {
+      await ctx.reply(
+        '🧹 Kontext war fast voll — ich habe für die nächste Nachricht frisch aufgesetzt. Dein gespeichertes Wissen (Memory/OMI/Daily) bleibt erhalten.',
+        { parse_mode: undefined },
+      );
+    }
+  } catch (e) {
+    console.log(`[applyContextGuard] non-fatal: ${(e as Error).message}`);
+  }
 }
 
 async function sendCompactionNotification(
@@ -677,6 +701,7 @@ export async function handleAgentReply(
 
         // Context visibility notifications
         await sendUsageFooter(ctx, response.usage);
+        await applyContextGuard(ctx, sessionKey, response.usage);
         await sendCompactionNotification(ctx, response.compaction);
         await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
 
@@ -881,6 +906,7 @@ async function handleStreamingResponse(
 
     // Context visibility notifications
     await sendUsageFooter(ctx, response.usage);
+    await applyContextGuard(ctx, sessionKey, response.usage);
     await sendCompactionNotification(ctx, response.compaction);
     await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
 
@@ -990,6 +1016,7 @@ async function handleWaitResponse(
 
     // Context visibility notifications
     await sendUsageFooter(ctx, response.usage);
+    await applyContextGuard(ctx, sessionKey, response.usage);
     await sendCompactionNotification(ctx, response.compaction);
     await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
 

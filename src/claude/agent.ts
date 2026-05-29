@@ -13,6 +13,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import * as fs from 'fs';
 import { sessionManager } from './session-manager.js';
+import { classifyContextPressure, type ContextPressure } from './context-pressure.js';
 import { setActiveQuery, clearActiveQuery, isCancelled, clearCancelled, gracefulCancel, isCurrentTurnEpoch } from './request-queue.js';
 import { getActiveContextsForSession } from '../handler/request-registry.js';
 import type { Context } from 'grammy';
@@ -1514,6 +1515,38 @@ export function clearConversation(sessionKey: string): void {
  */
 export function forgetChatSession(sessionKey: string): void {
   chatSessionIds.delete(sessionKey);
+}
+
+/**
+ * Bug-A (death-spiral) prevention — usage-based rotation AFTER a successful turn.
+ *
+ * Called from the message handler right after sendUsageFooter on every reply
+ * path. When the context window is filling up we rotate to a fresh Claude-Code
+ * session for the NEXT turn (forgetChatSession drops the resume id;
+ * forceFreshSession installs a clean in-memory session). No data loss: the old
+ * JSONL stays on disk and the next turn rebuilds todayContext/daily/memory
+ * fresh. This is the PRIMARY fix (Codex order b); isOversized 7 MB is the
+ * boot-airbag (order c). See audit_nexusgram_bug_audit_2026-05-27-28.md.
+ */
+export function maybeRotateAfterContextPressure(
+  sessionKey: string,
+  usage: AgentUsage | undefined,
+): ContextPressure {
+  if (!usage) return 'none';
+  // Same "used" definition as the usage footer (input + output + cacheRead) so
+  // that what fires == what the user sees in the % footer.
+  const used = usage.inputTokens + usage.outputTokens + usage.cacheReadTokens;
+  const pressure = classifyContextPressure(used, usage.contextWindow);
+  const pct = usage.contextWindow > 0 ? Math.round((used / usage.contextWindow) * 100) : 0;
+  if (pressure === 'rotated') {
+    forgetChatSession(sessionKey);
+    sessionManager.forceFreshSession(sessionKey);
+    chatUsageCache.delete(sessionKey);
+    logAt('basic', `[ContextRotation] HARD rotate ${sessionKey} at ${pct}% — next turn starts fresh (Bug-A guard)`);
+  } else if (pressure === 'warned') {
+    logAt('basic', `[ContextRotation] WARN ${sessionKey} at ${pct}% — approaching context limit (Bug-A guard)`);
+  }
+  return pressure;
 }
 
 /**
