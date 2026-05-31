@@ -12,6 +12,7 @@ import {
   forgetChatSession,
   discardCancelledTurnState,
 } from '../../claude/agent.js';
+import { occupancyTokens } from '../../claude/context-pressure.js';
 import { config } from '../../config.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { getUptimeFormatted } from '../middleware/stale-filter.js';
@@ -892,10 +893,12 @@ export async function handleStatus(ctx: Context): Promise<void> {
 
   const cached = getCachedUsage(sessionKey);
   if (cached) {
+    // Single-source occupancy (Bug-A metric) — same as footer + guard + /context.
+    const usedCtx = occupancyTokens(cached);
     const pct = cached.contextWindow > 0
-      ? Math.round(((cached.inputTokens + cached.outputTokens) / cached.contextWindow) * 100)
+      ? Math.min(100, Math.round((usedCtx / cached.contextWindow) * 100))
       : 0;
-    status += `\n• *Context:* ${esc(String(pct))}% \\(${esc(fmtTokens(cached.inputTokens + cached.outputTokens))}/${esc(fmtTokens(cached.contextWindow))}\\)`;
+    status += `\n• *Context:* ${esc(String(pct))}% \\(${esc(fmtTokens(usedCtx))}/${esc(fmtTokens(cached.contextWindow))}\\)`;
     status += `\n• *Session Cost:* \\$${esc(cached.totalCostUsd.toFixed(4))}`;
   }
 
@@ -1242,8 +1245,10 @@ export async function handleContext(ctx: Context): Promise<void> {
   // Try cached SDK usage first (instant, no CLI shell-out)
   const cached = getCachedUsage(sessionKey);
   if (cached) {
+    // Single-source occupancy (Bug-A metric) — same as footer + guard + /status.
+    const usedCtx = occupancyTokens(cached);
     const pct = cached.contextWindow > 0
-      ? Math.round(((cached.inputTokens + cached.outputTokens + cached.cacheReadTokens) / cached.contextWindow) * 100)
+      ? Math.min(100, Math.round((usedCtx / cached.contextWindow) * 100))
       : 0;
     const bar = getProgressBar(pct);
 

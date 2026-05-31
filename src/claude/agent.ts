@@ -13,7 +13,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import * as fs from 'fs';
 import { sessionManager } from './session-manager.js';
-import { classifyContextPressure, type ContextPressure } from './context-pressure.js';
+import { classifyContextPressure, occupancyTokens, type ContextPressure } from './context-pressure.js';
 import { setActiveQuery, clearActiveQuery, isCancelled, clearCancelled, gracefulCancel, isCurrentTurnEpoch } from './request-queue.js';
 import { getActiveContextsForSession } from '../handler/request-registry.js';
 import type { Context } from 'grammy';
@@ -60,6 +60,11 @@ export interface AgentUsage {
   contextWindow: number;
   numTurns: number;
   model: string;
+  /** TRUE per-step max window occupancy (input+cache_read+cache_creation+output),
+   *  captured live from assistant messages. NON-cumulative — the metric the Bug-A
+   *  rotation guard + footer + /status read via occupancyTokens(). 0 = not captured
+   *  (callers fall back to the cumulative counters). Tier-1 / Codex Pattern-A. */
+  windowTokens: number;
 }
 
 interface AgentResponse {
@@ -713,6 +718,13 @@ export async function sendToAgent(
   let resultUsage: AgentUsage | undefined;
   let compactionEvent: { trigger: 'manual' | 'auto'; preTokens: number } | undefined;
   let initEvent: { model: string; sessionId: string } | undefined;
+  // Bug-A metric (Tier-1, Codex Pattern-A 2026-05-31): TRUE per-step window
+  // occupancy. result.modelUsage is CUMULATIVE across the query() call, so we
+  // capture the max occupancy from each assistant message instead. `observedModel`
+  // lets us pick the right modelUsage[model] (Object.keys()[0] is fragile with
+  // multi-model/subagent turns).
+  let maxWindowTokens = 0;
+  let observedModel: string | undefined;
 
   // Determine permission mode
   const permissionMode = getPermissionMode(command);
@@ -1127,6 +1139,25 @@ export async function sendToAgent(
 
       if (responseMessage.type === 'assistant') {
         logAt('verbose', '[Claude] Assistant content blocks:', responseMessage.message.content.length);
+        // Bug-A metric: capture TRUE per-step window occupancy from each assistant
+        // message. NON-cumulative (unlike result.modelUsage). max-over-all-steps is
+        // equivalent to dedupe-by-message.id-then-max for a MAX aggregation, so we
+        // need no explicit dedupe (parallel tool-calls share message.id but we take
+        // the max, never a sum). Occupancy includes output_tokens because the guard
+        // rotates AFTER the turn to protect the NEXT one. (Codex Pattern-A #1/#2.)
+        const stepUsage = (responseMessage.message as {
+          usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+        }).usage;
+        if (stepUsage) {
+          const occ =
+            (stepUsage.input_tokens ?? 0) +
+            (stepUsage.cache_read_input_tokens ?? 0) +
+            (stepUsage.cache_creation_input_tokens ?? 0) +
+            (stepUsage.output_tokens ?? 0);
+          if (occ > maxWindowTokens) maxWindowTokens = occ;
+        }
+        const stepModel = (responseMessage.message as { model?: string }).model;
+        if (stepModel) observedModel = stepModel;
         for (const block of responseMessage.message.content) {
           logAt('trace', '[Claude] Block type:', block.type);
           if (block.type === 'text') {
@@ -1231,10 +1262,16 @@ export async function sendToAgent(
         logAt('verbose', '[Claude] Result:', JSON.stringify(responseMessage, null, 2).substring(0, 500));
         gotResult = true;
 
-        // Extract usage data from result
+        // Extract usage data from result. NOTE: modelUsage token counters are
+        // CUMULATIVE per query() call — kept for the $-cost/turns footer, but the
+        // Bug-A rotation ratio uses windowTokens (per-step max) via occupancyTokens.
         const resultMsg = responseMessage as SDKResultMessage;
         if (resultMsg.modelUsage) {
-          const modelKey = Object.keys(resultMsg.modelUsage)[0];
+          // Prefer the model we actually saw on assistant messages; Object.keys()[0]
+          // is fragile when subagents/multiple models appear (Codex Pattern-A #2).
+          const modelKey = (observedModel && resultMsg.modelUsage[observedModel])
+            ? observedModel
+            : Object.keys(resultMsg.modelUsage)[0];
           if (modelKey && resultMsg.modelUsage[modelKey]) {
             const mu = resultMsg.modelUsage[modelKey];
             resultUsage = {
@@ -1246,6 +1283,7 @@ export async function sendToAgent(
               contextWindow: mu.contextWindow,
               numTurns: resultMsg.num_turns,
               model: modelKey,
+              windowTokens: maxWindowTokens, // TRUE per-step occupancy (Bug-A metric)
             };
           }
         }
@@ -1533,9 +1571,11 @@ export function maybeRotateAfterContextPressure(
   usage: AgentUsage | undefined,
 ): ContextPressure {
   if (!usage) return 'none';
-  // Same "used" definition as the usage footer (input + output + cacheRead) so
-  // that what fires == what the user sees in the % footer.
-  const used = usage.inputTokens + usage.outputTokens + usage.cacheReadTokens;
+  // TRUE window occupancy via the single-source occupancyTokens() the footer +
+  // /status also use → what fires == what the user sees. NEVER the raw cumulative
+  // result counters: a 45-msg tool-loop summed them to 523% and HARD-rotated a
+  // healthy session (Bug-A metric, Codex Pattern-A 2026-05-31).
+  const used = occupancyTokens(usage);
   const pressure = classifyContextPressure(used, usage.contextWindow);
   const pct = usage.contextWindow > 0 ? Math.round((used / usage.contextWindow) * 100) : 0;
   if (pressure === 'rotated') {

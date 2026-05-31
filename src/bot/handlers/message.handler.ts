@@ -9,6 +9,7 @@ import {
   maybeRotateAfterContextPressure,
   type AgentUsage,
 } from '../../claude/agent.js';
+import { occupancyTokens } from '../../claude/context-pressure.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { config } from '../../config.js';
 import { messageSender } from '../../telegram/message-sender.js';
@@ -91,11 +92,14 @@ async function sendUsageFooter(
 ): Promise<void> {
   if (!config.CONTEXT_SHOW_USAGE || !usage) return;
   const u = usage;
+  // Single-source occupancy (Bug-A metric) — same value the rotation guard fires
+  // on, so the % the user sees == what triggers rotation. Clamp display to 100%.
+  const used = occupancyTokens(u);
   const pct = u.contextWindow > 0
-    ? Math.round(((u.inputTokens + u.outputTokens + u.cacheReadTokens) / u.contextWindow) * 100)
+    ? Math.min(100, Math.round((used / u.contextWindow) * 100))
     : 0;
   const bar = getProgressBar(pct);
-  const footer = `${bar} ${pct}% context · ${fmtTokens(u.inputTokens + u.outputTokens + u.cacheReadTokens)}/${fmtTokens(u.contextWindow)} · $${u.totalCostUsd.toFixed(4)} · ${u.numTurns} turns`;
+  const footer = `${bar} ${pct}% context · ${fmtTokens(used)}/${fmtTokens(u.contextWindow)} · $${u.totalCostUsd.toFixed(4)} · ${u.numTurns} turns`;
   await ctx.reply(footer, { parse_mode: undefined });
 }
 
