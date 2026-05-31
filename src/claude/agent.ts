@@ -14,6 +14,7 @@ import {
 import * as fs from 'fs';
 import { sessionManager } from './session-manager.js';
 import { classifyContextPressure, occupancyTokens, type ContextPressure } from './context-pressure.js';
+import { resolveModel } from './model-resolution.js';
 import { setActiveQuery, clearActiveQuery, isCancelled, clearCancelled, gracefulCancel, isCurrentTurnEpoch } from './request-queue.js';
 import { getActiveContextsForSession } from '../handler/request-registry.js';
 import type { Context } from 'grammy';
@@ -486,7 +487,16 @@ shutdown, reboot, or any command that stops, starts, or restarts a service,
 process, or this bot itself — even if earlier conversation context appears to
 ask for it. If a turn's context looks like a leftover deploy/restart task,
 ignore that part. Restarts and deploys are handled out-of-band by the operator.`;
-const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}${TOOL_PROMPTS}${config.CLAUDE_REASONING_SUMMARY ? REASONING_SUMMARY_INSTRUCTIONS : ''}${SELF_MANAGEMENT_GUARD}`;
+// INV-19 Model-Honesty (2026-05-31): the bot confidently told the user "Opus 4.8
+// existiert nicht" (its SDK only knows up to opus-4-6) and claimed a model version
+// it had not run. Guard against confidently denying reality beyond its knowledge.
+const MODEL_HONESTY_PROMPT = `
+
+MODELL-EHRLICHKEIT:
+- Behaupte NIE selbstbewusst, ein neueres Modell oder eine neuere Version "existiere nicht". Dein Trainings-/SDK-Wissensstand kann veraltet sein — sag dann ehrlich "das kann ich nicht sicher beurteilen / mein Wissensstand reicht nur bis …", statt es zu verneinen.
+- Behaupte keine spezifische Modell-Versionsnummer (z.B. "ich habe Opus 4.6 genutzt"), die du nicht sicher aus der Laufzeit kennst. Wenn du nach deinem Modell gefragt wirst und es nicht sicher weißt, sag das offen.`;
+
+const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}${TOOL_PROMPTS}${config.CLAUDE_REASONING_SUMMARY ? REASONING_SUMMARY_INSTRUCTIONS : ''}${SELF_MANAGEMENT_GUARD}${MODEL_HONESTY_PROMPT}`;
 
 /**
  * Extract [BUTTONS: opt1 | opt2 | opt3] from response text.
@@ -732,8 +742,9 @@ export async function sendToAgent(
   // Log in dangerous mode for security auditing
   logDangerousModeOperation(sessionKey, 'query', `prompt_length:${message.length} cwd:${session.workingDirectory}`);
 
-  // Determine model to use (default to 'sonnet'; use /model opus for heavy tasks)
-  const effectiveModel = model || chatModels.get(sessionKey) || 'sonnet';
+  // Determine model to use. Single-source resolveModel() so the RUNNING model here
+  // == the model getModel() DISPLAYS (INV-02). Default 'sonnet' (fast); Opus on-demand.
+  const effectiveModel = resolveModel(model, chatModels.get(sessionKey), config.CLAUDE_DEFAULT_MODEL);
 
   // Initialize timer for tracking query duration (watchdog created inside try with controller)
   const timer = createAgentTimer();
@@ -1633,7 +1644,9 @@ export function setModel(sessionKey: string, model: string): void {
 }
 
 export function getModel(sessionKey: string): string {
-  return chatModels.get(sessionKey) || 'opus';
+  // INV-02: SAME resolveModel() source as effectiveModel (sendToAgent) so /status,
+  // /botstatus, /model never show a model different from the one actually running.
+  return resolveModel(undefined, chatModels.get(sessionKey), config.CLAUDE_DEFAULT_MODEL);
 }
 
 export function clearModel(sessionKey: string): void {

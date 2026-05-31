@@ -41,6 +41,10 @@ const envSchema = z.object({
     .transform((val) => val.toLowerCase() === 'true'),
   BOT_NAME: z.string().default('Nexusgram'),
   BOT_MODE: z.enum(['dev', 'prod']).default('dev'),
+  // INV-02 Model-Truth (2026-05-31): single source for the default model. 'sonnet'
+  // = fast default (user strategy); Opus only on-demand via /model opus. Both
+  // effectiveModel AND getModel read this via resolveModel() → display==computed.
+  CLAUDE_DEFAULT_MODEL: z.string().default('sonnet'),
   STREAMING_MODE: z.enum(['streaming', 'wait']).default('streaming'),
   STREAMING_DEBOUNCE_MS: z
     .string()
