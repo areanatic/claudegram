@@ -261,6 +261,13 @@ export interface GenerateSpeechOptions {
 }
 
 /**
+ * Thrown when no TTS provider can synthesize the requested language
+ * (e.g. non-English while the OpenAI fallback is disabled). Callers should
+ * catch this and degrade to text-only — it is NOT an error condition.
+ */
+export class TtsUnavailableError extends Error {}
+
+/**
  * Generate speech using the configured TTS provider.
  * Returns an audio Buffer (format depends on provider:
  *   - groq: OGG/Opus
@@ -285,11 +292,18 @@ export async function generateSpeech(text: string, voice?: string, options?: Gen
     autumn: 'nova', diana: 'shimmer', hannah: 'coral',
   };
 
-  if (config.TTS_PROVIDER === 'groq' && looksNonEnglish && config.OPENAI_API_KEY) {
-    const detectedBy = language ? `language=${language}` : 'text heuristic';
-    const mappedVoice = voice ? (GROQ_TO_OPENAI_VOICE[voice] || 'onyx') : undefined;
-    console.log(`[TTS] Non-English detected (${detectedBy}), using OpenAI TTS (voice: ${voice} → ${mappedVoice})`);
-    return generateSpeechOpenAI(text, mappedVoice);
+  if (config.TTS_PROVIDER === 'groq' && looksNonEnglish) {
+    // Groq Orpheus is English-only. Non-English needs OpenAI — but only when the
+    // fallback is explicitly enabled (T0.1 2026-05-31: OFF by default, OpenAI quota
+    // exhausted). Otherwise skip cleanly so the caller degrades to text-only:
+    // no garbage Groq audio for German, no insufficient_quota spam.
+    if (config.TTS_NONENGLISH_OPENAI_FALLBACK && config.OPENAI_API_KEY) {
+      const detectedBy = language ? `language=${language}` : 'text heuristic';
+      const mappedVoice = voice ? (GROQ_TO_OPENAI_VOICE[voice] || 'onyx') : undefined;
+      console.log(`[TTS] Non-English detected (${detectedBy}), using OpenAI TTS (voice: ${voice} → ${mappedVoice})`);
+      return generateSpeechOpenAI(text, mappedVoice);
+    }
+    throw new TtsUnavailableError(`non-english TTS disabled (lang=${language ?? 'heuristic'})`);
   }
 
   if (config.TTS_PROVIDER === 'groq') {

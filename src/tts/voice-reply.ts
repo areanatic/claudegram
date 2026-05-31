@@ -1,6 +1,6 @@
 import { Context, InputFile } from 'grammy';
 import { config } from '../config.js';
-import { generateSpeech } from './tts.js';
+import { generateSpeech, TtsUnavailableError } from './tts.js';
 import { getTTSSettings, isVoiceActive, getDetectedLanguage } from './tts-settings.js';
 import { getSessionKeyFromCtx } from '../utils/session-key.js';
 
@@ -92,6 +92,12 @@ export async function maybeSendVoiceReply(ctx: Context, text: string, options?: 
       await ctx.replyWithAudio(file);
     }
   } catch (error) {
+    if (error instanceof TtsUnavailableError) {
+      // Non-English voice synthesis is disabled (OpenAI quota exhausted). The text
+      // answer was already sent, so degrade to text-only quietly — no error spam.
+      console.log(`[TTS] voice-reply skipped, text-only (${error.message})`);
+      return;
+    }
     console.error('[TTS] Failed to generate or send voice reply:', error);
   }
 }

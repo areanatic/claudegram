@@ -53,6 +53,10 @@ const envSchema = z.object({
   // TTS Configuration
   TTS_ENABLED: z.string().default('true').transform(toBool),
   TTS_PROVIDER: z.enum(['groq', 'openai']).default('groq'),
+  // T0.1 (2026-05-31): non-English auto-fallback to OpenAI TTS. OFF by default —
+  // OpenAI quota exhausted (insufficient_quota spam); non-English degrades to text-only.
+  // Set true again once OpenAI quota is refilled OR a non-English TTS provider is added.
+  TTS_NONENGLISH_OPENAI_FALLBACK: z.string().default('false').transform(toBool),
   TTS_MODEL: z.string().default('gpt-4o-mini-tts'),
   TTS_VOICE: z.string().default('coral'),
   TTS_INSTRUCTIONS: z.string().default('Speak in a friendly, natural conversational tone.'),
