@@ -30,6 +30,7 @@ import { downloadFileSecure, getTelegramFileUrl } from '../../utils/download.js'
 import { sanitizeError, sanitizePath } from '../../utils/sanitize.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
+import { runPostAgentSuccess } from './post-agent.js';
 import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.middleware.js';
 import { markProcessing, markDone, markDropped, markError, attachContent } from '../../inbox/input-log.js';
 import { withHardTimeout, HardTimeoutError } from '../../utils/hard-timeout.js';
@@ -285,6 +286,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
               abortController,
               voiceMode: true,
               telegramCtx: ctx,
+              currentInputLogRowId: inputLogRowId,
               turnEpoch,
             });
           } else if (getStreamingMode() === 'streaming') {
@@ -299,6 +301,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
                 },
                 abortController,
                 telegramCtx: ctx,
+                currentInputLogRowId: inputLogRowId,
                 turnEpoch,
               });
             } catch (error) {
@@ -312,6 +315,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
             response = await sendToAgent(sessionKey, transcript, {
               abortController,
               telegramCtx: ctx,
+              currentInputLogRowId: inputLogRowId,
               turnEpoch,
             });
           }
@@ -351,6 +355,10 @@ export async function handleVoice(ctx: Context): Promise<void> {
             await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
           }
           await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
+          // Tier-1: same post-agent work as the text path (usage footer + Bug-A
+          // rotation guard + compaction/new-session notices). Voice was guard-blind
+          // before, so a voice-heavy session could fill the window unchecked.
+          await runPostAgentSuccess(ctx, sessionKey, response);
           markDone(inputLogRowId);
         },
         voiceHardCapMs,

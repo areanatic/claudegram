@@ -6,10 +6,9 @@ import {
   CLAUDE_CANCEL_SENTINEL_TEXT,
   StaleTurnError,
   assertTurnIsCurrent,
-  maybeRotateAfterContextPressure,
   type AgentUsage,
 } from '../../claude/agent.js';
-import { occupancyTokens } from '../../claude/context-pressure.js';
+import { runPostAgentSuccess } from './post-agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { config } from '../../config.js';
 import { messageSender } from '../../telegram/message-sender.js';
@@ -72,106 +71,11 @@ function extractRedditUrl(text: string): string | null {
   return null;
 }
 
-export function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
-  return String(n);
-}
-
-export function getProgressBar(pct: number): string {
-  const clamped = Math.max(0, Math.min(100, pct));
-  const filled = Math.round(clamped / 10);
-  const empty = 10 - filled;
-  const color = clamped >= 80 ? '🔴' : clamped >= 60 ? '🟡' : '🟢';
-  return color + ' [' + '█'.repeat(filled) + '░'.repeat(empty) + ']';
-}
-
-async function sendUsageFooter(
-  ctx: Context,
-  usage: AgentUsage | undefined,
-): Promise<void> {
-  if (!config.CONTEXT_SHOW_USAGE || !usage) return;
-  const u = usage;
-  // Single-source occupancy (Bug-A metric) — same value the rotation guard fires
-  // on, so the % the user sees == what triggers rotation. Clamp display to 100%.
-  const used = occupancyTokens(u);
-  const pct = u.contextWindow > 0
-    ? Math.min(100, Math.round((used / u.contextWindow) * 100))
-    : 0;
-  const bar = getProgressBar(pct);
-  const footer = `${bar} ${pct}% context · ${fmtTokens(used)}/${fmtTokens(u.contextWindow)} · $${u.totalCostUsd.toFixed(4)} · ${u.numTurns} turns`;
-  await ctx.reply(footer, { parse_mode: undefined });
-}
-
-/**
- * Bug-A guard: after the usage footer, rotate to a fresh Claude session for the
- * NEXT turn if the context window is filling up (>= 90%). Informs the operator
- * once, transparently. Must never throw into the reply path.
- */
-async function applyContextGuard(
-  ctx: Context,
-  sessionKey: string,
-  usage: AgentUsage | undefined,
-): Promise<void> {
-  try {
-    const pressure = maybeRotateAfterContextPressure(sessionKey, usage);
-    if (pressure === 'rotated') {
-      await ctx.reply(
-        '🧹 Kontext war fast voll — ich habe für die nächste Nachricht frisch aufgesetzt. Dein gespeichertes Wissen (Memory/OMI/Daily) bleibt erhalten.',
-        { parse_mode: undefined },
-      );
-    }
-  } catch (e) {
-    console.log(`[applyContextGuard] non-fatal: ${(e as Error).message}`);
-  }
-}
-
-async function sendCompactionNotification(
-  ctx: Context,
-  compaction: { trigger: 'manual' | 'auto'; preTokens: number } | undefined,
-): Promise<void> {
-  if (!config.CONTEXT_NOTIFY_COMPACTION || !compaction) return;
-  const c = compaction;
-  console.log(`[Compaction] Sending notification: trigger=${c.trigger}, preTokens=${c.preTokens}`);
-  const emoji = c.trigger === 'auto' ? '⚠️' : 'ℹ️';
-  const triggerLabel = c.trigger === 'auto' ? 'Auto-compacted' : 'Manually compacted';
-  try {
-    const msg = `${emoji} *Context Compacted*\n\n`
-      + `${esc(triggerLabel)} — previous context was ${esc(fmtTokens(c.preTokens))} tokens\\.\n`
-      + `The agent now has a summarized version of your conversation\\.\n\n`
-      + `_Tip: Use /handoff before compaction to save a detailed context document\\._`;
-    await ctx.reply(msg, { parse_mode: 'MarkdownV2' });
-  } catch (err) {
-    console.error('[Compaction] Failed to send notification:', err);
-    // Fallback to plain text if MarkdownV2 fails
-    try {
-      await ctx.reply(
-        `${emoji} Context Compacted\n\n`
-        + `${triggerLabel} — previous context was ${fmtTokens(c.preTokens)} tokens.\n`
-        + `The agent now has a summarized version of your conversation.`,
-        { parse_mode: undefined }
-      );
-    } catch (fallbackErr) {
-      console.error('[Compaction] Fallback notification also failed:', fallbackErr);
-    }
-  }
-}
-
-async function sendSessionInitNotification(
-  ctx: Context,
-  sessionKey: string,
-  sessionInit: { model: string; sessionId: string } | undefined,
-): Promise<void> {
-  if (!config.CONTEXT_NOTIFY_COMPACTION || !sessionInit) return;
-  const previousSessionId = sessionManager.getSession(sessionKey)?.claudeSessionId;
-  if (previousSessionId && sessionInit.sessionId !== previousSessionId) {
-    const msg = `🔄 *New Agent Session*\n\n`
-      + `A new agent session has started \\(previous context may be summarized\\)\\.\n`
-      + `Model: \`${esc(sessionInit.model)}\`\n\n`
-      + `_The agent may not remember earlier details\\. Consider sharing context\\._`;
-    await ctx.reply(msg, { parse_mode: 'MarkdownV2' });
-  }
-}
+// Tier-1 (2026-05-31): the usage footer, Bug-A rotation guard, and compaction /
+// new-session notifications moved to ./post-agent.ts so ALL reply paths (text,
+// voice, photo, document, command-audio) run them via runPostAgentSuccess().
+// Re-export the two pure formatters command.handler still imports from here.
+export { fmtTokens, getProgressBar } from './post-agent.js';
 
 /**
  * Build the standard onLongRunning / onHardCap callbacks for a Telegram-context
@@ -704,10 +608,7 @@ export async function handleAgentReply(
         await maybeSendVoiceReply(ctx, response.text);
 
         // Context visibility notifications
-        await sendUsageFooter(ctx, response.usage);
-        await applyContextGuard(ctx, sessionKey, response.usage);
-        await sendCompactionNotification(ctx, response.compaction);
-        await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
+        await runPostAgentSuccess(ctx, sessionKey, response);
 
         // Follow-up action buttons
         await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
@@ -909,10 +810,7 @@ async function handleStreamingResponse(
     await maybeSendVoiceReply(ctx, response.text);
 
     // Context visibility notifications
-    await sendUsageFooter(ctx, response.usage);
-    await applyContextGuard(ctx, sessionKey, response.usage);
-    await sendCompactionNotification(ctx, response.compaction);
-    await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
+    await runPostAgentSuccess(ctx, sessionKey, response);
 
     // Follow-up action buttons
     await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
@@ -1019,10 +917,7 @@ async function handleWaitResponse(
     await maybeSendVoiceReply(ctx, response.text);
 
     // Context visibility notifications
-    await sendUsageFooter(ctx, response.usage);
-    await applyContextGuard(ctx, sessionKey, response.usage);
-    await sendCompactionNotification(ctx, response.compaction);
-    await sendSessionInitNotification(ctx, sessionKey, response.sessionInit);
+    await runPostAgentSuccess(ctx, sessionKey, response);
 
     // Follow-up action buttons
     await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);

@@ -1558,8 +1558,9 @@ export function forgetChatSession(sessionKey: string): void {
 /**
  * Bug-A (death-spiral) prevention — usage-based rotation AFTER a successful turn.
  *
- * Called from the message handler right after sendUsageFooter on every reply
- * path. When the context window is filling up we rotate to a fresh Claude-Code
+ * Called from runPostAgentSuccess (the shared post-agent hook) right after the
+ * usage footer on EVERY reply path (text/voice/photo/document/command-audio).
+ * When the context window is filling up we rotate to a fresh Claude-Code
  * session for the NEXT turn (forgetChatSession drops the resume id;
  * forceFreshSession installs a clean in-memory session). No data loss: the old
  * JSONL stays on disk and the next turn rebuilds todayContext/daily/memory

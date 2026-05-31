@@ -19,6 +19,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { config } from '../../config.js';
 import { sendToAgent, StaleTurnError, assertTurnIsCurrent } from '../../claude/agent.js';
+import { runPostAgentSuccess } from './post-agent.js';
+import { getInputLogRowId } from '../middleware/input-log.middleware.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -281,6 +283,10 @@ async function sendSingleFileConfirmation(
         // D0 Hardening Item 1 / Amendment A (2026-05-27): close pre-side-effect
         // race-window before startStreaming/setAbortController/sendToAgent.
         assertTurnIsCurrent(sessionKey, turnEpoch);
+        // Tier-1: thread the input-log row + run the shared post-agent hook
+        // (Bug-A guard was document-blind). telegramCtx intentionally NOT added
+        // here — it would change the doc agent's MCP tool surface (untested).
+        const inputLogRowId = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
         if (getStreamingMode() === 'streaming') {
           await messageSender.startStreaming(ctx);
           const abortController = new AbortController();
@@ -292,9 +298,11 @@ async function sendSingleFileConfirmation(
                 messageSender.updateStream(ctx, progressText);
               },
               abortController,
+              currentInputLogRowId: inputLogRowId,
               turnEpoch,
             });
             await messageSender.finishStreaming(ctx, response.text);
+            await runPostAgentSuccess(ctx, sessionKey, response);
           } catch (error) {
             await messageSender.cancelStreaming(ctx);
             if (error instanceof StaleTurnError) throw error; // bubble to outer
@@ -305,8 +313,9 @@ async function sendSingleFileConfirmation(
           await ctx.replyWithChatAction('typing');
           const abortController = new AbortController();
           setAbortController(sessionKey, abortController, turnEpoch);
-          const response = await sendToAgent(sessionKey, agentPrompt, { abortController, turnEpoch });
+          const response = await sendToAgent(sessionKey, agentPrompt, { abortController, currentInputLogRowId: inputLogRowId, turnEpoch });
           await messageSender.sendMessage(ctx, response.text);
+          await runPostAgentSuccess(ctx, sessionKey, response);
         }
       });
     } catch (error) {

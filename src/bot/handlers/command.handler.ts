@@ -37,6 +37,8 @@ import { getTerminalUISettings, setTerminalUIEnabled } from '../../telegram/term
 import { getTelegraphSettings, setTelegraphEnabled } from '../../telegram/telegraph-settings.js';
 import { maybeSendVoiceReply } from '../../tts/voice-reply.js';
 import { sendFollowUpButtons } from '../../telegram/followup-buttons.js';
+import { runPostAgentSuccess } from './post-agent.js';
+import { getInputLogRowId } from '../middleware/input-log.middleware.js';
 import { transcribeFile, downloadTelegramAudio } from '../../audio/transcribe.js';
 import { executeVReddit } from '../../reddit/vreddit.js';
 import { redditFetch, redditFetchBoth, type RedditFetchOptions } from '../../reddit/redditfetch.js';
@@ -2891,6 +2893,10 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
     const session = sessionManager.getOrResumeSession(sessionKey);
     if (!session) return;
 
+    // Tier-1: thread the input-log row + run the shared post-agent hook on the
+    // command-audio agent path (Bug-A guard was audio-blind, like voice).
+    const inputLogRowId = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
+
     try {
     await queueRequest(sessionKey, transcript, async (turnEpoch) => {
       // D0 Hardening Item 1 / Amendment A (2026-05-27): Audio pre-side-effect guard.
@@ -2903,11 +2909,13 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
           abortController,
           voiceMode: true,
           telegramCtx: ctx,
+          currentInputLogRowId: inputLogRowId,
           turnEpoch,
         });
         await maybeSendVoiceReply(ctx, response.text, { voiceMode: true });
         await messageSender.sendMessage(ctx, response.text);
         await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
+        await runPostAgentSuccess(ctx, sessionKey, response);
       } else if (getStreamingMode() === 'streaming') {
         await messageSender.startStreaming(ctx);
         const abortController = new AbortController();
@@ -2917,11 +2925,13 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
             onProgress: (progressText) => { messageSender.updateStream(ctx, progressText); },
             abortController,
             telegramCtx: ctx,
+            currentInputLogRowId: inputLogRowId,
             turnEpoch,
           });
           await messageSender.finishStreaming(ctx, response.text);
           await maybeSendVoiceReply(ctx, response.text, {});
           await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
+          await runPostAgentSuccess(ctx, sessionKey, response);
         } catch (error) {
           await messageSender.cancelStreaming(ctx);
           throw error;
@@ -2933,11 +2943,13 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
         const response = await sendToAgent(sessionKey, transcript, {
           abortController,
           telegramCtx: ctx,
+          currentInputLogRowId: inputLogRowId,
           turnEpoch,
         });
         await messageSender.sendMessage(ctx, response.text);
         await maybeSendVoiceReply(ctx, response.text, {});
         await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
+        await runPostAgentSuccess(ctx, sessionKey, response);
       }
     });
     } catch (error) {
