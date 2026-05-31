@@ -39,6 +39,7 @@ import { maybeSendVoiceReply } from '../../tts/voice-reply.js';
 import { sendFollowUpButtons } from '../../telegram/followup-buttons.js';
 import { runPostAgentSuccess } from './post-agent.js';
 import { getInputLogRowId } from '../middleware/input-log.middleware.js';
+import { registerTranscribePrompt, takeFreshTranscribeReply } from './transcribe-pending.js';
 import { transcribeFile, downloadTelegramAudio } from '../../audio/transcribe.js';
 import { executeVReddit } from '../../reddit/vreddit.js';
 import { redditFetch, redditFetchBoth, type RedditFetchOptions } from '../../reddit/redditfetch.js';
@@ -2847,8 +2848,9 @@ export async function handleTranscribe(ctx: Context): Promise<void> {
     }
   }
 
-  // Path B: no audio attached — send ForceReply prompt
-  await ctx.reply(
+  // Path B: no audio attached — send ForceReply prompt + register it (RI-23) so
+  // only a reply to THIS specific, fresh, one-shot prompt routes transcribe-only.
+  const promptMsg = await ctx.reply(
     '🎤 *Transcribe Audio*\n\n_Send a voice note or audio file:_',
     {
       parse_mode: 'MarkdownV2',
@@ -2859,6 +2861,7 @@ export async function handleTranscribe(ctx: Context): Promise<void> {
       },
     }
   );
+  registerTranscribePrompt(ctx.chat?.id ?? 0, ctx.from?.id ?? 0, promptMsg.message_id);
 }
 
 /**
@@ -2876,10 +2879,11 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
     return;
   }
 
-  // If this is a reply to the ForceReply "Transcribe Audio" prompt → transcribe-only (no agent)
+  // RI-23 (Tier-1): transcribe-only ONLY for a reply to a FRESH /transcribe prompt
+  // (precise prompt msg-id + same user + TTL + one-shot). A stale prompt no longer
+  // hijacks a real audio question — it falls through to the agent path below.
   const replyTo = ctx.message?.reply_to_message;
-  const isTranscribeOnly = replyTo?.from?.is_bot &&
-    ((replyTo as { text?: string }).text || '').includes('Transcribe Audio');
+  const isTranscribeOnly = takeFreshTranscribeReply(ctx.chat?.id ?? 0, ctx.from?.id ?? 0, replyTo?.message_id);
 
   console.log(`[TranscribeAudio] file_id=${audio.file_id} mime=${audio.mime_type} size=${audio.file_size} transcribeOnly=${isTranscribeOnly}`);
   const transcript = await transcribeAndSend(ctx, audio.file_id, audio.mime_type);

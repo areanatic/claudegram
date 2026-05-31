@@ -385,6 +385,17 @@ export function markDone(rowId: number | null): void {
 }
 
 /**
+ * Tier-1 (RI-23): a successful NON-agent outcome (e.g. transcribe-only). status
+ * stays 'done' (it WAS handled — not pending, not unanswered) with response_sent_at
+ * set, and dropped_reason carries the handled-kind for audit. Crucially NOT
+ * status='dropped' — buildContextAvailabilityPrompt warns only on 'dropped' rows,
+ * and this is a successful outcome, not a loss.
+ */
+export function markHandledNoAgent(rowId: number | null, reason: string): void {
+  updateStatus(rowId, 'done', { response_sent_at: new Date().toISOString(), dropped_reason: reason });
+}
+
+/**
  * Transition a row to status='dropped' with a reason (e.g. 'watchdog_cancel',
  * 'queue_cleared', 'error'). Best-effort.
  */

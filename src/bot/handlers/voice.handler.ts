@@ -31,8 +31,9 @@ import { sanitizeError, sanitizePath } from '../../utils/sanitize.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
 import { runPostAgentSuccess } from './post-agent.js';
+import { takeFreshTranscribeReply } from './transcribe-pending.js';
 import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.middleware.js';
-import { markProcessing, markDone, markDropped, markError, attachContent } from '../../inbox/input-log.js';
+import { markProcessing, markDone, markDropped, markError, attachContent, markHandledNoAgent } from '../../inbox/input-log.js';
 import { withHardTimeout, HardTimeoutError } from '../../utils/hard-timeout.js';
 
 export async function handleVoice(ctx: Context): Promise<void> {
@@ -69,15 +70,15 @@ export async function handleVoice(ctx: Context): Promise<void> {
   // Dismiss previous follow-up buttons
   await dismissFollowUpButtons(ctx, sessionKey);
 
-  // If this is a reply to the bot's "Transcribe Audio" ForceReply, route to transcribe-only flow
-  // (must run BEFORE session auto-creation — transcribe-only must never spawn an agent session)
+  // RI-23 (Tier-1): route transcribe-only ONLY for a reply to a FRESH /transcribe
+  // ForceReply — matched by exact prompt msg-id + same user + TTL + one-shot. A
+  // stale "Transcribe Audio" bot text no longer hijacks a real voice question;
+  // those fall through to the agent below and ARE answered. (Must run BEFORE
+  // session auto-creation — transcribe-only must never spawn an agent session.)
   const replyTo = ctx.message?.reply_to_message;
-  if (replyTo && replyTo.from?.is_bot) {
-    const replyText = (replyTo as { text?: string }).text || '';
-    if (replyText.includes('Transcribe Audio')) {
-      await handleTranscribeOnly(ctx, chatId, messageId, voice);
-      return;
-    }
+  if (takeFreshTranscribeReply(chatId, ctx.from?.id ?? 0, replyTo?.message_id)) {
+    await handleTranscribeOnly(ctx, chatId, messageId, voice, inputLogRowId);
+    return;
   }
 
   // Auto-resume or create session — voice notes must never be blocked
@@ -442,7 +443,8 @@ async function handleTranscribeOnly(
   ctx: Context,
   chatId: number,
   messageId: number,
-  voice: { file_id: string; file_size?: number; mime_type?: string }
+  voice: { file_id: string; file_size?: number; mime_type?: string },
+  inputLogRowId: number | null,
 ): Promise<void> {
   const ackMsg = await ctx.reply('🎤 Transcribing...', { parse_mode: undefined });
 
@@ -475,9 +477,16 @@ async function handleTranscribeOnly(
     }
 
     await sendTranscriptResult(ctx, transcript);
+    // RI-23 (Tier-1): a successful transcribe-only is a HANDLED outcome, not a
+    // lost input. Attach the transcript + mark done-without-agent so the
+    // catch-all finalizer doesn't tag it 'handler_no_finalize' (would read as
+    // "unanswered") and contextAvailability never sees it as 'dropped'.
+    attachContent(inputLogRowId, transcript);
+    markHandledNoAgent(inputLogRowId, 'transcribe_only');
   } catch (error) {
     const errorMessage = sanitizeError(error);
     console.error('[Transcribe] Voice ForceReply error:', errorMessage);
+    markError(inputLogRowId, errorMessage.slice(0, 200));
     try {
       await ctx.api.editMessageText(chatId, ackMsg.message_id, `❌ ${errorMessage}`, { parse_mode: undefined });
     } catch {
