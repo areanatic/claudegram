@@ -66,7 +66,7 @@ import {
   snapshotRegistry,
 } from '../../handler/request-registry.js';
 import { markCancelled } from '../../handler/request-context.js';
-import { countPending as countPendingInputs } from '../../inbox/input-log.js';
+import { countPending as countPendingInputs, countHandlerNoFinalize } from '../../inbox/input-log.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -3931,10 +3931,14 @@ export async function handleHealth(ctx: Context): Promise<void> {
   // period means inputs are being received but not finalized — the early
   // warning signal RI-19 lacked.
   const pendingInputs = countPendingInputs();
+  // Tier-1: rows the catch-all finalizer closed without an agent answer (early
+  // returns / RI-23 transcribe hijack). A rising number = inputs silently unanswered.
+  const handlerNoFinalize = countHandlerNoFinalize();
 
   lines.push(
     ``,
     `*Input\\-Log pending:* ${pendingInputs >= 0 ? pendingInputs : esc('n/a')}`,
+    `*Input\\-Log no\\-finalize:* ${handlerNoFinalize >= 0 ? handlerNoFinalize : esc('n/a')}`,
     `*Memory FTS5 rows:* ${memoryRowCount >= 0 ? memoryRowCount : esc(`error: ${memoryError ?? 'unknown'}`)}`,
     `*Promise\\.race outside agent path:* ${PROMISE_RACE_BUILD_TIME_COUNT} \\(build\\-time counter; verify: grep \\-rnE 'await Promise\\.race' src/\\)`,
     `*Agent\\-path Promise\\.race:* 0 \\(Sprint 3 RequestContext\\)`,

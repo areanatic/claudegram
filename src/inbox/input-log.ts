@@ -447,6 +447,13 @@ function updateStatus(
  *
  * Agent paths that already called markDone/markDropped/markError are no-ops
  * here (status is no longer open). Idempotent.
+ *
+ * Tier-1 (Codex Pattern-A 2026-05-31): catch-all completions are stamped with
+ * dropped_reason='handler_no_finalize' so that status='done' alone no longer
+ * means "an agent answered". A real agent reply (markDone) leaves dropped_reason
+ * NULL + response_sent_at set; a catch-all finalize (early return, RI-23
+ * transcribe hijack, non-agent media) is now distinguishable for audit
+ * (countHandlerNoFinalize). COALESCE keeps any pre-set reason intact.
  */
 export function finalizeIfOpen(rowId: number | null): void {
   const conn = getDb();
@@ -454,12 +461,35 @@ export function finalizeIfOpen(rowId: number | null): void {
   try {
     conn
       .prepare(
-        `UPDATE input_log SET status = 'done', updated_at = ?
-         WHERE id = ? AND status IN ('received', 'processing')`,
+        `UPDATE input_log
+            SET status = 'done',
+                dropped_reason = COALESCE(dropped_reason, 'handler_no_finalize'),
+                updated_at = ?
+          WHERE id = ? AND status IN ('received', 'processing')`,
       )
       .run(new Date().toISOString(), rowId);
   } catch (err) {
     console.error('[InputLog] finalizeIfOpen failed:', err);
+  }
+}
+
+/**
+ * Count rows completed by the catch-all finalizer rather than by an agent
+ * (status='done' + dropped_reason='handler_no_finalize'). A rising count means
+ * handlers return without answering — e.g. the RI-23 voice hijack or an early
+ * return that should have produced a reply. Audit signal (Tier-1, /health).
+ */
+export function countHandlerNoFinalize(): number {
+  const conn = getDb();
+  if (!conn) return -1;
+  try {
+    const row = conn
+      .prepare("SELECT COUNT(*) AS n FROM input_log WHERE status = 'done' AND dropped_reason = 'handler_no_finalize'")
+      .get() as { n: number };
+    return row.n;
+  } catch (err) {
+    console.error('[InputLog] countHandlerNoFinalize failed:', err);
+    return -1;
   }
 }
 
