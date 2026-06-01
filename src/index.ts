@@ -5,7 +5,8 @@ import { config } from './config.js';
 import { preventSleep, allowSleep } from './utils/caffeinate.js';
 import { stopCleanup } from './telegram/deduplication.js';
 import { closeMemoryDb } from './memory/nexus-memory.js';
-import { closeInputLog, ensureInputLogInitialized, recoverOrphanedInputs } from './inbox/input-log.js';
+import { closeInputLog, ensureInputLogInitialized, claimResumableOrphans } from './inbox/input-log.js';
+import { runAutoResume } from './inbox/auto-resume.js';
 import { acquireLock, releaseLock } from './utils/pid-lock.js';
 import { cancelAllRequests, getActiveSessionKeys } from './claude/request-queue.js';
 import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
@@ -46,12 +47,16 @@ async function main() {
   // Deterministic boot-time init removes that lock-risk surface.
   ensureInputLogInitialized();
 
-  // Akt 1c boot-recovery: any input_log row still 'received'/'processing' is
-  // orphaned from a previous process — mark it dropped BEFORE polling starts,
-  // so it neither lingers as silent drift nor inflates the /health pending count.
-  const recovery = recoverOrphanedInputs();
+  // INV-01 Auto-Resume + boot-recovery: any input_log row still
+  // 'received'/'processing' is orphaned from a previous process. claimResumableOrphans
+  // CLAIMS recent/public/replayable TEXT rows (status→'processing', resume_attempts+1)
+  // so the runner can re-process the user's interrupted task, and drops the rest
+  // (old drift + non-replayable) exactly like the legacy boot-recovery. Runs
+  // synchronously BEFORE polling starts, so the budget is claimed atomically
+  // before any freshly-arriving input — and a new input is never seen as orphaned.
+  const recovery = claimResumableOrphans();
   if (recovery.recovered > 0) {
-    console.log(`[Startup] Boot-recovery: ${recovery.recovered} orphaned input(s) from a previous run marked dropped.`);
+    console.log(`[Startup] Boot-recovery: ${recovery.recovered} orphaned input(s) from a previous run dropped (${recovery.resumable.length} claimed for replay).`);
   }
 
   // Start concurrent runner — updates are processed in parallel,
@@ -97,9 +102,17 @@ async function main() {
   // Codex pre-review: 0.82 CONDITIONAL-GO with all 5 P0s addressed.
   startOmiBridgeWatcher();
 
+  // INV-01 Auto-Resume: replay the CLAIMED orphans through the real agent path
+  // so an interrupted task is finished, not lost. Fire-and-forget AFTER the
+  // runner is polling (the per-session queue + agent need the bot live), exactly
+  // like the watchers above — boot latency must never block responsiveness.
+  void runAutoResume(bot, recovery);
+
   // FIX 4 (2026-05-22): tell users whose in-flight message was lost to a
-  // crash/restart. Only RECENT orphans (see RECENT_ORPHAN_WINDOW_MS) — old
-  // drift is dropped silently. Grouped per chat, capped at 3 snippets, best-effort.
+  // crash/restart. With INV-01 these are now only the NON-replayable recent
+  // orphans (private / media / side-effect-already-started / attempts-exhausted /
+  // over the per-boot cap). Old drift is dropped silently. Grouped per chat,
+  // capped at 3 snippets, best-effort.
   if (recovery.recentOrphans.length > 0) {
     const byChat = new Map<number, typeof recovery.recentOrphans>();
     for (const orphan of recovery.recentOrphans) {

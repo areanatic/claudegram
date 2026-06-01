@@ -35,7 +35,7 @@ import { injectContext, saveMemory } from '../memory/nexus-memory.js';
 import { logConversationTurn } from '../memory/conversation-logger.js';
 import { isPrivate } from '../memory/privacy-state.js';
 import { buildRecentUploadsContext } from '../memory/recent-uploads.js';
-import { getLatestInputLog } from '../inbox/input-log.js';
+import { getLatestInputLog, markSideEffectStarted } from '../inbox/input-log.js';
 
 /**
  * Privacy Mode Phase 1 — neutralizing system-prompt suffix.
@@ -935,13 +935,34 @@ export async function sendToAgent(
       }],
     };
 
+    // INV-01 Auto-Resume (Codex correction #2): flag the durable input_log row
+    // the moment a MUTATING tool STARTS, so the next boot never auto-replays a
+    // turn that may have already performed a non-idempotent external write
+    // (git push, file overwrite, subagent spawn). PreToolUse = before execution,
+    // so even a crash mid-tool leaves the flag set. Telegram push MCP tools are
+    // separately mitigated by withholding telegramCtx on replay; this denylist
+    // covers the native filesystem/shell/subagent tools — extend it if new
+    // mutating native tools land. Runs AFTER the security hook so a denied
+    // self-management command is not flagged. No-op when there is no row id
+    // (non-queued/test paths).
+    const MUTATING_TOOLS = new Set(['Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Task']);
+    const sideEffectPreToolUse: HookCallbackMatcher = {
+      hooks: [async (input) => {
+        const i = input as { tool_name?: string };
+        if (i.tool_name && MUTATING_TOOLS.has(i.tool_name)) {
+          markSideEffectStarted(options.currentInputLogRowId ?? null, i.tool_name);
+        }
+        return { continue: true };
+      }],
+    };
+
     const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> =
       LOG_LEVELS[getLogLevel()] >= LOG_LEVELS.verbose
         ? {
           ...preCompactHook,
           ...verboseHooks,
-          // security hook runs first, verbose-logging hook (if any) after
-          PreToolUse: [securityPreToolUse, ...(verboseHooks.PreToolUse ?? [])],
+          // security hook runs first, then side-effect flag, then verbose-logging
+          PreToolUse: [securityPreToolUse, sideEffectPreToolUse, ...(verboseHooks.PreToolUse ?? [])],
           SessionStart: [{
             hooks: [async (input) => {
               logAt('basic', '[Hook] SessionStart', input);
@@ -955,7 +976,7 @@ export async function sendToAgent(
             }],
           }],
         }
-        : { ...preCompactHook, PreToolUse: [securityPreToolUse] };
+        : { ...preCompactHook, PreToolUse: [securityPreToolUse, sideEffectPreToolUse] };
 
     // Validate cwd exists — stale sessions may reference paths from another OS
     let cwd = session.workingDirectory;
