@@ -63,8 +63,14 @@ function iso(offsetMs: number): string {
 }
 
 (async () => {
-  const { recordInput, claimResumableOrphans, markSideEffectStarted, ensureInputLogInitialized } =
-    await import('./input-log.js');
+  const {
+    recordInput,
+    claimResumableOrphans,
+    markSideEffectStarted,
+    ensureInputLogInitialized,
+    clampBootCap,
+    hasNewerDuplicate,
+  } = await import('./input-log.js');
 
   // Force the module to create the schema before any direct test connection
   // (clearRows/setRow) touches the DB file.
@@ -173,6 +179,28 @@ function iso(offsetMs: number): string {
   // A side-effect row is now excluded from claim.
   const c4 = claimResumableOrphans();
   check(!c4.resumable.some((o) => o.id === S), 'side-effect row never claimed');
+
+  // ── Phase 5: clampBootCap hard ceiling [1,5] (Codex P1-1) ───────────────────
+  check(clampBootCap(undefined) === 5, 'unset → 5');
+  check(clampBootCap('5') === 5, "'5' → 5");
+  check(clampBootCap('50') === 5, "'50' clamped → 5");
+  check(clampBootCap('-1') === 1, "'-1' clamped → 1");
+  check(clampBootCap('0') === 5, "'0' → default 5");
+  check(clampBootCap('3') === 3, "'3' → 3");
+  check(clampBootCap('abc') === 5, "garbage → 5");
+  check(clampBootCap('4.9') === 4, "'4.9' floored → 4");
+
+  // ── Phase 6: hasNewerDuplicate dedup (Codex P1-2) ───────────────────────────
+  clearRows();
+  const O = insert({ chatId: 50, sessionKey: '50', receivedAtMs: -120_000, rawContent: 'same text' });
+  // newer row, identical content, same session → duplicate
+  const N = insert({ chatId: 50, sessionKey: '50', receivedAtMs: -30_000, rawContent: 'same text' });
+  check(hasNewerDuplicate('50', 'same text', O, getRow(O).received_at as string), 'newer identical re-send detected');
+  check(!hasNewerDuplicate('50', 'same text', N, getRow(N).received_at as string), 'newest row has no newer duplicate');
+  check(!hasNewerDuplicate('50', 'different text', O, getRow(O).received_at as string), 'different content is NOT a duplicate');
+  // different session with same text must not match
+  insert({ chatId: 51, sessionKey: '51', receivedAtMs: -10_000, rawContent: 'same text' });
+  check(!hasNewerDuplicate('50', 'same text', N, getRow(N).received_at as string), 'cross-session same text does not dedupe');
 
   console.log(`✅ input-log auto-resume claim: ${pass}/${pass} cases PASS`);
 

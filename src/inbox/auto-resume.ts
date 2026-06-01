@@ -32,7 +32,14 @@ import type { Bot } from 'grammy';
 import { queueRequest } from '../claude/request-queue.js';
 import { sendToAgent, StaleTurnError } from '../claude/agent.js';
 import { splitMessage } from '../telegram/markdown.js';
-import { markDone, markDropped, markError, type ClaimResult, type ResumableOrphan } from './input-log.js';
+import {
+  hasNewerDuplicate,
+  markDone,
+  markDropped,
+  markError,
+  type ClaimResult,
+  type ResumableOrphan,
+} from './input-log.js';
 
 const PREFACE_SNIPPET_MAX = 120; // allow-hardcoded: reason="UI snippet length for resume preface, not a timeout"
 
@@ -65,6 +72,15 @@ async function sendChunked(bot: Bot, chatId: number, text: string): Promise<void
 }
 
 async function replayOne(bot: Bot, row: ResumableOrphan): Promise<void> {
+  // Codex Pattern-B P1-2: if the user already re-sent the IDENTICAL message
+  // after the restart, a fresh live turn already owes them that answer — skip
+  // the replay to avoid a double-answer. Exact-content + strictly-later match,
+  // so a different unanswered input is never suppressed.
+  if (hasNewerDuplicate(row.sessionKey, row.rawContent, row.id, row.receivedAt)) {
+    console.log(`[AutoResume] row ${row.id} superseded by an identical live re-send — skipping replay`);
+    markDropped(row.id, 'auto_resume_deduped_newer');
+    return;
+  }
   try {
     const response = await queueRequest(row.sessionKey, row.rawContent, async (turnEpoch) =>
       sendToAgent(row.sessionKey, row.rawContent, {
@@ -85,9 +101,13 @@ async function replayOne(bot: Bot, row: ResumableOrphan): Promise<void> {
     markDone(row.id);
   } catch (err) {
     if (err instanceof StaleTurnError) {
-      // A live user turn superseded the replay — the user is actively chatting
-      // and their turn owns the reply. Finalize without a re-send notice.
-      console.log(`[AutoResume] row ${row.id} superseded by a live turn — skipping replay`);
+      // Edge case (Codex Pattern-B P1-2): a newer turn for this session advanced
+      // the epoch WHILE this replay was suspended in the queue (not the normal
+      // FIFO path — the queue serializes, so normally replay and a live resend
+      // run sequentially). When it does happen, the newer turn owns the reply;
+      // finalize this one without a re-send notice. The common "user re-sent the
+      // same message" case is handled earlier by the hasNewerDuplicate dedup.
+      console.log(`[AutoResume] row ${row.id} hit a stale-turn epoch advance — skipping replay`);
       markDropped(row.id, 'auto_resume_superseded');
       return;
     }

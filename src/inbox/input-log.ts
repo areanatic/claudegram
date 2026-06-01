@@ -697,11 +697,19 @@ export interface ClaimResult {
 }
 
 /**
- * Hard cap on rows replayed per boot (Codex Q6). A deploy in the middle of a
- * voice/text burst must not spawn dozens of concurrent agent turns at once; the
- * overflow falls back to a re-send notice.
+ * Hard cap on rows replayed per boot (Codex Q6 + Pattern-B P1-1). A deploy in
+ * the middle of a voice/text burst must not spawn dozens of concurrent agent
+ * turns; the overflow falls back to a re-send notice. The env override is
+ * CLAMPED to [1,5] so a misconfigured `NEXUSGRAM_MAX_BOOT_RESUME=50` (or a
+ * negative value → unlimited SQLite `LIMIT`) can never breach the invariant.
  */
-const MAX_BOOT_RESUME = Number(process.env.NEXUSGRAM_MAX_BOOT_RESUME) || 5; // allow-hardcoded: reason="per-boot replay fan-out cap, tunable via env"
+const BOOT_CAP_HARD_MAX = 5; // allow-hardcoded: reason="per-boot replay fan-out hard ceiling (Codex P1-1)"
+export function clampBootCap(raw: string | undefined): number {
+  const parsed = Number(raw);
+  const v = Number.isFinite(parsed) && parsed !== 0 ? parsed : BOOT_CAP_HARD_MAX; // 0/NaN/unset → default
+  return Math.min(BOOT_CAP_HARD_MAX, Math.max(1, Math.floor(v)));
+}
+const MAX_BOOT_RESUME = clampBootCap(process.env.NEXUSGRAM_MAX_BOOT_RESUME);
 
 /**
  * Max times a single row is EVER handed to the agent across the bot's whole
@@ -811,6 +819,39 @@ export function claimResumableOrphans(): ClaimResult {
   } catch (err) {
     console.error('[InputLog] claimResumableOrphans failed:', err);
     return { resumable: [], recentOrphans: [], recovered: 0 };
+  }
+}
+
+/**
+ * INV-01 Auto-Resume (Codex Pattern-B P1-2): true if a NEWER row with the SAME
+ * raw_content already exists for this session — i.e. the user re-sent the
+ * identical message after the restart. Used by runAutoResume to skip the replay
+ * of an orphan whose answer is already owed to a fresh live turn, preventing a
+ * double-answer. Deliberately matches on EXACT content + a strictly-later
+ * received_at, so it only dedupes genuine duplicates and never suppresses a
+ * different (still-unanswered) input. Best-effort; on error returns false
+ * (favours answering over silently dropping).
+ */
+export function hasNewerDuplicate(
+  sessionKey: string,
+  rawContent: string,
+  excludeRowId: number,
+  afterReceivedAt: string,
+): boolean {
+  const conn = getDb();
+  if (!conn) return false;
+  try {
+    const row = conn
+      .prepare(
+        `SELECT 1 FROM input_log
+          WHERE session_key = ? AND raw_content = ? AND id <> ? AND received_at > ?
+          LIMIT 1`,
+      )
+      .get(sessionKey, rawContent, excludeRowId, afterReceivedAt);
+    return row !== undefined;
+  } catch (err) {
+    console.error('[InputLog] hasNewerDuplicate failed:', err);
+    return false;
   }
 }
 
