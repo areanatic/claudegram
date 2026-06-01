@@ -122,10 +122,13 @@ async function main() {
     }
     for (const [chatId, orphans] of byChat) {
       const snippets = orphans.slice(0, 3).map((o) => {
-        const preview = (o.rawContent || `(${o.inputType})`)
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(0, 120);
+        // Privacy (review round-2): never echo the CONTENT of a private message
+        // in the restart notice — defensive for group chats. The user still
+        // learns a private message was interrupted, just not its text.
+        const preview =
+          o.privacy === 'private'
+            ? '(private Nachricht)'
+            : (o.rawContent || `(${o.inputType})`).replace(/\s+/g, ' ').trim().slice(0, 120);
         return `• ${preview}`;
       });
       const notice =

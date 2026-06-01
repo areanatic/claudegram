@@ -595,6 +595,9 @@ export interface OrphanInput {
   inputType: string;
   rawContent: string | null;
   receivedAt: string;
+  /** So the boot re-send notice can REDACT the snippet of a private row instead
+   *  of echoing its content (defensive for group chats). */
+  privacy: 'public' | 'private';
 }
 
 /**
@@ -639,7 +642,7 @@ export function recoverOrphanedInputs(): RecoveryResult {
     const recentOrphans = conn
       .prepare(
         `SELECT chat_id AS chatId, input_type AS inputType,
-                raw_content AS rawContent, received_at AS receivedAt
+                raw_content AS rawContent, received_at AS receivedAt, privacy
            FROM input_log
           WHERE status IN ('received', 'processing')
             AND received_at <= ? AND received_at >= ?`,
@@ -804,7 +807,7 @@ export function claimResumableOrphans(): ClaimResult {
       const recentOrphans = conn
         .prepare(
           `SELECT chat_id AS chatId, input_type AS inputType,
-                  raw_content AS rawContent, received_at AS receivedAt
+                  raw_content AS rawContent, received_at AS receivedAt, privacy
              FROM input_log
             WHERE status IN ('received','processing')
               AND received_at <= @cutoff AND received_at >= @recentCutoff
