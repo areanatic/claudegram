@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { sessionHistory, SessionHistoryEntry } from './session-history.js';
 import { config } from '../config.js';
-import { effectiveWindowTokens, DEFAULT_CONTEXT_WINDOW } from './context-pressure.js';
+import { exceedsBootWindow, effectiveWindowTokens } from './context-pressure.js';
 
 /**
  * Resolve a stored working directory to a valid path on this system.
@@ -68,10 +68,9 @@ class SessionManager {
   private isContextFullAtBoot(session: Session): boolean {
     if (!session.claudeSessionId) return false;
     // No live SDK usage exists at boot — derive the window from the default
-    // model (in-memory per-session model is empty after a restart).
-    const windowTokens = effectiveWindowTokens(config.CLAUDE_DEFAULT_MODEL);
-    const baseline200kBytes = 7 * 1024 * 1024; // allow-hardcoded: reason="Bug-A boot-airbag baseline ~80% of 200k for text-dense JSONL; scaled by window below"
-    const mbLimit = baseline200kBytes * (windowTokens / DEFAULT_CONTEXT_WINDOW);
+    // model (in-memory per-session model is empty after a restart). The
+    // size→threshold decision is the pure, unit-tested exceedsBootWindow().
+    const model = config.CLAUDE_DEFAULT_MODEL;
     const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
     if (!fs.existsSync(claudeProjectsDir)) return false;
     try {
@@ -80,10 +79,10 @@ class SessionManager {
         const sessionFile = path.join(claudeProjectsDir, dir, `${session.claudeSessionId}.jsonl`);
         if (fs.existsSync(sessionFile)) {
           const { size } = fs.statSync(sessionFile);
-          if (size > mbLimit) {
+          if (exceedsBootWindow(size, model)) {
             console.log(
-              `[SessionRotation] JSONL context-full at boot: ${Math.round(size / 1024 / 1024)}MB > ` +
-                `${Math.round(mbLimit / 1024 / 1024)}MB (window ${windowTokens})`,
+              `[SessionRotation] JSONL context-full at boot: ${Math.round(size / 1024 / 1024)}MB ` +
+                `(window ${effectiveWindowTokens(model)}, model ${model})`,
             );
             return true;
           }

@@ -12,6 +12,7 @@ import {
   classifyContextPressure,
   occupancyTokens,
   effectiveWindowTokens,
+  exceedsBootWindow,
   DEFAULT_CONTEXT_WINDOW,
   LARGE_CONTEXT_WINDOW,
   CONTEXT_ROTATE_WARN,
@@ -111,3 +112,26 @@ for (const [model, want, msg] of winCases) {
   winPass++;
 }
 console.log(`✅ effectiveWindowTokens: ${winPass}/${winCases.length} cases PASS`);
+
+// ── exceedsBootWindow: boot-airbag size threshold, window-scaled (INV-01) ──
+// 7MB baseline at 200k; scales to 35MB at 1M so a healthy large-window session
+// is NOT false-rotated while the Bug-A 9.5MB/200k death-spiral still rotates.
+const MB = 1024 * 1024; // allow-hardcoded: reason="MB unit for test byte-size fixtures"
+let bwPass = 0;
+const bwCases: Array<[number, string | undefined | null, boolean, string]> = [
+  [7 * MB + 1, 'sonnet', true, '7MB+1 @200k → rotate'],
+  [7 * MB - 1, 'sonnet', false, 'just under 7MB @200k → keep'],
+  [Math.round(9.5 * MB), 'sonnet', true, 'Bug-A 9.5MB @200k → rotate'],
+  [9.5 * MB | 0, 'claude-opus-4-8', false, '9.5MB @1M → keep (no false-rotate)'],
+  [36 * MB, 'claude-opus-4-8', true, '36MB @1M → rotate'],
+  [34 * MB, 'claude-opus-4-8', false, '34MB @1M → keep'],
+  [100 * MB, undefined, true, 'huge @unknown(200k) → rotate'],
+  [0, 'sonnet', false, '0 bytes → never'],
+  [-5, 'sonnet', false, 'negative → never'],
+  [NaN, 'sonnet', false, 'NaN → never'],
+];
+for (const [size, model, want, msg] of bwCases) {
+  assert.equal(exceedsBootWindow(size, model), want, `exceedsBootWindow: ${msg}`);
+  bwPass++;
+}
+console.log(`✅ exceedsBootWindow: ${bwPass}/${bwCases.length} cases PASS`);

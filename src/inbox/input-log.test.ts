@@ -69,6 +69,7 @@ function iso(offsetMs: number): string {
     markSideEffectStarted,
     ensureInputLogInitialized,
     clampBootCap,
+    clampInt,
     hasNewerDuplicate,
   } = await import('./input-log.js');
 
@@ -189,6 +190,12 @@ function iso(offsetMs: number): string {
   check(clampBootCap('3') === 3, "'3' → 3");
   check(clampBootCap('abc') === 5, "garbage → 5");
   check(clampBootCap('4.9') === 4, "'4.9' floored → 4");
+  // clampInt with the MAX_RESUME_ATTEMPTS config (def=2, [1,5]) — Codex round-2 P2
+  check(clampInt(undefined, 2, 1, 5) === 2, 'attempts unset → 2');
+  check(clampInt('0', 2, 1, 5) === 2, "attempts '0' → default 2");
+  check(clampInt('50', 2, 1, 5) === 5, "attempts '50' clamped → 5");
+  check(clampInt('-1', 2, 1, 5) === 1, "attempts '-1' clamped → 1");
+  check(clampInt('3', 2, 1, 5) === 3, "attempts '3' → 3");
 
   // ── Phase 6: hasNewerDuplicate dedup (Codex P1-2) ───────────────────────────
   clearRows();
@@ -201,6 +208,19 @@ function iso(offsetMs: number): string {
   // different session with same text must not match
   insert({ chatId: 51, sessionKey: '51', receivedAtMs: -10_000, rawContent: 'same text' });
   check(!hasNewerDuplicate('50', 'same text', N, getRow(N).received_at as string), 'cross-session same text does not dedupe');
+
+  // status filter (Codex round-2 P2): only a newer row that WILL be answered
+  // (received/processing/done) suppresses O's replay; a dropped/error one must
+  // NOT, or O's question would go permanently unanswered.
+  const Ot = getRow(O).received_at as string;
+  setRow(N, { status: 'dropped' });
+  check(!hasNewerDuplicate('50', 'same text', O, Ot), 'newer DROPPED duplicate does NOT suppress');
+  setRow(N, { status: 'error' });
+  check(!hasNewerDuplicate('50', 'same text', O, Ot), 'newer ERROR duplicate does NOT suppress');
+  setRow(N, { status: 'done' });
+  check(hasNewerDuplicate('50', 'same text', O, Ot), 'newer DONE duplicate suppresses (already answered)');
+  setRow(N, { status: 'processing' });
+  check(hasNewerDuplicate('50', 'same text', O, Ot), 'newer PROCESSING duplicate suppresses (live turn owns it)');
 
   console.log(`✅ input-log auto-resume claim: ${pass}/${pass} cases PASS`);
 

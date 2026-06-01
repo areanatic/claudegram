@@ -91,9 +91,11 @@ async function replayOne(bot: Bot, row: ResumableOrphan): Promise<void> {
     const answer = (response?.text ?? '').trim();
     if (!answer) {
       // Agent produced no text (e.g. a turn that only used the withheld
-      // push-tools). Treat as not-completed → re-send.
-      markError(row.id, 'auto_resume_empty_response');
+      // push-tools). Notice FIRST, then markError (Codex round-2 P2): a process
+      // crash between must leave the row 'processing' (→ re-claimed/retried next
+      // boot), never 'error' with the user never told.
       await sendChunked(bot, row.chatId, buildResendNotice(row.rawContent));
+      markError(row.id, 'auto_resume_empty_response');
       return;
     }
     // Reply FIRST, then mark done — a send failure must never look "answered".
@@ -113,10 +115,13 @@ async function replayOne(bot: Bot, row: ResumableOrphan): Promise<void> {
     }
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[AutoResume] replay failed for row ${row.id} (${row.sessionKey}):`, msg);
-    markError(row.id, `auto_resume_error:${msg.slice(0, 80)}`);
+    // Notice FIRST (best-effort), then markError (Codex round-2 P2): a crash
+    // between must leave the row 'processing' (re-claimed next boot), not a
+    // silent 'error' the user never heard about.
     try {
       await sendChunked(bot, row.chatId, buildResendNotice(row.rawContent));
     } catch { /* best-effort */ }
+    markError(row.id, `auto_resume_error:${msg.slice(0, 80)}`);
   }
 }
 

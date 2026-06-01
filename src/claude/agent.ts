@@ -946,10 +946,20 @@ export async function sendToAgent(
     // self-management command is not flagged. No-op when there is no row id
     // (non-queued/test paths).
     const MUTATING_TOOLS = new Set(['Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Task']);
+    // Review round-2 (P1, both engines): the Master's BOT_TOOLS also grants
+    // non-idempotent nexusgram MCP WRITE-tools — inbox_route (fs move),
+    // publish_telegraph (external POST), send_file (Telegram push). An
+    // interrupted turn that ran one of these must be excluded from auto-replay
+    // too, else the replay re-runs the prompt about already-done work. Read MCP
+    // tools (search/read/list/fetch/extract) are idempotent → not flagged.
+    // Matched by suffix so the mcp__<server>__ prefix is irrelevant.
+    const MUTATING_MCP_SUFFIXES = ['nexusgram_inbox_route', 'nexusgram_publish_telegraph', 'nexusgram_send_file'];
+    const isMutatingTool = (name: string): boolean =>
+      MUTATING_TOOLS.has(name) || MUTATING_MCP_SUFFIXES.some((s) => name.endsWith(s));
     const sideEffectPreToolUse: HookCallbackMatcher = {
       hooks: [async (input) => {
         const i = input as { tool_name?: string };
-        if (i.tool_name && MUTATING_TOOLS.has(i.tool_name)) {
+        if (i.tool_name && isMutatingTool(i.tool_name)) {
           markSideEffectStarted(options.currentInputLogRowId ?? null, i.tool_name);
         }
         return { continue: true };

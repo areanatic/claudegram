@@ -96,3 +96,21 @@ export function effectiveWindowTokens(model: string | undefined | null): number 
   }
   return DEFAULT_CONTEXT_WINDOW;
 }
+
+/** Boot-airbag baseline (INV-01): ~80% of a 200k window for text-dense --resume
+ *  JSONLs (Bug-A: a 9.5MB JSONL sat at ~196.8k/200k = death-spiral). */
+export const BOOT_AIRBAG_BASELINE_BYTES = 7 * 1024 * 1024; // allow-hardcoded: reason="Bug-A boot-airbag baseline ~80% of 200k for text-dense JSONL; scaled by window in exceedsBootWindow"
+
+/**
+ * Pure boot-airbag threshold (INV-01, extracted for unit coverage): does a
+ * --resume JSONL of `sizeBytes` exceed the airbag limit for `model`'s context
+ * window? The 7MB@200k baseline scales with the window (35MB@1M) so the Bug-A
+ * 200k death-spiral still rotates while a healthy 1M session is NOT
+ * false-rotated. Size-only — the caller never reads JSONL content.
+ */
+export function exceedsBootWindow(sizeBytes: number, model: string | undefined | null): boolean {
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) return false;
+  const windowTokens = effectiveWindowTokens(model);
+  const mbLimit = BOOT_AIRBAG_BASELINE_BYTES * (windowTokens / DEFAULT_CONTEXT_WINDOW);
+  return sizeBytes > mbLimit;
+}

@@ -620,6 +620,12 @@ const RECENT_ORPHAN_WINDOW_MS = 600_000; // allow-hardcoded: reason="10min boot-
  *
  * FIX 4 (2026-05-22): also returns the RECENT orphans so the caller can tell
  * the affected user their in-flight message was lost to the crash/restart.
+ *
+ * @deprecated INV-01 (2026-06-01): superseded by `claimResumableOrphans()`,
+ * which CLAIMS+replays recoverable orphans instead of blanket-dropping them.
+ * The boot path (index.ts) no longer calls this. Do NOT re-import it — that
+ * would reinstate the drop-only behaviour that lost the user's in-flight task.
+ * Kept only as a short-term rollback anchor; remove in a post-canary cleanup.
  */
 export function recoverOrphanedInputs(): RecoveryResult {
   const conn = getDb();
@@ -704,19 +710,31 @@ export interface ClaimResult {
  * negative value → unlimited SQLite `LIMIT`) can never breach the invariant.
  */
 const BOOT_CAP_HARD_MAX = 5; // allow-hardcoded: reason="per-boot replay fan-out hard ceiling (Codex P1-1)"
-export function clampBootCap(raw: string | undefined): number {
+
+/**
+ * Clamp an integer env override to [min,max] with a default for unset/0/NaN.
+ * Shared by both replay guards so the clamp invariant is proven once (tested via
+ * clampBootCap + clampInt cases). 0 is treated as unset (→ default), negatives
+ * and overshoots are clamped into range.
+ */
+export function clampInt(raw: string | undefined, def: number, min: number, max: number): number {
   const parsed = Number(raw);
-  const v = Number.isFinite(parsed) && parsed !== 0 ? parsed : BOOT_CAP_HARD_MAX; // 0/NaN/unset → default
-  return Math.min(BOOT_CAP_HARD_MAX, Math.max(1, Math.floor(v)));
+  const v = Number.isFinite(parsed) && parsed !== 0 ? Math.floor(parsed) : def;
+  return Math.min(max, Math.max(min, v));
+}
+export function clampBootCap(raw: string | undefined): number {
+  return clampInt(raw, BOOT_CAP_HARD_MAX, 1, BOOT_CAP_HARD_MAX);
 }
 const MAX_BOOT_RESUME = clampBootCap(process.env.NEXUSGRAM_MAX_BOOT_RESUME);
 
 /**
  * Max times a single row is EVER handed to the agent across the bot's whole
  * lifetime — crash-loop / poison-message guard (Teil B §3). Default 2 survives
- * one transient crash plus one genuine attempt.
+ * one transient crash plus one genuine attempt. CLAMPED to [1,5] (Codex round-2
+ * P2): a negative env value would stop all replay, a huge one would prolong a
+ * crash-loop — neither may breach the poison-message ceiling.
  */
-const MAX_RESUME_ATTEMPTS = Number(process.env.NEXUSGRAM_MAX_RESUME_ATTEMPTS) || 2; // allow-hardcoded: reason="poison-input replay ceiling, tunable via env"
+const MAX_RESUME_ATTEMPTS = clampInt(process.env.NEXUSGRAM_MAX_RESUME_ATTEMPTS, 2, 1, 5); // allow-hardcoded: reason="poison-input replay ceiling, clamped [1,5]"
 
 /**
  * Boot-recovery + Auto-Resume (INV-01). Replaces the blanket-drop boot path:
@@ -841,10 +859,15 @@ export function hasNewerDuplicate(
   const conn = getDb();
   if (!conn) return false;
   try {
+    // Codex round-2 P2: only dedupe against a row that will ACTUALLY be answered
+    // — a live turn (received/processing) or one already answered (done). A
+    // newer identical row that is itself dropped/error must NOT suppress this
+    // replay, or the user's question would go permanently unanswered.
     const row = conn
       .prepare(
         `SELECT 1 FROM input_log
           WHERE session_key = ? AND raw_content = ? AND id <> ? AND received_at > ?
+            AND status IN ('received','processing','done')
           LIMIT 1`,
       )
       .get(sessionKey, rawContent, excludeRowId, afterReceivedAt);
