@@ -11,6 +11,9 @@ import assert from 'node:assert/strict';
 import {
   classifyContextPressure,
   occupancyTokens,
+  effectiveWindowTokens,
+  DEFAULT_CONTEXT_WINDOW,
+  LARGE_CONTEXT_WINDOW,
   CONTEXT_ROTATE_WARN,
   CONTEXT_ROTATE_HARD,
   type ContextPressure,
@@ -85,3 +88,26 @@ assert.equal(classifyContextPressure(occupancyTokens(sessFull), 200_000), 'rotat
 occPass++;
 
 console.log(`✅ occupancyTokens: ${occPass}/${occCases.length + 2} cases PASS`);
+
+// ── effectiveWindowTokens: boot-airbag model→window map (INV-01, Codex #5) ──
+// opus-4-7/opus-4-8 must NOT be mapped to 200k (would false-rotate a healthy
+// large-window session); sonnet/haiku/opus-4-6/'opus'/unknown stay 200k so the
+// Bug-A 196.8k/200k death-spiral still rotates at boot.
+let winPass = 0;
+const winCases: Array<[string | undefined | null, number, string]> = [
+  ['sonnet', DEFAULT_CONTEXT_WINDOW, 'sonnet → 200k'],
+  ['claude-haiku-4-5', DEFAULT_CONTEXT_WINDOW, 'haiku → 200k'],
+  ['opus', DEFAULT_CONTEXT_WINDOW, "SDK 'opus' alias (=opus-4-6) → 200k"],
+  ['claude-opus-4-6', DEFAULT_CONTEXT_WINDOW, 'opus-4-6 → 200k'],
+  ['claude-opus-4-7', LARGE_CONTEXT_WINDOW, 'opus-4-7 → 1M (Codex #5: not blind-200k)'],
+  ['claude-opus-4-8', LARGE_CONTEXT_WINDOW, 'opus-4-8 → 1M'],
+  ['some-sonnet-1m', LARGE_CONTEXT_WINDOW, '1m variant → 1M'],
+  ['', DEFAULT_CONTEXT_WINDOW, 'empty → 200k default'],
+  [undefined, DEFAULT_CONTEXT_WINDOW, 'undefined → 200k default'],
+  [null, DEFAULT_CONTEXT_WINDOW, 'null → 200k default'],
+];
+for (const [model, want, msg] of winCases) {
+  assert.equal(effectiveWindowTokens(model), want, `effectiveWindowTokens: ${msg}`);
+  winPass++;
+}
+console.log(`✅ effectiveWindowTokens: ${winPass}/${winCases.length} cases PASS`);

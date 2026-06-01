@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { sessionHistory, SessionHistoryEntry } from './session-history.js';
 import { config } from '../config.js';
+import { effectiveWindowTokens, DEFAULT_CONTEXT_WINDOW } from './context-pressure.js';
 
 /**
  * Resolve a stored working directory to a valid path on this system.
@@ -46,16 +47,31 @@ class SessionManager {
   }
 
   /**
-   * Check if the Claude session JSONL exceeds 20 MB (115MB incident prevention).
-   * Searches ~/.claude/projects/ for the session file by claudeSessionId.
+   * Boot airbag (INV-01): is the resumed/in-memory Claude session JSONL already
+   * near-full for its model's context window?
+   *
+   * Codex correction #4: this MUST run in BOTH `getOrResumeSession` branches —
+   * the in-memory `existing` path AND the post-reboot `resumed` path. Before this
+   * fix it only ran on `existing`; after a reboot `sessions` is empty, so
+   * `resumeLastSession` returned an oversized session WITHOUT a check and the
+   * very next (auto-resumed) turn just reproduced "Prompt is too long".
+   *
+   * Approach: a file-size proxy on the --resume JSONL, scaled to the model's
+   * context window. 7 MB ≈ ~80% of a 200k window for text-dense transcripts
+   * (Bug-A: a 9.5 MB JSONL sat at ~196.8k/200k = death-spiral). Scaling by the
+   * window (Codex #5) keeps the 200k case rotating while NOT false-rotating a
+   * healthy large-window (1M) session. Size-only (`statSync`) — it NEVER reads
+   * JSONL content, so there is no privacy tail-read on a resumed session. The
+   * primary guard remains the usage-based rotation in agent.ts
+   * (maybeRotateAfterContextPressure); this is the second line, at boot.
    */
-  private isOversized(session: Session): boolean {
+  private isContextFullAtBoot(session: Session): boolean {
     if (!session.claudeSessionId) return false;
-    // Bug-A boot-airbag: 20 MB fired far too late — a 9.5 MB JSONL was already
-    // at ~196.8k tokens (death-spiral). 7 MB ≈ 80% of the 200k window for
-    // text-dense transcripts. Primary guard is the usage-based rotation in
-    // agent.ts (maybeRotateAfterContextPressure); this is the second line.
-    const MB_LIMIT = 7 * 1024 * 1024; // allow-hardcoded: reason="Bug-A boot-airbag ~80% of 200k for text-dense JSONL; primary guard is usage-based in agent.ts; tunable via config later"
+    // No live SDK usage exists at boot — derive the window from the default
+    // model (in-memory per-session model is empty after a restart).
+    const windowTokens = effectiveWindowTokens(config.CLAUDE_DEFAULT_MODEL);
+    const baseline200kBytes = 7 * 1024 * 1024; // allow-hardcoded: reason="Bug-A boot-airbag baseline ~80% of 200k for text-dense JSONL; scaled by window below"
+    const mbLimit = baseline200kBytes * (windowTokens / DEFAULT_CONTEXT_WINDOW);
     const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
     if (!fs.existsSync(claudeProjectsDir)) return false;
     try {
@@ -64,8 +80,11 @@ class SessionManager {
         const sessionFile = path.join(claudeProjectsDir, dir, `${session.claudeSessionId}.jsonl`);
         if (fs.existsSync(sessionFile)) {
           const { size } = fs.statSync(sessionFile);
-          if (size > MB_LIMIT) {
-            console.log(`[SessionRotation] JSONL oversized: ${Math.round(size / 1024 / 1024)}MB`);
+          if (size > mbLimit) {
+            console.log(
+              `[SessionRotation] JSONL context-full at boot: ${Math.round(size / 1024 / 1024)}MB > ` +
+                `${Math.round(mbLimit / 1024 / 1024)}MB (window ${windowTokens})`,
+            );
             return true;
           }
           return false;
@@ -101,8 +120,8 @@ class SessionManager {
         this.sessions.delete(sessionKey);
         return this.createSession(sessionKey, workDir);
       }
-      if (this.isOversized(existing)) {
-        console.log(`[SessionRotation] Session oversized for ${sessionKey}, starting fresh session`);
+      if (this.isContextFullAtBoot(existing)) {
+        console.log(`[SessionRotation] Session context-full for ${sessionKey}, starting fresh session`);
         const workDir = existing.workingDirectory;
         this.sessions.delete(sessionKey);
         return this.createSession(sessionKey, workDir);
@@ -114,6 +133,16 @@ class SessionManager {
     if (resumed) {
       if (this.isNewDay(resumed)) {
         console.log(`[SessionRotation] Resumed session from previous day for ${sessionKey}, starting fresh`);
+        const workDir = resumed.workingDirectory;
+        this.sessions.delete(sessionKey);
+        return this.createSession(sessionKey, workDir);
+      }
+      // Codex correction #4 (INV-01): the boot airbag MUST also fire here. After
+      // a reboot the in-memory branch above is skipped entirely; without this
+      // check a resumed near-full session would be handed straight to the
+      // (auto-resumed) turn and only reproduce "Prompt is too long".
+      if (this.isContextFullAtBoot(resumed)) {
+        console.log(`[SessionRotation] Resumed session context-full at boot for ${sessionKey}, starting fresh`);
         const workDir = resumed.workingDirectory;
         this.sessions.delete(sessionKey);
         return this.createSession(sessionKey, workDir);

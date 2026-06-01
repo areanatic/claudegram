@@ -69,3 +69,30 @@ export function classifyContextPressure(usedTokens: number, contextWindow: numbe
   if (ratio >= CONTEXT_ROTATE_WARN) return 'warned';
   return 'none';
 }
+
+/** Default context window — SDK 0.2.63 200k-class (sonnet/haiku/opus-4-6). */
+export const DEFAULT_CONTEXT_WINDOW = 200_000;
+/** Large-window class — opus-4-7 (observed cache_read ~720k) / opus-4-8 (1M). */
+export const LARGE_CONTEXT_WINDOW = 1_000_000;
+
+/**
+ * Best-effort model → context-window mapping for the BOOT airbag (INV-01),
+ * where no live SDK usage exists yet — the live rotation reads
+ * `usage.contextWindow` straight from the SDK, but at process boot we only have
+ * the on-disk JSONL.
+ *
+ * Codex correction #5: opus-4-7 must NOT be blind-mapped to 200k — it ran with
+ * cache_read ~720k, i.e. a large window; mapping it to 200k would false-rotate a
+ * perfectly healthy session. Known large-window models → 1M; everything else
+ * (sonnet, haiku, opus-4-6, the SDK 'opus' alias, unknown) → 200k, which keeps
+ * the Bug-A 196.8k/200k death-spiral case rotating correctly. Extend the
+ * large-window list when the SDK gains real 1M opus-4-8 support.
+ */
+export function effectiveWindowTokens(model: string | undefined | null): number {
+  const m = (model ?? '').toLowerCase();
+  if (!m) return DEFAULT_CONTEXT_WINDOW;
+  if (m.includes('opus-4-7') || m.includes('opus-4-8') || m.includes('1m')) {
+    return LARGE_CONTEXT_WINDOW;
+  }
+  return DEFAULT_CONTEXT_WINDOW;
+}
