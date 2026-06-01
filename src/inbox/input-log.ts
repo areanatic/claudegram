@@ -65,7 +65,10 @@ function getDb(): Database.Database | null {
         dropped_reason TEXT,
         processed_at TEXT,
         response_sent_at TEXT,
-        updated_at TEXT
+        updated_at TEXT,
+        resume_attempts INTEGER NOT NULL DEFAULT 0,
+        side_effect_tool_started_at TEXT,
+        tool_execution_names TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_input_log_chat ON input_log(chat_id);
       CREATE INDEX IF NOT EXISTS idx_input_log_status ON input_log(status);
@@ -139,6 +142,37 @@ function getDb(): Database.Database | null {
     if (!cols.includes('privacy')) {
       console.log('[InputLog] migrating: adding column privacy (default public)');
       conn.exec(`ALTER TABLE input_log ADD COLUMN privacy TEXT NOT NULL DEFAULT 'public'`);
+    }
+
+    // INV-01 Auto-Resume (2026-06-01): columns that gate resumable-orphan replay.
+    //   resume_attempts            — crash-loop / poison guard. Incremented in
+    //                                the SAME transaction that claims a row for
+    //                                replay (claimResumableOrphans), so the
+    //                                counter is on disk BEFORE the agent runs and
+    //                                survives an immediate re-crash. Caps total
+    //                                replays of one row across the bot's whole
+    //                                lifetime at MAX_RESUME_ATTEMPTS (Teil B §3).
+    //   side_effect_tool_started_at — set by the PreToolUse hook BEFORE a
+    //                                mutating tool (Bash/Write/Edit/MultiEdit/
+    //                                Task) runs. A row with this set is NEVER
+    //                                auto-replayed (Codex correction #2): the
+    //                                turn may have already performed a
+    //                                non-idempotent external write that a blind
+    //                                replay would duplicate.
+    //   tool_execution_names       — audit: comma-separated mutating tool names.
+    // Additive-ALTER (mirrors updated_at / privacy above) so a pre-existing
+    // table gains the columns without data loss.
+    if (!cols.includes('resume_attempts')) {
+      console.log('[InputLog] migrating: adding column resume_attempts (default 0)');
+      conn.exec('ALTER TABLE input_log ADD COLUMN resume_attempts INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!cols.includes('side_effect_tool_started_at')) {
+      console.log('[InputLog] migrating: adding column side_effect_tool_started_at');
+      conn.exec('ALTER TABLE input_log ADD COLUMN side_effect_tool_started_at TEXT');
+    }
+    if (!cols.includes('tool_execution_names')) {
+      console.log('[InputLog] migrating: adding column tool_execution_names');
+      conn.exec('ALTER TABLE input_log ADD COLUMN tool_execution_names TEXT');
     }
 
     // FIX 6+ Stage 2d (2026-05-25): one-time backfill via migration marker.
@@ -408,6 +442,42 @@ export function markError(rowId: number | null, reason: string): void {
   updateStatus(rowId, 'error', { dropped_reason: reason });
 }
 
+/**
+ * INV-01 Auto-Resume (Codex correction #2): record that a MUTATING tool
+ * (Bash / Write / Edit / MultiEdit / Task — anything not clearly read-only) has
+ * STARTED for this turn. Called from the PreToolUse hook BEFORE the tool runs.
+ *
+ * A row with `side_effect_tool_started_at` set is excluded from auto-replay on
+ * the next boot, because the turn may have already performed a non-idempotent
+ * external write (git push, file overwrite, subagent spawn) that a blind replay
+ * would duplicate. The FIRST mutating tool stamps the timestamp (COALESCE keeps
+ * it stable); later tools only append their name to the audit list (deduped,
+ * length-capped). Best-effort — must never crash a tool invocation.
+ */
+export function markSideEffectStarted(rowId: number | null, toolName: string): void {
+  const conn = getDb();
+  if (!conn || rowId == null) return;
+  try {
+    const now = new Date().toISOString();
+    conn
+      .prepare(
+        `UPDATE input_log
+            SET side_effect_tool_started_at = COALESCE(side_effect_tool_started_at, ?),
+                tool_execution_names = CASE
+                  WHEN tool_execution_names IS NULL OR tool_execution_names = '' THEN ?
+                  WHEN INSTR(',' || tool_execution_names || ',', ',' || ? || ',') > 0 THEN tool_execution_names
+                  WHEN LENGTH(tool_execution_names) > 200 THEN tool_execution_names
+                  ELSE tool_execution_names || ',' || ?
+                END,
+                updated_at = ?
+          WHERE id = ?`,
+      )
+      .run(now, toolName, toolName, toolName, now, rowId);
+  } catch (err) {
+    console.error('[InputLog] markSideEffectStarted failed:', err);
+  }
+}
+
 /** Fill in / overwrite the raw_content (used to attach the voice transcript). */
 export function attachContent(rowId: number | null, content: string): void {
   const conn = getDb();
@@ -586,6 +656,161 @@ export function recoverOrphanedInputs(): RecoveryResult {
   } catch (err) {
     console.error('[InputLog] recoverOrphanedInputs failed:', err);
     return { recovered: 0, recentOrphans: [] };
+  }
+}
+
+// ── INV-01 Auto-Resume (2026-06-01): claim resumable orphans ─────────────────
+
+/**
+ * A recent orphaned TEXT input eligible to be REPLAYED through the real agent
+ * path on boot (instead of dropped + "please re-send"). Selection AND the
+ * resume_attempts increment happen atomically in `claimResumableOrphans()`;
+ * `runAutoResume()` (src/inbox/auto-resume.ts) then replays each row via the
+ * per-session request queue.
+ */
+export interface ResumableOrphan {
+  id: number;
+  chatId: number;
+  sessionKey: string;
+  rawContent: string;
+  privacy: 'public' | 'private';
+  receivedAt: string;
+  resumeAttempts: number;
+}
+
+/**
+ * Result of `claimResumableOrphans()`:
+ *  - resumable     — public text rows CLAIMED for replay (status set to
+ *                    'processing', resume_attempts incremented). `runAutoResume`
+ *                    must process exactly these.
+ *  - recentOrphans — recent rows that were NOT replayable (private / media /
+ *                    side-effect-already-started / attempts-exhausted / beyond
+ *                    the per-boot cap). Surfaced to the user as a "please
+ *                    re-send" notice, same shape as the legacy boot-recovery.
+ *  - recovered     — total rows marked dropped (recent non-replayable + old
+ *                    drift), for log parity with `recoverOrphanedInputs`.
+ */
+export interface ClaimResult {
+  resumable: ResumableOrphan[];
+  recentOrphans: OrphanInput[];
+  recovered: number;
+}
+
+/**
+ * Hard cap on rows replayed per boot (Codex Q6). A deploy in the middle of a
+ * voice/text burst must not spawn dozens of concurrent agent turns at once; the
+ * overflow falls back to a re-send notice.
+ */
+const MAX_BOOT_RESUME = Number(process.env.NEXUSGRAM_MAX_BOOT_RESUME) || 5; // allow-hardcoded: reason="per-boot replay fan-out cap, tunable via env"
+
+/**
+ * Max times a single row is EVER handed to the agent across the bot's whole
+ * lifetime — crash-loop / poison-message guard (Teil B §3). Default 2 survives
+ * one transient crash plus one genuine attempt.
+ */
+const MAX_RESUME_ATTEMPTS = Number(process.env.NEXUSGRAM_MAX_RESUME_ATTEMPTS) || 2; // allow-hardcoded: reason="poison-input replay ceiling, tunable via env"
+
+/**
+ * Boot-recovery + Auto-Resume (INV-01). Replaces the blanket-drop boot path:
+ * recent, public, replayable TEXT orphans are CLAIMED (status→'processing',
+ * resume_attempts+1) so the real agent can re-process them; everything else
+ * still open is dropped exactly like `recoverOrphanedInputs`, with the recent
+ * non-replayable subset surfaced for a "please re-send" notice.
+ *
+ * The claim + increment run in ONE transaction so the higher attempt counter is
+ * durably on disk BEFORE any replay starts — an immediate re-crash therefore
+ * still sees it and the crash-loop terminates at MAX_RESUME_ATTEMPTS.
+ *
+ * MUST run before the runner starts polling (like recoverOrphanedInputs), so a
+ * freshly-arriving input is never mistaken for an orphan.
+ */
+export function claimResumableOrphans(): ClaimResult {
+  const conn = getDb();
+  if (!conn) return { resumable: [], recentOrphans: [], recovered: 0 };
+  try {
+    const now = Date.now();
+    const cutoff = new Date(now).toISOString();
+    const recentCutoff = new Date(now - RECENT_ORPHAN_WINDOW_MS).toISOString();
+
+    const claim = conn.transaction((): ClaimResult => {
+      // 1. Eligible resumable rows: recent, text, non-empty, public, no mutating
+      //    tool started, attempts left. ASC received_at preserves user order.
+      //    Capped at MAX_BOOT_RESUME per boot.
+      const eligible = conn
+        .prepare(
+          `SELECT id, chat_id AS chatId, session_key AS sessionKey,
+                  raw_content AS rawContent, privacy,
+                  received_at AS receivedAt, resume_attempts AS resumeAttempts
+             FROM input_log
+            WHERE status IN ('received','processing')
+              AND received_at <= @cutoff AND received_at >= @recentCutoff
+              AND input_type = 'text'
+              AND raw_content IS NOT NULL AND TRIM(raw_content) <> ''
+              AND resume_attempts < @maxAttempts
+              AND privacy = 'public'
+              AND side_effect_tool_started_at IS NULL
+            ORDER BY received_at ASC
+            LIMIT @bootCap`,
+        )
+        .all({
+          cutoff,
+          recentCutoff,
+          maxAttempts: MAX_RESUME_ATTEMPTS,
+          bootCap: MAX_BOOT_RESUME,
+        }) as ResumableOrphan[];
+
+      const claimedIds = eligible.map((r) => r.id);
+      // Row ids are DB-generated integers — safe to inline; named params can't
+      // be used for a variable-length IN-list in better-sqlite3.
+      const notClaimed = claimedIds.length > 0 ? `AND id NOT IN (${claimedIds.join(',')})` : '';
+
+      // 2. Increment + mark 'processing' in the SAME transaction. Counter on
+      //    disk before any replay → re-crash still terminates the loop at MAX.
+      const inc = conn.prepare(
+        `UPDATE input_log
+            SET resume_attempts = resume_attempts + 1, status = 'processing', updated_at = @now
+          WHERE id = @id`,
+      );
+      for (const r of eligible) inc.run({ id: r.id, now: cutoff });
+
+      // 3. Recent rows we did NOT claim (private / media / side-effect /
+      //    exhausted / over-cap) → surface for a re-send notice, BEFORE drop.
+      const recentOrphans = conn
+        .prepare(
+          `SELECT chat_id AS chatId, input_type AS inputType,
+                  raw_content AS rawContent, received_at AS receivedAt
+             FROM input_log
+            WHERE status IN ('received','processing')
+              AND received_at <= @cutoff AND received_at >= @recentCutoff
+              ${notClaimed}`,
+        )
+        .all({ cutoff, recentCutoff }) as OrphanInput[];
+
+      // 4. Drop everything still open that we did NOT claim (recent
+      //    non-replayable + old drift). Claimed rows stay 'processing'.
+      const dropped = conn
+        .prepare(
+          `UPDATE input_log
+              SET status = 'dropped', dropped_reason = 'startup_recovery', updated_at = @now
+            WHERE status IN ('received','processing') AND received_at <= @cutoff
+              ${notClaimed}`,
+        )
+        .run({ cutoff, now: cutoff });
+
+      return { resumable: eligible, recentOrphans, recovered: dropped.changes };
+    });
+
+    const result = claim();
+    if (result.resumable.length > 0 || result.recovered > 0) {
+      console.log(
+        `[InputLog] claimResumableOrphans: ${result.resumable.length} claimed for replay, ` +
+          `${result.recovered} dropped (${result.recentOrphans.length} recent non-replayable)`,
+      );
+    }
+    return result;
+  } catch (err) {
+    console.error('[InputLog] claimResumableOrphans failed:', err);
+    return { resumable: [], recentOrphans: [], recovered: 0 };
   }
 }
 
