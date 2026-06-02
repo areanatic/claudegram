@@ -14,6 +14,7 @@ import {
   effectiveWindowTokens,
   exceedsBootWindow,
   isContextOverflowSentinel,
+  shouldRetryAfterOverflow,
   DEFAULT_CONTEXT_WINDOW,
   LARGE_CONTEXT_WINDOW,
   CONTEXT_ROTATE_WARN,
@@ -152,6 +153,8 @@ const sentCases: Array<[string | undefined | null, boolean, string]> = [
   [undefined, false, 'undefined'],
   [null, false, 'null'],
   ['pong', false, 'normal short answer'],
+  ['Your prompt is too long.', false, 'Codex P2-3: SHORT real answer containing phrase → must NOT misfire'],
+  ['Die Eingabe (prompt is too long) war grenzwertig.', false, 'short phrase-containing answer → must NOT misfire'],
   [
     'Guter Punkt: dein Prompt is too long, wenn du zu viele Keyframes auf einmal anfragst — schick lieber 2-3 pro Nachricht, dann passt es.',
     false,
@@ -163,3 +166,19 @@ for (const [input, want, msg] of sentCases) {
   sentPass++;
 }
 console.log(`✅ isContextOverflowSentinel: ${sentPass}/${sentCases.length} cases PASS`);
+
+// ── shouldRetryAfterOverflow: auto-replay only on a clean, side-effect-free
+// failed turn (Codex P1-2). The real SDK sentinel has no text + no tools. ──
+let retPass = 0;
+const retCases: Array<[{ isOverflowRetry: boolean; toolsUsedCount: number; hasText: boolean }, boolean, string]> = [
+  [{ isOverflowRetry: false, toolsUsedCount: 0, hasText: false }, true, 'clean sentinel, first attempt → retry'],
+  [{ isOverflowRetry: true, toolsUsedCount: 0, hasText: false }, false, 'already a retry → no recursion'],
+  [{ isOverflowRetry: false, toolsUsedCount: 2, hasText: false }, false, 'tools ran → no replay (would duplicate side effects)'],
+  [{ isOverflowRetry: false, toolsUsedCount: 0, hasText: true }, false, 'text streamed → no replay'],
+  [{ isOverflowRetry: false, toolsUsedCount: 3, hasText: true }, false, 'tools + text → no replay'],
+];
+for (const [opts, want, msg] of retCases) {
+  assert.equal(shouldRetryAfterOverflow(opts), want, `shouldRetryAfterOverflow: ${msg}`);
+  retPass++;
+}
+console.log(`✅ shouldRetryAfterOverflow: ${retPass}/${retCases.length} cases PASS`);

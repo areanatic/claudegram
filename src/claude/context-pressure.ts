@@ -122,12 +122,33 @@ export function exceedsBootWindow(sizeBytes: number, model: string | undefined |
  * usage-based rotation guard never sees a usage number and the session sticks
  * in an infinite "Prompt is too long" loop (forensik 2026-06-02, proven via
  * Pyrofork self-test). `sendToAgent` detects it so it can rotate + retry on a
- * fresh session. Tight match to avoid false-positives on real answers that
- * happen to quote the phrase: exact trim-match, or a short string containing it.
+ * fresh session. EXACT trim/lowercase match only — the loose "short string
+ * containing it" branch was removed (Codex P2-3) because it false-positived on
+ * real answers like "Your prompt is too long.".
  */
 export function isContextOverflowSentinel(text: string | undefined | null): boolean {
   if (!text) return false;
+  // EXACT match only (Codex P2-3, 2026-06-02): a loose `<60 && includes` branch
+  // false-positived on legitimate short answers like "Your prompt is too long."
+  // The real SDK sentinel is the bare phrase; match it (and the known 'input'
+  // variant) exactly after trim/lowercase, nothing else.
   const t = text.trim().toLowerCase();
-  if (t === 'prompt is too long' || t === 'input is too long') return true;
-  return t.length < 60 && (t.includes('prompt is too long') || t.includes('input is too long'));
+  return t === 'prompt is too long' || t === 'input is too long';
+}
+
+/**
+ * After a context-overflow sentinel is detected, decide whether to auto-retry
+ * the user's message on a fresh session. Retry ONLY when the failed attempt
+ * produced NO side effects — the real SDK sentinel is an input-rejection with no
+ * assistant text and no tool_use, so an empty turn is safe to replay. If the
+ * turn already streamed text or ran tools (a misclassified success), do NOT
+ * replay — that would duplicate side effects (Codex P1-2, 2026-06-02). Never
+ * retry the retry itself (recursion guard via isOverflowRetry).
+ */
+export function shouldRetryAfterOverflow(opts: {
+  isOverflowRetry: boolean;
+  toolsUsedCount: number;
+  hasText: boolean;
+}): boolean {
+  return !opts.isOverflowRetry && opts.toolsUsedCount === 0 && !opts.hasText;
 }

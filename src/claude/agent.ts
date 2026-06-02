@@ -13,7 +13,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import * as fs from 'fs';
 import { sessionManager } from './session-manager.js';
-import { classifyContextPressure, occupancyTokens, isContextOverflowSentinel, type ContextPressure } from './context-pressure.js';
+import { classifyContextPressure, occupancyTokens, isContextOverflowSentinel, shouldRetryAfterOverflow, type ContextPressure } from './context-pressure.js';
 import { resolveModel } from './model-resolution.js';
 import { setActiveQuery, clearActiveQuery, isCancelled, clearCancelled, gracefulCancel, isCurrentTurnEpoch } from './request-queue.js';
 import { getActiveContextsForSession } from '../handler/request-registry.js';
@@ -531,11 +531,12 @@ function extractButtons(text: string): { text: string; buttons: string[] } {
  * so it doesn't appear in Telegram chat (it's already in logs).
  */
 function stripReasoningSummary(text: string): string {
-  // Match a trailing reasoning summary block:
-  //   ---\n**Reasoning Summary**\n... (to end)
-  //   or: **Reasoning Summary**\n... (to end)
-  //   or: *Reasoning Summary*\n... (to end)
-  return text.replace(/\n*(?:---\n+)?(?:\*{1,2})Reasoning Summary(?:\*{1,2})\n[\s\S]*$/, '').trimEnd();
+  // Match a trailing reasoning summary block. Asterisks are OPTIONAL (Bug fix
+  // 2026-06-02, Pyrofork-observed leak): opus-4-7 emits the header as PLAIN
+  // "Reasoning Summary" (no markdown bold), so the old `\*{1,2}` requirement
+  // missed it and the internal block leaked into every Telegram reply.
+  //   ---\n**Reasoning Summary**\n...  |  *Reasoning Summary*\n...  |  Reasoning Summary\n...
+  return text.replace(/\n*(?:---\n+)?\*{0,2}Reasoning Summary\*{0,2}\s*\n[\s\S]*$/i, '').trimEnd();
 }
 
 type LogLevel = 'off' | 'basic' | 'verbose' | 'trace';
@@ -726,7 +727,12 @@ export async function sendToAgent(
     role: 'user',
     content: prompt,
   });
-  recordTranscript(sessionKey, 'user', message);
+  // Codex P2-4 (2026-06-02): on a context-overflow auto-retry the first attempt
+  // already persisted this user message — don't double-record it in the
+  // transcript (the retry would otherwise see two copies via loadTodayTranscript).
+  if (!isOverflowRetry) {
+    recordTranscript(sessionKey, 'user', message);
+  }
 
   let fullText = '';
   const toolsUsed: string[] = [];
@@ -1349,23 +1355,11 @@ export async function sendToAgent(
           // "Prompt is too long" (not a thrown error). If we stored this turn's
           // session_id and surfaced the sentinel, the next turn would resume the
           // same over-full session and reproduce it forever. Instead: flag it,
-          // skip the session-id store + sentinel output, and rotate+retry AFTER
+          // skip the session-id store + sentinel output, and rotate/heal AFTER
           // the loop. (Proven root-cause: bug-prompt-too-long-stuck-loop.)
-          // Fault-injection hook (test-only): NEXUSGRAM_FORCE_OVERFLOW_ONCE=1
-          // forces the FIRST attempt of any turn down the overflow self-heal
-          // path so the rotate+retry wiring can be verified deterministically on
-          // the test bot (the real overflow is hard to reproduce because the SDK
-          // only emits it >200k and the public-scope test bot won't resume the
-          // operator's oversized session). No-op in production (env unset); the
-          // `!isOverflowRetry` guard ensures the retry itself runs normally.
-          // '1' = force only the first attempt (retry heals); 'always' = force
-          // BOTH attempts so the recursion-guard / honest-resend path is testable.
-          const forceMode = process.env.NEXUSGRAM_FORCE_OVERFLOW_ONCE;
-          const forceOverflow =
-            forceMode === 'always' || (forceMode === '1' && !isOverflowRetry);
-          if (isContextOverflowSentinel(responseMessage.result) || forceOverflow) {
+          if (isContextOverflowSentinel(responseMessage.result)) {
             contextOverflowDetected = true;
-            logAt('basic', `[Claude] Context overflow ${forceOverflow ? '(forced/test) ' : ''}detected for ${sessionKey} — will rotate + retry`);
+            logAt('basic', `[Claude] Context overflow sentinel detected for ${sessionKey} — will rotate/heal`);
           } else {
             // Only store session_id on successful results (not on error_during_execution)
             if ('session_id' in responseMessage && responseMessage.session_id) {
@@ -1469,11 +1463,20 @@ export async function sendToAgent(
     chatSessionIds.delete(sessionKey);
     conversationHistory.delete(sessionKey);
     sessionManager.forceFreshSession(sessionKey);
-    if (!isOverflowRetry) {
+    // Codex P1-2 (2026-06-02): only auto-replay when the failed turn had NO side
+    // effects (the real sentinel is an empty input-rejection). If it already
+    // streamed text or ran tools, replaying would duplicate work — rotate and
+    // ask the user to resend instead.
+    const retry = shouldRetryAfterOverflow({
+      isOverflowRetry,
+      toolsUsedCount: toolsUsed.length,
+      hasText: fullText.trim() !== '',
+    });
+    if (retry) {
       logAt('basic', `[Claude] Context overflow — rotated session ${sessionKey}, retrying once on a fresh session`);
       return await sendToAgent(sessionKey, message, { ...options, _overflowRetry: true });
     }
-    logAt('basic', `[Claude] Context overflow persisted after fresh-session retry for ${sessionKey} — asking user to resend`);
+    logAt('basic', `[Claude] Context overflow — rotated session ${sessionKey}; not auto-retrying (retry=${isOverflowRetry} tools=${toolsUsed.length} text=${fullText.trim() !== ''}) — asking user to resend`);
     fullText =
       '⚠️ Die Session war voll — ich habe sie automatisch frisch gestartet. ' +
       'Bitte schick deine letzte Nachricht nochmal, am besten etwas kompakter ' +
