@@ -13,7 +13,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import * as fs from 'fs';
 import { sessionManager } from './session-manager.js';
-import { classifyContextPressure, occupancyTokens, type ContextPressure } from './context-pressure.js';
+import { classifyContextPressure, occupancyTokens, isContextOverflowSentinel, type ContextPressure } from './context-pressure.js';
 import { resolveModel } from './model-resolution.js';
 import { setActiveQuery, clearActiveQuery, isCancelled, clearCancelled, gracefulCancel, isCurrentTurnEpoch } from './request-queue.js';
 import { getActiveContextsForSession } from '../handler/request-registry.js';
@@ -194,6 +194,13 @@ interface AgentOptions {
   telegramCtx?: Context;
   /** When true, appends voice-mode instructions for conversational TTS-friendly responses */
   voiceMode?: boolean;
+  /**
+   * Internal self-heal guard (2026-06-02). Set true when `sendToAgent`
+   * re-invokes itself after a context-window overflow that the SDK surfaced as
+   * a `success` result with text "Prompt is too long" (NOT a thrown error).
+   * Prevents an infinite retry loop if the fresh session is still too large.
+   */
+  _overflowRetry?: boolean;
   /**
    * Codex BLOCKER (Akt 1.3 round 6): the turn epoch assigned by `processQueue`
    * at dequeue. Passed explicitly from the queue handler so ownership is bound
@@ -668,6 +675,9 @@ export async function sendToAgent(
   options: AgentOptions = {}
 ): Promise<AgentResponse> {
   const { onProgress, onToolStart, onToolEnd, abortController, command, model, voiceMode, turnEpoch } = options;
+  // Self-heal guard: TRUE when this call is the one-shot retry after a context
+  // overflow already rotated the session below.
+  const isOverflowRetry = options._overflowRetry === true;
 
   // Codex BLOCKER (Akt 1.3 round 6): the turn epoch is the one `processQueue`
   // assigned at DEQUEUE and passed explicitly through the queue handler — NOT
@@ -725,6 +735,9 @@ export async function sendToAgent(
   // budget is hit. The turn then ends normally with the partial answer — no
   // exception, no controller.abort(), no process crash.
   let toolBudgetReached = false;
+  // Context-overflow self-heal (2026-06-02): set true when the SDK returns the
+  // "Prompt is too long" sentinel as a success result (see isContextOverflowSentinel).
+  let contextOverflowDetected = false;
   let resultUsage: AgentUsage | undefined;
   let compactionEvent: { trigger: 'manual' | 'auto'; preTokens: number } | undefined;
   let initEvent: { model: string; sessionId: string } | undefined;
@@ -1331,27 +1344,51 @@ export async function sendToAgent(
         }
 
         if (responseMessage.subtype === 'success') {
-          // Only store session_id on successful results (not on error_during_execution)
-          if ('session_id' in responseMessage && responseMessage.session_id) {
-            // Codex BLOCKER 1 (round 4): turn-ownership guard. A late `success`
-            // from an old (hard-capped) turn must not overwrite the session-id
-            // a NEWER turn already owns.
-            if (isStillOwnerTurn()) {
-              chatSessionIds.set(sessionKey, responseMessage.session_id);
-              sessionManager.setClaudeSessionId(sessionKey, responseMessage.session_id);
-              logAt('basic', `[Claude] Stored session ${responseMessage.session_id} for session ${sessionKey}`);
-            } else {
-              logAt('basic', `[Claude] Skipping session-id store for ${sessionKey} — a newer turn owns the session`);
+          // Context-overflow self-heal (2026-06-02): a prompt that exceeds the
+          // model's context window comes back as a SUCCESS result whose text is
+          // "Prompt is too long" (not a thrown error). If we stored this turn's
+          // session_id and surfaced the sentinel, the next turn would resume the
+          // same over-full session and reproduce it forever. Instead: flag it,
+          // skip the session-id store + sentinel output, and rotate+retry AFTER
+          // the loop. (Proven root-cause: bug-prompt-too-long-stuck-loop.)
+          // Fault-injection hook (test-only): NEXUSGRAM_FORCE_OVERFLOW_ONCE=1
+          // forces the FIRST attempt of any turn down the overflow self-heal
+          // path so the rotate+retry wiring can be verified deterministically on
+          // the test bot (the real overflow is hard to reproduce because the SDK
+          // only emits it >200k and the public-scope test bot won't resume the
+          // operator's oversized session). No-op in production (env unset); the
+          // `!isOverflowRetry` guard ensures the retry itself runs normally.
+          // '1' = force only the first attempt (retry heals); 'always' = force
+          // BOTH attempts so the recursion-guard / honest-resend path is testable.
+          const forceMode = process.env.NEXUSGRAM_FORCE_OVERFLOW_ONCE;
+          const forceOverflow =
+            forceMode === 'always' || (forceMode === '1' && !isOverflowRetry);
+          if (isContextOverflowSentinel(responseMessage.result) || forceOverflow) {
+            contextOverflowDetected = true;
+            logAt('basic', `[Claude] Context overflow ${forceOverflow ? '(forced/test) ' : ''}detected for ${sessionKey} — will rotate + retry`);
+          } else {
+            // Only store session_id on successful results (not on error_during_execution)
+            if ('session_id' in responseMessage && responseMessage.session_id) {
+              // Codex BLOCKER 1 (round 4): turn-ownership guard. A late `success`
+              // from an old (hard-capped) turn must not overwrite the session-id
+              // a NEWER turn already owns.
+              if (isStillOwnerTurn()) {
+                chatSessionIds.set(sessionKey, responseMessage.session_id);
+                sessionManager.setClaudeSessionId(sessionKey, responseMessage.session_id);
+                logAt('basic', `[Claude] Stored session ${responseMessage.session_id} for session ${sessionKey}`);
+              } else {
+                logAt('basic', `[Claude] Skipping session-id store for ${sessionKey} — a newer turn owns the session`);
+              }
             }
-          }
 
-          // Append final result text if different from accumulated
-          if (responseMessage.result && !fullText.includes(responseMessage.result)) {
-            if (fullText.length > 0) {
-              fullText += '\n\n';
+            // Append final result text if different from accumulated
+            if (responseMessage.result && !fullText.includes(responseMessage.result)) {
+              if (fullText.length > 0) {
+                fullText += '\n\n';
+              }
+              fullText += responseMessage.result;
+              onProgress?.(fullText);
             }
-            fullText += responseMessage.result;
-            onProgress?.(fullText);
           }
         } else if (responseMessage.subtype === 'error_during_execution' && isCancelled(sessionKey)) {
           // Interrupted via /cancel - show clean cancellation message.
@@ -1419,6 +1456,29 @@ export async function sendToAgent(
     // Codex BLOCKER 1: ownership-guarded — only clear the slot if it still
     // holds OUR Query. A late teardown must not delete a newer turn's Query.
     clearActiveQuery(sessionKey, ownedQuery);
+  }
+
+  // Context-overflow self-heal (2026-06-02): the SDK returned "Prompt is too
+  // long" as a success result. Rotate to a brand-new Claude session (drop the
+  // resume id + in-memory history) and retry the user's message ONCE. A fresh
+  // session's baseline (system prompt + tool schemas + 3000-char transcript)
+  // fits the window, so the retry succeeds where the bloated resume failed.
+  // The `_overflowRetry` guard prevents an infinite loop if the fresh turn is
+  // still somehow too large. Ownership-guarded like the other rotation paths.
+  if (contextOverflowDetected && isStillOwnerTurn()) {
+    chatSessionIds.delete(sessionKey);
+    conversationHistory.delete(sessionKey);
+    sessionManager.forceFreshSession(sessionKey);
+    if (!isOverflowRetry) {
+      logAt('basic', `[Claude] Context overflow — rotated session ${sessionKey}, retrying once on a fresh session`);
+      return await sendToAgent(sessionKey, message, { ...options, _overflowRetry: true });
+    }
+    logAt('basic', `[Claude] Context overflow persisted after fresh-session retry for ${sessionKey} — asking user to resend`);
+    fullText =
+      '⚠️ Die Session war voll — ich habe sie automatisch frisch gestartet. ' +
+      'Bitte schick deine letzte Nachricht nochmal, am besten etwas kompakter ' +
+      '(z.B. 2-3 Sachen statt alles auf einmal).';
+    onProgress?.(fullText);
   }
 
   // Tool-Budget cooperative stop (2026-05-22): the turn produced a partial

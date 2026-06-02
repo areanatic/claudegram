@@ -13,6 +13,7 @@ import {
   occupancyTokens,
   effectiveWindowTokens,
   exceedsBootWindow,
+  isContextOverflowSentinel,
   DEFAULT_CONTEXT_WINDOW,
   LARGE_CONTEXT_WINDOW,
   CONTEXT_ROTATE_WARN,
@@ -135,3 +136,30 @@ for (const [size, model, want, msg] of bwCases) {
   bwPass++;
 }
 console.log(`✅ exceedsBootWindow: ${bwPass}/${bwCases.length} cases PASS`);
+
+// ── isContextOverflowSentinel: SDK surfaces a context overflow as a SUCCESS
+// result whose TEXT is "Prompt is too long" (2026-06-02 stuck-loop root-cause).
+// Must catch the real sentinel (incl. case/whitespace) but NOT misfire on real
+// answers that merely quote the phrase. ──
+let sentPass = 0;
+const sentCases: Array<[string | undefined | null, boolean, string]> = [
+  ['Prompt is too long', true, 'exact SDK sentinel'],
+  ['prompt is too long', true, 'lowercase'],
+  ['  Prompt is too long  ', true, 'whitespace-padded'],
+  ['PROMPT IS TOO LONG', true, 'uppercase'],
+  ['Input is too long', true, 'input variant'],
+  ['', false, 'empty string'],
+  [undefined, false, 'undefined'],
+  [null, false, 'null'],
+  ['pong', false, 'normal short answer'],
+  [
+    'Guter Punkt: dein Prompt is too long, wenn du zu viele Keyframes auf einmal anfragst — schick lieber 2-3 pro Nachricht, dann passt es.',
+    false,
+    'long real answer quoting the phrase → must NOT misfire',
+  ],
+];
+for (const [input, want, msg] of sentCases) {
+  assert.equal(isContextOverflowSentinel(input), want, `isContextOverflowSentinel: ${msg}`);
+  sentPass++;
+}
+console.log(`✅ isContextOverflowSentinel: ${sentPass}/${sentCases.length} cases PASS`);

@@ -114,3 +114,20 @@ export function exceedsBootWindow(sizeBytes: number, model: string | undefined |
   const mbLimit = BOOT_AIRBAG_BASELINE_BYTES * (windowTokens / DEFAULT_CONTEXT_WINDOW);
   return sizeBytes > mbLimit;
 }
+
+/**
+ * The Claude Agent SDK surfaces an over-the-context-window prompt as a NORMAL
+ * `subtype:'success'` result whose text is the sentinel "Prompt is too long"
+ * (18 chars) — NOT a thrown error. Because the SDK reports it as a SUCCESS, the
+ * usage-based rotation guard never sees a usage number and the session sticks
+ * in an infinite "Prompt is too long" loop (forensik 2026-06-02, proven via
+ * Pyrofork self-test). `sendToAgent` detects it so it can rotate + retry on a
+ * fresh session. Tight match to avoid false-positives on real answers that
+ * happen to quote the phrase: exact trim-match, or a short string containing it.
+ */
+export function isContextOverflowSentinel(text: string | undefined | null): boolean {
+  if (!text) return false;
+  const t = text.trim().toLowerCase();
+  if (t === 'prompt is too long' || t === 'input is too long') return true;
+  return t.length < 60 && (t.includes('prompt is too long') || t.includes('input is too long'));
+}
