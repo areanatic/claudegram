@@ -157,6 +157,28 @@ function hasPrivacyColumn(conn: Database.Database): boolean {
   return privacyColumnAvailable;
 }
 
+/** Cross-Bot T2 (a): per-bot origin slug. Read from BOT_NAME env DIRECTLY (not via the
+ *  config module) so this file stays import-light and usable in deterministic tests that
+ *  don't set the full bot env. Mirrors src/inbox/capture-router.ts botId() exactly. */
+export function botId(): string {
+  return (process.env.BOT_NAME || 'Nexusgram').toLowerCase().replace(/\s+/g, '-');
+}
+
+/** Detect the additive `bot` column (Cross-Bot T2 migration). Cached after first check.
+ *  Lets the code work on both pre- and post-migration DBs without crashing — the column
+ *  is metadata only and NEVER participates in the privacy clause. */
+let botColumnAvailable: boolean | null = null;
+function hasBotColumn(conn: Database.Database): boolean {
+  if (botColumnAvailable !== null) return botColumnAvailable;
+  try {
+    const rows = conn.prepare(`PRAGMA table_info(memories)`).all() as Array<{ name: string }>;
+    botColumnAvailable = rows.some(r => r.name === 'bot');
+  } catch {
+    botColumnAvailable = false;
+  }
+  return botColumnAvailable;
+}
+
 /**
  * Build the privacy WHERE-clause fragment based on the caller's mode.
  *
@@ -260,13 +282,27 @@ export function saveMemory(
   project?: string,
   tags?: string,
   source = 'nexusgram',
-  privacy: 'public' | 'private' = 'public'
+  privacy: 'public' | 'private' = 'public',
+  // Cross-Bot T2 (a): per-bot origin. Defaults to the current bot's slug. Metadata only —
+  // does NOT affect privacy/visibility. NULL on legacy rows / pre-migration DBs.
+  bot: string | null = botId(),
 ): number | null {
   const conn = getDb();
   if (!conn) return null;
   try {
     const decayRate = type === 'episodic' ? 0.02 : 0.0;
     if (hasPrivacyColumn(conn)) {
+      // Post-bot-migration: also persist the per-bot origin column.
+      if (hasBotColumn(conn)) {
+        const stmt = conn.prepare(`
+          INSERT INTO memories (type, content, source, project, tags, decay_rate, privacy, bot)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        const result = stmt.run(
+          type, content, source, project || null, tags || null, decayRate, privacy, bot || null,
+        );
+        return Number(result.lastInsertRowid);
+      }
       const stmt = conn.prepare(`
         INSERT INTO memories (type, content, source, project, tags, decay_rate, privacy)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -349,6 +385,9 @@ export interface McpMemoryHit {
   tags: string | null;
   project: string | null;
   score: number;
+  /** Cross-Bot T2 (a): which bot saved this (slug). NULL on legacy / pre-migration rows.
+   *  Metadata only — surfaced so the agent can say "saved by family-bot"; never gates visibility. */
+  bot?: string | null;
 }
 
 export interface MemorySearchOptions {
@@ -375,9 +414,10 @@ export function searchMemoryReadOnly(
 
     const { clause: privClause, params: privParams } = buildPrivacyClause(conn, policy);
     const projectClause = project ? `AND m.project = ?` : '';
+    const botCol = hasBotColumn(conn) ? ', m.bot' : '';   // T2(a) additive; absent pre-migration
 
     const buildStmt = () => conn!.prepare(`
-      SELECT m.content, m.tags, m.project, m.score, m.privacy, m.source
+      SELECT m.content, m.tags, m.project, m.score, m.privacy, m.source${botCol}
       FROM memories_fts fts
       JOIN memories m ON m.id = fts.rowid
       WHERE memories_fts MATCH ?
@@ -428,12 +468,13 @@ export function searchMemoryReadOnly(
       );
     }
 
-    // Strip privacy/source from output, truncate per V2.4-5 spec
+    // Strip privacy/source from output, truncate per V2.4-5 spec. `bot` (T2 metadata) kept.
     return rows.map(r => ({
       content: r.content.length > 500 ? r.content.slice(0, 500) + '…' : r.content,
       tags: r.tags,
       project: r.project,
       score: r.score,
+      bot: r.bot ?? null,
     }));
   } catch (err) {
     console.error('[NexusMemory/MCP] searchMemoryReadOnly error:', err);
@@ -475,9 +516,10 @@ export function recentMemoriesReadOnly(
 
     const { clause: privClause, params: privParams } = buildPrivacyClause(conn, policy, 'm');
     const projectClause = project ? 'AND m.project = ?' : '';
+    const botCol = hasBotColumn(conn) ? ', m.bot' : '';   // T2(a) additive; absent pre-migration
 
     const stmt = conn.prepare(`
-      SELECT m.content, m.tags, m.project, m.score, m.created_at
+      SELECT m.content, m.tags, m.project, m.score, m.created_at${botCol}
       FROM memories m
       WHERE m.archived = 0
       ${projectClause}
@@ -491,13 +533,14 @@ export function recentMemoriesReadOnly(
     params.push(clampedLimit);
 
     const rows = stmt.all(...params) as Array<McpMemoryHit & { created_at: string }>;
-    // Strip to {content, tags, project, score, created_at}, truncate per V2.4-5 spec
+    // Strip to {content, tags, project, score, created_at, bot}, truncate per V2.4-5 spec
     return rows.map(r => ({
       content: r.content.length > 500 ? r.content.slice(0, 500) + '…' : r.content,
       tags: r.tags,
       project: r.project,
       score: r.score,
       created_at: r.created_at,
+      bot: r.bot ?? null,
     }));
   } catch (err) {
     console.error('[NexusMemory/MCP] recentMemoriesReadOnly error:', err);
