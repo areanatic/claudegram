@@ -75,6 +75,13 @@ interface AgentResponse {
   usage?: AgentUsage;
   compaction?: { trigger: 'manual' | 'auto'; preTokens: number };
   sessionInit?: { model: string; sessionId: string };
+  /** RF-6 Latenz-Marker (Wave 1 / Stream 1): wall-clock-Dauer dieses Agent-Turns
+   *  in ms, vom post-agent-Hook für die "⏱"-Bubble genutzt. Gemessen ab
+   *  Queue-Dequeue / Timer-Start (inkl. Prompt-/Memory-Kontextbau), aber OHNE
+   *  Queue-Wartezeit, Telegram-Send, TTS und Follow-up-Buttons (Codex P2-3 —
+   *  also NICHT exakt "query()-Start"). Optional → bestehende Returns ohne
+   *  durationMs bleiben gültig und zeigen keinen Marker. */
+  durationMs?: number;
 }
 
 /**
@@ -1541,6 +1548,8 @@ export async function sendToAgent(
     usage: resultUsage,
     compaction: compactionEvent,
     sessionInit: initEvent,
+    // RF-6 Latenz-Marker: wall-clock dieses Agent-Turns (timer @ ~L776).
+    durationMs: getElapsedMs(timer),
   };
 }
 
@@ -1572,6 +1581,11 @@ export async function sendLoopToAgent(
   const loopPrompt = `${message}
 
 IMPORTANT: When you have fully completed this task, respond with the word "DONE" on its own line at the end of your response. If you need to continue working, do not say "DONE".`;
+
+  // RF-6 Latenz-Marker (Codex P1-1): TOTAL loop wall-clock — a multi-iteration
+  // loop must report the SUM of all iterations, not just the last inner
+  // sendToAgent duration (which is what response.durationMs would carry).
+  const loopStartedAt = Date.now();
 
   let iteration = 0;
   let combinedText = '';
@@ -1637,6 +1651,12 @@ IMPORTANT: When you have fully completed this task, respond with the word "DONE"
     text: stripReasoningSummary(loopExtracted.text),
     toolsUsed: allToolsUsed,
     buttons: loopExtracted.buttons.length > 0 ? loopExtracted.buttons : undefined,
+    // RF-6 Latenz-Marker: total loop wall-clock (sum of all iterations), NOT the
+    // last inner sendToAgent duration. Cancel returns above stay marker-free.
+    // NOTE: /loop is NOT in the scoped T1 trigger set; this threads durationMs
+    // for completeness/honesty so a /loop reply CAN show a marker, but the live
+    // default (LATENCY_MARKER_ENABLED=false) keeps it dormant.
+    durationMs: Date.now() - loopStartedAt,
   };
 }
 

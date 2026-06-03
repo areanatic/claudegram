@@ -440,6 +440,70 @@ export function searchMemoryReadOnly(
   }
 }
 
+/**
+ * Read-only recency listing for the MCP tool `nexus_memory_recent` (WAVE-1 Cross-Bot T1).
+ * Complements searchMemoryReadOnly (keyword/FTS5) with "latest N memories, no keyword"
+ * for recall-before-ask. Mirrors searchMemoryReadOnly's hardening EXACTLY:
+ *  - Opens its OWN read-only connection (separate from the write-capable singleton)
+ *  - query_only=ON, busy_timeout=5000
+ *  - Fail-CLOSED by default (scope='public'); broader scopes only via explicit
+ *    MemoryRetrievalPolicy in options.policy, or env-derived policy at call-time
+ *  - Scope-aware privacy via buildPrivacyClause(conn, policy, 'm') — identical gating
+ *    to the search tool; NO broader exposure
+ *  - archived=0 only; NO score>0.3 filter (recency tool must surface fresh 0-score rows)
+ *  - ORDER BY created_at DESC, id DESC (id tie-breaker for sub-second collisions, Codex P1-2)
+ *  - Output stripped to {content, tags, project, score, created_at} — no
+ *    file_path/source/privacy/id leak (Codex P1-3)
+ *  - Limit clamped to [1, 20]
+ */
+export function recentMemoriesReadOnly(
+  limit = 5,
+  project?: string,
+  options: MemorySearchOptions = {},
+): (McpMemoryHit & { created_at: string })[] {
+  const clampedLimit = Math.max(1, Math.min(20, Math.floor(limit)));
+  const policy = options.policy ?? readMemoryPolicyFromEnv();
+
+  let conn: Database.Database | null = null;
+  try {
+    conn = new Database(NEXUS_MEMORY_DB, { readonly: true, fileMustExist: true });
+    conn.pragma('busy_timeout = 5000');
+    conn.pragma('query_only = ON');
+
+    const { clause: privClause, params: privParams } = buildPrivacyClause(conn, policy, 'm');
+    const projectClause = project ? 'AND m.project = ?' : '';
+
+    const stmt = conn.prepare(`
+      SELECT m.content, m.tags, m.project, m.score, m.created_at
+      FROM memories m
+      WHERE m.archived = 0
+      ${projectClause}
+      ${privClause}
+      ORDER BY m.created_at DESC, m.id DESC
+      LIMIT ?
+    `);
+    const params: unknown[] = [];
+    if (project) params.push(project);
+    params.push(...privParams);
+    params.push(clampedLimit);
+
+    const rows = stmt.all(...params) as Array<McpMemoryHit & { created_at: string }>;
+    // Strip to {content, tags, project, score, created_at}, truncate per V2.4-5 spec
+    return rows.map(r => ({
+      content: r.content.length > 500 ? r.content.slice(0, 500) + '…' : r.content,
+      tags: r.tags,
+      project: r.project,
+      score: r.score,
+      created_at: r.created_at,
+    }));
+  } catch (err) {
+    console.error('[NexusMemory/MCP] recentMemoriesReadOnly error:', err);
+    return [];
+  } finally {
+    try { conn?.close(); } catch { /* swallow */ }
+  }
+}
+
 // ── Phase 7.2 Task-Sidecar search ───────────────────────────────────────────
 // Codex pre-review: cross_review_phase-7-2-task-sidecar-architecture_2026-05-27.md (0.86)
 

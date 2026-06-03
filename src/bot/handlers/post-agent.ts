@@ -21,6 +21,7 @@ import { type AgentUsage, maybeRotateAfterContextPressure } from '../../claude/a
 import { occupancyTokens } from '../../claude/context-pressure.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
+import { formatLatencyMarker } from '../../utils/agent-timer.js';
 
 export function fmtTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
@@ -123,12 +124,45 @@ async function sendSessionInitNotification(
   }
 }
 
+/**
+ * RF-6 Latenz-Transparenz (Wave 1 / Stream 1, 2026-06-03): on SLOW answers
+ * (>= LATENCY_MARKER_MIN_MS) send an honest SEPARATE bubble "⏱ ~2 Min" so the
+ * user sees that real work happened / how long it took. CRITICAL: a separate
+ * bubble — NEVER appended to response.text (that text is fed to TTS and the
+ * streaming/MarkdownV2 body). Fast answers (< threshold) show nothing. Instant
+ * reversible via LATENCY_MARKER_ENABLED=false (needs a bot RESTART — config is
+ * parsed at boot — but no rebuild).
+ *
+ * SCOPE (Codex P1-2 Option A — narrow T1): this fires only for answers that flow
+ * through runPostAgentSuccess (main message/voice/photo/document + command-audio).
+ * Reddit-chat, follow-up-button callbacks, PD-commands and auto-dispatch/auto-
+ * resume are intentionally NOT covered (auto-dispatch already shows its own "⏳").
+ *
+ * durationMs honesty (Codex P2-3): it is the turn wall-clock from queue-dequeue
+ * (incl. prompt/memory context-build), NOT exact query()-start, and EXCLUDES
+ * queue-wait, telegram-send and TTS.
+ */
+async function sendLatencyMarker(
+  ctx: Context,
+  durationMs: number | undefined,
+): Promise<void> {
+  if (!config.LATENCY_MARKER_ENABLED) return;
+  // Codex P2-2: undefined OR non-finite (e.g. NaN from a misconfigured source)
+  // must short-circuit — otherwise `NaN < MIN_MS` is false → marker on every reply.
+  if (durationMs === undefined || !Number.isFinite(durationMs)) return;
+  if (durationMs < config.LATENCY_MARKER_MIN_MS) return;
+  // Separate bubble; pure ASCII digits + emoji → no MarkdownV2 escaping needed.
+  await ctx.reply(`⏱ ${formatLatencyMarker(durationMs)}`, { parse_mode: undefined });
+}
+
 /** Minimal shape of an agent reply needed for the post-agent work. AgentResponse
  *  (agent.ts) is structurally assignable. */
 export interface PostAgentResult {
   usage?: AgentUsage;
   compaction?: { trigger: 'manual' | 'auto'; preTokens: number };
   sessionInit?: { model: string; sessionId: string };
+  /** RF-6 Latenz-Marker: Agent-Turn-Dauer in ms (für die "⏱"-Bubble). */
+  durationMs?: number;
 }
 
 /** Run one post-agent step in isolation: a failure here must never block the
@@ -152,6 +186,10 @@ export async function runPostAgentSuccess(
   response: PostAgentResult | undefined,
 ): Promise<void> {
   if (!response) return;
+  // RF-6 latency marker first → clings right under the answer (text path runs
+  // before follow-up buttons; voice path runs AFTER them, so in voice it is
+  // "after the answer, possibly after follow-up buttons" — Codex P2-4).
+  await safeStep('latencyMarker', () => sendLatencyMarker(ctx, response.durationMs));
   await safeStep('usageFooter', () => sendUsageFooter(ctx, response.usage));
   await safeStep('contextGuard', () => applyContextGuard(ctx, sessionKey, response.usage));
   await safeStep('compaction', () => sendCompactionNotification(ctx, response.compaction));

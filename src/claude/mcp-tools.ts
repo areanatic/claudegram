@@ -16,6 +16,7 @@ import { sessionManager } from './session-manager.js';
 import { getWorkspaceRoot, isPathWithinRoot } from '../utils/workspace-guard.js';
 import {
   searchMemoryReadOnly,
+  recentMemoriesReadOnly,
   readMemoryPolicyFromEnv,
   searchTasks,
   searchPersonTimeline,
@@ -103,6 +104,9 @@ function buildToolList(toolsCtx: McpToolsContext) {
 
   tools.push(sendFileTool(toolsCtx));
   tools.push(nexusMemorySearchTool(toolsCtx));
+  // WAVE-1 Cross-Bot T1 (2026-06-03): recency listing (created_at DESC), no keyword.
+  // Scope-gated like search; strictly honors /private (Codex P0-1).
+  tools.push(nexusMemoryRecentTool(toolsCtx));
 
   // Phase 7.2 (2026-05-27): operator-private task index from omi-bridge-task.
   // Gated by NEXUS_MEMORY_SCOPE — Master ('self_private') gets full description,
@@ -798,7 +802,19 @@ function nexusgramReadL1Tool(toolsCtx?: McpToolsContext) {
 function nexusMemorySearchTool(_toolsCtx: McpToolsContext) {
   return tool(
     'nexusgram_memory_search',
-    'Search NEXUS FTS5 memory database for past memories. Use when the user asks about identities (e.g. "wer ist Alina-Bot?"), prior decisions, project history, or any fact likely persisted earlier. Returns up to 5 (default) ranked matches, each with content snippet + tags + project + score. Privacy: only public memories are returned.',
+    'Keyword-search the SHARED NEXUS memory (FTS5) BEFORE asking the user to repeat themselves. ' +
+      'USE THIS FIRST whenever the user implies you should already know something: ' +
+      '"hab ich dir doch gesagt", "hab ich dir doch geschickt", "did I already tell you", ' +
+      '"wie ich erwähnt habe", "wie ich dir gesagt habe", "haben wir besprochen", "we discussed this", ' +
+      '"der Link / die Nummer / die Adresse die ich dir gegeben habe", "the link/number I gave you", ' +
+      '"letztes Mal", "weißt du noch", "wie ich dir geschickt habe", identities ("wer ist Alina-Bot?"), ' +
+      'prior decisions, project history, or ANY fact likely saved in an earlier session. ' +
+      'Do NOT re-ask the user before you have searched here. If you have a keyword, use this; ' +
+      'for the latest items without a keyword use nexus_memory_recent; for raw Telegram inputs ' +
+      '(incl. dropped) use nexusgram_input_log_search. Returns up to 5 (default, max 20) ranked ' +
+      'matches: content snippet + tags + project + score. ' +
+      'Privacy is scope-gated server-side: public scope returns public memories only; ' +
+      'Master self_private scope may also return trusted operator-private memories.',
     {
       query: z.string().min(1).describe('FTS5 search query, e.g. "alina bot family" or "nexusgram recovery plan"'),
       project: z.string().optional().describe('Filter by project tag (e.g. "nexus", "family"). Omit for cross-project search.'),
@@ -821,6 +837,63 @@ function nexusMemorySearchTool(_toolsCtx: McpToolsContext) {
       } catch (error) {
         return {
           content: [{ type: 'text' as const, text: `Memory search error: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+}
+
+// WAVE-1 Cross-Bot T1 (2026-06-03): keyword-less recency listing. Mirrors the strict
+// OMI privacy pattern (omi_task_search :997) — operator_all → public for MCP, and a
+// per-turn /private on → public downgrade (Codex P0-1). Unlike nexusgram_memory_search,
+// this handler DOES use toolsCtx and honors /private, because keyword-less enumeration
+// of private rows is the higher-risk path.
+function nexusMemoryRecentTool(toolsCtx: McpToolsContext) {
+  const bootPolicy = readMemoryPolicyFromEnv();
+  // operator_all downgrades to public for MCP (consistent with omi_task_search / nexus_memory_search)
+  const safePolicy: MemoryRetrievalPolicy = bootPolicy.scope === 'operator_all'
+    ? { ...bootPolicy, scope: 'public' }
+    : bootPolicy;
+
+  return tool(
+    'nexus_memory_recent',
+    'List the most RECENT NEXUS shared-memory entries (newest first, by created_at) — ' +
+      'no keyword needed. USE THIS when the user asks "was haben wir zuletzt besprochen", ' +
+      '"what did we save recently", "letzte Notizen", "neueste Memories", "zeig mir die letzten ' +
+      'Einträge", or when you need fresh cross-session context but have NO specific search term — ' +
+      'recall BEFORE asking the user to repeat. For a keyword/topic lookup use ' +
+      'nexusgram_memory_search instead; for raw Telegram inputs use nexusgram_input_log_search. ' +
+      'Returns up to 5 (default, max 20) entries: content snippet + tags + project + score + created_at. ' +
+      'Privacy is scope-gated server-side: public scope returns public memories only; ' +
+      'Master self_private scope may also return trusted operator-private memories; ' +
+      '/private mode downgrades this tool to public-only.',
+    {
+      limit: z.number().int().min(1).max(20).optional().describe('Max entries (1–20, default 5).'),
+      project: z.string().optional().describe('Filter by project tag (e.g. "nexus", "family"). Omit for cross-project.'),
+    },
+    async ({ limit, project }) => {
+      try {
+        // P0-1: per-turn /private on → public-only; never lean on the helper's env default
+        const sessionIsPrivate = isPrivate(toolsCtx.sessionKey);
+        const effectivePolicy: MemoryRetrievalPolicy = sessionIsPrivate
+          ? { ...safePolicy, scope: 'public' }
+          : safePolicy;
+        const hits = recentMemoriesReadOnly(limit ?? 5, project, { policy: effectivePolicy });
+        if (hits.length === 0) {
+          return {
+            content: [{ type: 'text' as const, text: `No recent memories found${project ? ` in project "${project}"` : ''}.` }],
+          };
+        }
+        const formatted = hits.map((h, i) =>
+          `[${i + 1}] ${h.created_at} (project=${h.project ?? '-'}, score=${h.score.toFixed(2)}, tags=${h.tags ?? '-'})\n${h.content}`
+        ).join('\n\n---\n\n');
+        return {
+          content: [{ type: 'text' as const, text: `${hits.length} most recent memor${hits.length === 1 ? 'y' : 'ies'}:\n\n${formatted}` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: 'text' as const, text: `Recent memory error: ${error instanceof Error ? error.message : String(error)}` }],
           isError: true,
         };
       }

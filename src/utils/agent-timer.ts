@@ -65,3 +65,22 @@ export function getTimingReport(timer: AgentTimer): string {
   const elapsed = formatDuration(getElapsedMs(timer));
   return `${elapsed} elapsed, ${timer.messageCount} messages`;
 }
+
+/**
+ * RF-6 Latenz-Marker (Wave 1 / Stream 1): freundliche, grobe Dauer für den User
+ * ("⏱ ~2 Min") auf langsamen Antworten. Auf ganze Minuten AUFGERUNDET (ehrliche
+ * Grob-Angabe, kein Pseudo-Präzises "1m 30s"); die Tilde signalisiert "ungefähr".
+ * Unter 60s fällt es auf Sekunden ("Xs") zurück — nur relevant, wenn
+ * LATENCY_MARKER_MIN_MS testweise < 60000 gesetzt ist. Reuse des bestehenden
+ * Elapsed-Mechanismus (getElapsedMs/AgentTimer) — KEIN zweiter Timer.
+ * Negative Inputs werden auf 0 geklemmt (Codex P2-Guard).
+ */
+export function formatLatencyMarker(ms: number): string {
+  const safeMs = Math.max(0, ms);
+  const totalSeconds = Math.floor(safeMs / 1000);
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const minutes = Math.ceil(safeMs / 60000);
+  return `~${minutes} Min`;
+}
