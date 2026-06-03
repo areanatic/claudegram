@@ -24,7 +24,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-const NEXUS_ROOT = '/Volumes/AstronOne/NEXUS_miniM_13-03-26';
+// Env-overridable ONLY for deterministic tests (point at a throwaway dir so a test never
+// writes the live privacy-state.json). Prod leaves it unset → identical to the constant.
+const NEXUS_ROOT = process.env.NEXUS_ROOT_PATH || '/Volumes/AstronOne/NEXUS_miniM_13-03-26';
 const STATE_DIR = path.join(NEXUS_ROOT, '.nexus-memory');
 const STATE_FILE = path.join(STATE_DIR, 'privacy-state.json');
 
