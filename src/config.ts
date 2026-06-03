@@ -354,6 +354,14 @@ const envSchema = z.object({
   BOT_TOOLS: z.string()
     .default('Bash,Read,Write,Edit,Glob,Grep,Task')
     .transform(val => val.split(',').map(s => s.trim())),
+  // WAVE-2 Light-Path (2026-06-03): which SDK settingSources to load. Default
+  // 'project,user' = byte-identical old behavior. The 'project' source pulls the
+  // NEXUS-root CLAUDE.md AND the 60 .claude/agents/ subagent bodies (~90k tok est.)
+  // into every prompt — dead weight for a bot that never spawns those agents.
+  // Set BOT_SETTING_SOURCES=user to drop them (measured Light-Path cut).
+  BOT_SETTING_SOURCES: z.string()
+    .default('project,user')
+    .transform(val => val.split(',').map(s => s.trim()).filter(Boolean)),
   // Product Development Agents
   BOT_PD_ENABLED: z.string().default('false').transform(v => v === 'true'),
   BOT_PD_DEXMASTER_MODE: z.enum(['suggest', 'auto']).default('suggest'),

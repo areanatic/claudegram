@@ -1079,7 +1079,7 @@ export async function sendToAgent(
         preset: 'claude_code' as const,
         append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${todayContext}${previousDayContext}${recentUploadsContext}${contextAvailabilityContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
       },
-      settingSources: ['project', 'user'] as SettingSource[],
+      settingSources: config.BOT_SETTING_SOURCES as SettingSource[],
       model: effectiveModel,
       resume: existingSessionId,
       ...(permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
@@ -1191,6 +1191,9 @@ export async function sendToAgent(
     watchdog?.start();
 
     // Process response messages
+    // Speed-P0 (2026-06-03): TTFT = elapsed at first assistant message
+    // (= prompt-processing latency, the part the prefix cache affects).
+    let ttftMs: number | undefined;
     responseLoop: for await (const responseMessage of response) {
       // Record activity for watchdog
       recordMessage(timer);
@@ -1206,6 +1209,7 @@ export async function sendToAgent(
       logAt('trace', `[Claude] [${formatDuration(getElapsedMs(timer))}] Message: ${responseMessage.type}`);
 
       if (responseMessage.type === 'assistant') {
+        if (ttftMs === undefined) ttftMs = getElapsedMs(timer);
         logAt('verbose', '[Claude] Assistant content blocks:', responseMessage.message.content.length);
         // Bug-A metric: capture TRUE per-step window occupancy from each assistant
         // message. NON-cumulative (unlike result.modelUsage). max-over-all-steps is
@@ -1353,6 +1357,16 @@ export async function sendToAgent(
               model: modelKey,
               windowTokens: maxWindowTokens, // TRUE per-step occupancy (Bug-A metric)
             };
+            // Speed-P0 instrumentation (2026-06-03): emit real per-turn cache +
+            // TTFT at basic level so the prefix-cache-bust hypothesis is MEASURABLE
+            // on the live bot (was previously only in-memory chatUsageCache).
+            const _cr = mu.cacheReadInputTokens ?? 0;
+            const _cc = mu.cacheCreationInputTokens ?? 0;
+            const _ratio = (_cr + _cc) > 0 ? _cr / (_cr + _cc) : 0;
+            logAt('basic',
+              `[Metrics] cache_read=${_cr} cache_creation=${_cc} ratio=${_ratio.toFixed(3)} ` +
+              `input=${mu.inputTokens} output=${mu.outputTokens} ttft_ms=${ttftMs ?? -1} ` +
+              `elapsed_ms=${getElapsedMs(timer)} tools=${toolsUsed.length} model=${modelKey}`);
           }
         }
 
