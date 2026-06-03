@@ -799,7 +799,13 @@ function nexusgramReadL1Tool(toolsCtx?: McpToolsContext) {
   );
 }
 
-function nexusMemorySearchTool(_toolsCtx: McpToolsContext) {
+function nexusMemorySearchTool(toolsCtx: McpToolsContext) {
+  const bootPolicy = readMemoryPolicyFromEnv();
+  // operator_all downgrades to public for MCP (consistent with nexus_memory_recent / omi_task_search)
+  const safePolicy: MemoryRetrievalPolicy = bootPolicy.scope === 'operator_all'
+    ? { ...bootPolicy, scope: 'public' }
+    : bootPolicy;
+
   return tool(
     'nexusgram_memory_search',
     'Keyword-search the SHARED NEXUS memory (FTS5) BEFORE asking the user to repeat themselves. ' +
@@ -814,7 +820,8 @@ function nexusMemorySearchTool(_toolsCtx: McpToolsContext) {
       '(incl. dropped) use nexusgram_input_log_search. Returns up to 5 (default, max 20) ranked ' +
       'matches: content snippet + tags + project + score. ' +
       'Privacy is scope-gated server-side: public scope returns public memories only; ' +
-      'Master self_private scope may also return trusted operator-private memories.',
+      'Master self_private scope may also return trusted operator-private memories; ' +
+      '/private mode downgrades this tool to public-only.',
     {
       query: z.string().min(1).describe('FTS5 search query, e.g. "alina bot family" or "nexusgram recovery plan"'),
       project: z.string().optional().describe('Filter by project tag (e.g. "nexus", "family"). Omit for cross-project search.'),
@@ -822,7 +829,12 @@ function nexusMemorySearchTool(_toolsCtx: McpToolsContext) {
     },
     async ({ query, project, limit }) => {
       try {
-        const hits = searchMemoryReadOnly(query, limit ?? 5, project);
+        // P0-1 / fast-follow: per-turn /private on → public-only; never lean on the helper's env default
+        const sessionIsPrivate = isPrivate(toolsCtx.sessionKey);
+        const effectivePolicy: MemoryRetrievalPolicy = sessionIsPrivate
+          ? { ...safePolicy, scope: 'public' }
+          : safePolicy;
+        const hits = searchMemoryReadOnly(query, limit ?? 5, project, { policy: effectivePolicy });
         if (hits.length === 0) {
           return {
             content: [{ type: 'text' as const, text: `No memories found for query "${query}"${project ? ` in project "${project}"` : ''}.` }],
