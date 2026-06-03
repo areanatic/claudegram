@@ -1,6 +1,10 @@
 node_modules/
 dist/
+dist.*/
 .env
+.env.*
+!.env.example
+_backups/
 *.log
 .DS_Store
 .telegraph-account.json
