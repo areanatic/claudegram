@@ -34,6 +34,7 @@ import { runPostAgentSuccess } from './post-agent.js';
 import { takeFreshTranscribeReply } from './transcribe-pending.js';
 import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.middleware.js';
 import { markProcessing, markDone, markDropped, markError, attachContent, markHandledNoAgent } from '../../inbox/input-log.js';
+import { tryAutoDispatch } from '../../inbox/input-auto-dispatch.js';
 import { withHardTimeout, HardTimeoutError } from '../../utils/hard-timeout.js';
 
 export async function handleVoice(ctx: Context): Promise<void> {
@@ -106,6 +107,15 @@ export async function handleVoice(ctx: Context): Promise<void> {
   // Codex re-review MEDIUM: function-scoped so the outer catch can cancel a
   // dangling streaming bubble when the hard-cap fires while a stream was open.
   let streamingStarted = false;
+  // P0 Seamless-Input (2026-06-02): function-scoped copy of the transcript so the
+  // outer hard-cap catch can re-dispatch it through the agent (auto-continue)
+  // instead of dropping it with "please re-send". null until transcription lands.
+  let recoveredTranscript: string | null = null;
+  // P0 Seamless-Input (Codex P1-1): the hard-cap onTimeout fires gracefulCancel
+  // fire-and-forget and rejects immediately. Capture its promise so the catch can
+  // AWAIT the SDK drain BEFORE re-dispatching — otherwise a late-starting mutating
+  // tool of the original (zombie) turn could double-execute against the fresh turn.
+  let hardCancelDrain: Promise<void> | null = null;
 
   try {
     // Download voice file from Telegram (with retry for transient network errors)
@@ -158,6 +168,8 @@ export async function handleVoice(ctx: Context): Promise<void> {
     // Pre-fix, attachContent ran AFTER the confidence-gate — a dropped voice
     // (e.g. 2026-05-24 21:39 ChatGPT briefing) lost its content forever.
     attachContent(inputLogRowId, transcript);
+    // P0 Seamless-Input: capture for the outer hard-cap catch (auto re-dispatch).
+    recoveredTranscript = transcript;
 
     // Stage 2 Voice-Quality-Gate (2026-05-28): differentiated drop-reasons.
     // qualityFlag from transcribe.ts already classifies empty / hollow-bitrate
@@ -365,10 +377,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
         voiceHardCapMs,
         () => {
           // Hard-cap won the race. Claim the turn so a late agent return stays
-          // silent, then tear down the SDK. The catch block sends the single
-          // user-facing timeout reply.
+          // silent, then tear down the SDK. The catch block awaits this drain
+          // (hardCancelDrain) before any auto-continue re-dispatch (Codex P1-1).
           finalizeTurn();
-          return gracefulCancel(sessionKey, 'voice-hard-timeout');
+          hardCancelDrain = gracefulCancel(sessionKey, 'voice-hard-timeout');
+          return hardCancelDrain;
         },
         'voice-turn',
       );
@@ -389,6 +402,37 @@ export async function handleVoice(ctx: Context): Promise<void> {
     const isHardTimeout = error instanceof HardTimeoutError;
     let errorMessage: string;
     if (isHardTimeout) {
+      // P0 Seamless-Input (2026-06-02): instead of dropping a timed-out voice with
+      // "please re-send", try to re-dispatch the stored transcript on a FRESH turn
+      // and answer proactively in the channel (flag-gated, side-effect/loop/dedup-
+      // guarded — see input-auto-dispatch.ts). Cancel any dangling stream bubble
+      // first so the recovery answer is the clean output.
+      if (streamingStarted) {
+        try { await messageSender.cancelStreaming(ctx); } catch { /* best-effort */ }
+        streamingStarted = false;
+      }
+      // Codex P1-1: wait for the original turn's hard-cancel/SDK drain to finish
+      // BEFORE re-dispatch, so a late mutating tool is reflected in tryAutoDispatch's
+      // side-effect guard re-read → no double-side-effect against the fresh turn.
+      if (hardCancelDrain) {
+        try { await hardCancelDrain; } catch { /* best-effort — drain errors don't block */ }
+      }
+      const outcome = await tryAutoDispatch({
+        api: ctx.api,
+        chatId,
+        sessionKey,
+        rowId: inputLogRowId,
+        rawContent: recoveredTranscript ?? '',
+        inputType: 'voice',
+        reason: 'voice_hard_timeout',
+        // RF-2/RF-4: reuse the "🎤 Transcribing…" ack as the working-status → answer
+        // surface, so no stale ack bubble is left and the user sees honest progress.
+        statusMessageId: ackMsg.message_id,
+      });
+      // 'answered' (re-dispatch replied) or 'handled' (dedup/resend — audit already
+      // set) → suppress the fallback. Only 'fallback' sends the re-send notice (P1-2).
+      if (outcome !== 'fallback') return; // finally still runs cleanup
+      // Fallback (auto-dispatch off or declined): the honest transcript-rescue notice.
       // FIX 6+ Step 1 (2026-05-25): explicit Transcript-Rescue acknowledgement.
       // Pre-fix reply hid the fact that the transcript is in input_log and
       // can be recovered via nexusgram_input_log_search — user thought the

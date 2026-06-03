@@ -443,6 +443,84 @@ export function markError(rowId: number | null, reason: string): void {
 }
 
 /**
+ * P0 Seamless-Input (2026-06-02): finalize a row that live auto-dispatch RECOVERED
+ * (e.g. a voice_hard_timeout we re-ran on a fresh turn and answered). status='done'
+ * + response_sent_at set + dropped_reason rewritten to 'auto_continued_from_<reason>'
+ * so the audit trail shows recovery, not a silent 'done' and not a final 'dropped'.
+ * The old failure reason is intentionally replaced — the input WAS executed.
+ */
+export function markDoneRecovered(rowId: number | null, reason: string): void {
+  updateStatus(rowId, 'done', {
+    response_sent_at: new Date().toISOString(),
+    dropped_reason: `auto_continued_from_${reason}`,
+  });
+}
+
+/**
+ * P0 Seamless-Input: execution state needed by live auto-dispatch —
+ * `sideEffectStarted` (Decision D: never blind-replay a turn that already started
+ * a mutating tool), `resumeAttempts` (loop bound), `receivedAt` (dedup window).
+ */
+export function getRowExecutionState(
+  rowId: number | null,
+): { sideEffectStarted: boolean; resumeAttempts: number; receivedAt: string } | null {
+  const conn = getDb();
+  if (!conn || rowId == null) return null;
+  try {
+    const row = conn
+      .prepare(
+        `SELECT side_effect_tool_started_at AS se, resume_attempts AS attempts, received_at AS receivedAt
+           FROM input_log WHERE id = ?`,
+      )
+      .get(rowId) as { se: string | null; attempts: number; receivedAt: string } | undefined;
+    if (!row) return null;
+    return { sideEffectStarted: row.se != null, resumeAttempts: row.attempts ?? 0, receivedAt: row.receivedAt };
+  } catch (err) {
+    console.error('[InputLog] getRowExecutionState failed:', err);
+    return null;
+  }
+}
+
+/**
+ * P0 Seamless-Input (Codex P1-3 guard): true if a STRICTLY-LATER voice row for
+ * this session is still open ('received'/'processing'). A manually re-sent voice
+ * note is inserted with raw_content=NULL and only filled after Whisper, so the
+ * content-based hasNewerDuplicate() can't catch it during the timeout/auto-dispatch
+ * window. Live auto-dispatch uses this to DEFER to the newer turn and avoid a
+ * double answer (old voice auto-answered + new voice answered).
+ */
+export function hasLaterOpenVoiceRow(sessionKey: string, excludeRowId: number, receivedAt: string): boolean {
+  const conn = getDb();
+  if (!conn) return false;
+  try {
+    const row = conn
+      .prepare(
+        `SELECT 1 FROM input_log
+           WHERE session_key = ? AND input_type = 'voice' AND id <> ? AND received_at > ?
+             AND status IN ('received','processing') LIMIT 1`,
+      )
+      .get(sessionKey, excludeRowId, receivedAt);
+    return !!row;
+  } catch (err) {
+    console.error('[InputLog] hasLaterOpenVoiceRow failed:', err);
+    return false;
+  }
+}
+
+/** P0 Seamless-Input: bump resume_attempts for a LIVE auto-dispatch (loop bound). */
+export function incrementResumeAttempt(rowId: number | null): void {
+  const conn = getDb();
+  if (!conn || rowId == null) return;
+  try {
+    conn
+      .prepare('UPDATE input_log SET resume_attempts = resume_attempts + 1, updated_at = ? WHERE id = ?')
+      .run(new Date().toISOString(), rowId);
+  } catch (err) {
+    console.error('[InputLog] incrementResumeAttempt failed:', err);
+  }
+}
+
+/**
  * INV-01 Auto-Resume (Codex correction #2): record that a MUTATING tool
  * (Bash / Write / Edit / MultiEdit / Task — anything not clearly read-only) has
  * STARTED for this turn. Called from the PreToolUse hook BEFORE the tool runs.

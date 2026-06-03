@@ -183,6 +183,30 @@ const envSchema = z.object({
     .string()
     .default('true')
     .transform((val) => val.toLowerCase() === 'true'),
+  // RF-6 Latenz-Transparenz (Wave 1 / Stream 1, 2026-06-03): bei langsamen
+  // Antworten (>= LATENCY_MARKER_MIN_MS) eine ehrliche eigene Bubble "⏱ ~2 Min"
+  // senden, damit der User sieht, dass real gearbeitet wurde / wie lange es
+  // gedauert hat. Additiv, instant reversibel via Flag. Default OFF →
+  // byte-identical altes Verhalten; per-Bot via .env aktiviert. Flag wird beim
+  // Prozessstart aus .env geparst → Toggle braucht einen Bot-RESTART (kein
+  // Rebuild). SCOPE (Codex P1-2 Option A): Marker feuert NUR für Antworten über
+  // runPostAgentSuccess (Haupt-Handler message/voice/photo/document +
+  // command-audio). NICHT für Reddit-Chat, Follow-up-Button-Callbacks, PD-
+  // Commands oder Auto-Dispatch/Auto-Resume (Auto-Dispatch zeigt eigene "⏳"-
+  // Bubble). Siehe wave1_stream1_latenz_marker_scope_2026-06-03.md.
+  LATENCY_MARKER_ENABLED: z.string().default('false').transform(toBool),
+  // Marker nur ab dieser Dauer (ms). Default 60s — liegt oberhalb des gemessenen
+  // NexusGram-Medians (~49s), aber unterhalb des Means (~73s), trifft also den
+  // "fühlt sich langsam an"-Bereich. NaN-/Range-Guard (Codex P2-2): ein
+  // leerer/kaputter Wert fällt auf 60000 zurück statt NaN (sonst wäre
+  // `durationMs < NaN` immer false → Marker bei jeder Antwort, spammig).
+  LATENCY_MARKER_MIN_MS: z
+    .string()
+    .default('60000')
+    .transform((val) => {
+      const n = parseInt(val, 10);
+      return Number.isFinite(n) && n >= 0 ? n : 60000;
+    }),
   // Terminal UI mode
   TERMINAL_UI_DEFAULT: z
     .string()
@@ -230,6 +254,29 @@ const envSchema = z.object({
   VOICE_AGENT_HARD_CAP_MS: z
     .string()
     .default('180000')
+    .transform((val) => parseInt(val, 10)),
+  // P0 Seamless-Input (2026-06-02): when an input was stored but NOT executed
+  // (e.g. a voice_hard_timeout), re-dispatch its content on a FRESH turn and
+  // deliver proactively in the same chat instead of "please re-send". Default
+  // OFF → byte-identical old behavior; enabled per-bot via .env.test first.
+  // See design_p0_seamless_input_autodispatch_2026-06-02.md.
+  INPUT_AUTODISPATCH_ENABLED: z.string().default('false').transform(toBool),
+  // Loop bound: max times a single row is auto-re-dispatched (shares the
+  // input_log.resume_attempts counter as the poison-input ceiling). Clamped to
+  // [1,5] with a NaN guard (Codex P2-1) so a misconfigured/empty value can never
+  // disable the ceiling (NaN >= NaN is false → would loop) or prolong a crash-loop.
+  INPUT_AUTODISPATCH_MAX_ATTEMPTS: z
+    .string()
+    .default('1')
+    .transform((val) => {
+      const n = parseInt(val, 10);
+      return Number.isFinite(n) ? Math.min(5, Math.max(1, n)) : 1;
+    }),
+  // A transcript at/above this length gets the "decompose into atomic tasks,
+  // execute in order, continue automatically" preface (long-voice handling).
+  INPUT_AUTODISPATCH_LONG_VOICE_CHARS: z
+    .string()
+    .default('600')
     .transform((val) => parseInt(val, 10)),
   // Schlachtplan Akt 1.3 Fix C (2026-05-21) / crash-safe re-design 2026-05-22:
   // per-turn tool budget. A turn exceeding this many tool_use blocks is stopped
