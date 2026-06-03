@@ -1,6 +1,9 @@
 import Database from 'better-sqlite3';
 
-const NEXUS_MEMORY_DB = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/memory.db';
+// Default points at the live shared NEXUS memory DB. Overridable via env ONLY so
+// deterministic tests / sandboxed migrations can target a throwaway copy. In prod
+// the env is unset → behaviour is byte-identical to the previous hardcoded constant.
+const NEXUS_MEMORY_DB = process.env.NEXUS_MEMORY_DB_PATH || '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/memory.db';
 
 let db: Database.Database | null = null;
 
