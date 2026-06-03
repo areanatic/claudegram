@@ -23,6 +23,7 @@ import {
   type Platform,
 } from './extract.js';
 import { saveMemory } from '../memory/nexus-memory.js';
+import { isPrivate } from '../memory/privacy-state.js';
 
 // ── Supported platforms for auto-inbox ────────────────────────────────────────
 
@@ -94,6 +95,12 @@ export async function processLinkInbox(
   const chatId = ctx.chat?.id;
   if (!chatId) return;
 
+  // Privacy P0 (Codex holistic 0.90): Link-Inbox runs BEFORE the Claude /private gate
+  // (message.handler routes solo media URLs here directly). Without this, a URL sent while
+  // /private is on saved as source='nexusgram' privacy='public' → readable cross-bot. Mirror
+  // the agent's per-turn gate: tag source='link-inbox' (allowlisted) + privacy from the session.
+  const linkPrivacy: 'public' | 'private' = isPrivate(sessionKey) ? 'private' : 'public';
+
   // 1. Immediate ack
   let ackMsgId: number | null = null;
   try {
@@ -128,7 +135,9 @@ export async function processLinkInbox(
       `[${label}] ${url}\n\n(Transkript fehlgeschlagen: ${errMsg})`,
       'semantic',
       sessionKey,
-      `link_inbox,${platform},no_transcript`
+      `link_inbox,${platform},no_transcript`,
+      'link-inbox',
+      linkPrivacy,
     );
     await editAck(`📎 [${label}] ${url}\n⚠️ Kein Transkript (${errMsg}) — URL gespeichert`);
     return;
@@ -146,7 +155,9 @@ export async function processLinkInbox(
     `[${label}] ${title}\nURL: ${url}\nKategorie: ${category}\n\nTranskript:\n${transcript}`,
     'semantic',
     sessionKey,
-    `link_inbox,${platform},${category.toLowerCase().replace(/[/ ]/g, '_')}`
+    `link_inbox,${platform},${category.toLowerCase().replace(/[/ ]/g, '_')}`,
+    'link-inbox',
+    linkPrivacy,
   );
 
   // 5. Cleanup temp files
