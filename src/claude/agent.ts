@@ -980,6 +980,15 @@ export async function sendToAgent(
     // tools (search/read/list/fetch/extract) are idempotent → not flagged.
     // Matched by suffix so the mcp__<server>__ prefix is irrelevant.
     const MUTATING_MCP_SUFFIXES = ['nexusgram_inbox_route', 'nexusgram_publish_telegraph', 'nexusgram_send_file'];
+    // WP-2 FIX C decision (Masterplan 2026-06-04, after 2 Codex rounds + User): we do NOT
+    // try to classify Bash commands as read-only vs mutating. Two Codex reviews
+    // (w06fk51zn + bhdplmp8a) proved a regex allowlist over shell is a losing cat-and-mouse
+    // (`&` background, `date -s`, quoted `-delete`, `git diff --output`, `notmuch
+    // --decrypt=stash`, awk `print|"cmd"`, sqlite3 `.save`, …). And the data showed the
+    // read-only-Bash-recovery case does not actually occur (real timed-out Bash tasks were
+    // all mutating: Edit + send_file). So `Bash` stays unconditionally side-effecting →
+    // Decision-D-skip → the caller surfaces a one-tap "weiter?" button instead of blind
+    // replay. Tool-LESS timeouts (the majority) still auto-continue safely (no side effect).
     const isMutatingTool = (name: string): boolean =>
       MUTATING_TOOLS.has(name) || MUTATING_MCP_SUFFIXES.some((s) => name.endsWith(s));
     const sideEffectPreToolUse: HookCallbackMatcher = {

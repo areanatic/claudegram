@@ -251,9 +251,14 @@ const envSchema = z.object({
   // turn. The Voice path has no RequestContext state machine (Phase C only
   // wired the text path); this local cap is its fail-fast guard. On expiry the
   // turn is gracefulCancel-ed and the user gets a clear timeout reply.
+  // WP-2 FIX C (Masterplan 2026-06-04): raised 180000→360000 (3→6min). Measured
+  // real requests take 65-73s; with tools/load they can exceed 3min, hitting the
+  // hard-cap → "zu lange, abgebrochen". 6min stays well under AGENT_QUERY_TIMEOUT_MS
+  // (600000/10min). The Decision-D read-only-recover fix is the root fix; this cap
+  // raise is the complementary guardrail (fewer turns hit the cap at all).
   VOICE_AGENT_HARD_CAP_MS: z
     .string()
-    .default('180000')
+    .default('360000')
     .transform((val) => parseInt(val, 10)),
   // P0 Seamless-Input (2026-06-02): when an input was stored but NOT executed
   // (e.g. a voice_hard_timeout), re-dispatch its content on a FRESH turn and
