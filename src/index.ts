@@ -9,6 +9,7 @@ import { closeInputLog, ensureInputLogInitialized, claimResumableOrphans } from 
 import { runAutoResume } from './inbox/auto-resume.js';
 import { acquireLock, releaseLock } from './utils/pid-lock.js';
 import { cancelAllRequests, getActiveSessionKeys } from './claude/request-queue.js';
+import { parseSessionKey } from './utils/session-key.js';
 import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
 import { startScannerProWatcher, stopScannerProWatcher } from './scanners/scanner-pro-watcher.js';
 import { startOmiBridgeWatcher, stopOmiBridgeWatcher } from './scanners/omi-bridge-watcher.js';
@@ -114,13 +115,17 @@ async function main() {
   // over the per-boot cap). Old drift is dropped silently. Grouped per chat,
   // capped at 3 snippets, best-effort.
   if (recovery.recentOrphans.length > 0) {
-    const byChat = new Map<number, typeof recovery.recentOrphans>();
+    // Group by full sessionKey (not just chatId) so a forum-topic notice lands
+    // in its originating thread instead of the General topic. parseSessionKey
+    // recovers chatId + threadId; threadId undefined in regular chats → unchanged.
+    const bySession = new Map<string, typeof recovery.recentOrphans>();
     for (const orphan of recovery.recentOrphans) {
-      const list = byChat.get(orphan.chatId) ?? [];
+      const list = bySession.get(orphan.sessionKey) ?? [];
       list.push(orphan);
-      byChat.set(orphan.chatId, list);
+      bySession.set(orphan.sessionKey, list);
     }
-    for (const [chatId, orphans] of byChat) {
+    for (const [sessionKey, orphans] of bySession) {
+      const { chatId, threadId } = parseSessionKey(sessionKey);
       const snippets = orphans.slice(0, 3).map((o) => {
         // Privacy (review round-2): never echo the CONTENT of a private message
         // in the restart notice — defensive for group chats. The user still
@@ -135,8 +140,9 @@ async function main() {
         '⚠️ Ich wurde gerade neu gestartet — deine letzte(n) Nachricht(en) sind ' +
         'dabei evtl. nicht durchgekommen. Bitte nochmal senden:\n' +
         snippets.join('\n');
+      const sendOpts = threadId !== undefined ? { message_thread_id: threadId } : {};
       try {
-        await bot.api.sendMessage(chatId, notice);
+        await bot.api.sendMessage(chatId, notice, sendOpts);
       } catch { /* best-effort — startup continues regardless */ }
     }
   }
@@ -166,11 +172,15 @@ async function main() {
       console.log(`[Shutdown] Notifying ${activeKeys.length} active session(s)...`);
       for (const sessionKey of activeKeys) {
         try {
-          const chatId = Number(sessionKey.split(':')[0]);
+          // activeKeys are full sessionKeys → recover both chatId AND the forum
+          // topic so the restart notice lands in the originating thread, not the
+          // General topic. threadId undefined in regular chats → {} (unchanged).
+          const { chatId, threadId } = parseSessionKey(sessionKey);
           if (!isNaN(chatId)) {
+            const sendOpts = threadId !== undefined ? { message_thread_id: threadId } : {};
             // 5s send timeout — don't let a slow Telegram API block the shutdown
             await Promise.race([
-              bot.api.sendMessage(chatId, '🔄 Bot restarting — your request was cancelled. Please send your message again in a moment.'),
+              bot.api.sendMessage(chatId, '🔄 Bot restarting — your request was cancelled. Please send your message again in a moment.', sendOpts),
               new Promise<never>((_, reject) => setTimeout(() => reject(new Error('send timeout')), 5000)),
             ]);
           }

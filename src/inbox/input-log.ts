@@ -670,6 +670,9 @@ export function countPending(): number {
 /** A recent orphaned input surfaced by boot-recovery for user notification. */
 export interface OrphanInput {
   chatId: number;
+  /** Full session key (`${chatId}:${threadId}` in forum topics) so the boot
+   *  re-send notice can land in the originating thread via parseSessionKey. */
+  sessionKey: string;
   inputType: string;
   rawContent: string | null;
   receivedAt: string;
@@ -719,7 +722,7 @@ export function recoverOrphanedInputs(): RecoveryResult {
     // user that their in-flight message was lost to a crash/restart.
     const recentOrphans = conn
       .prepare(
-        `SELECT chat_id AS chatId, input_type AS inputType,
+        `SELECT chat_id AS chatId, session_key AS sessionKey, input_type AS inputType,
                 raw_content AS rawContent, received_at AS receivedAt, privacy
            FROM input_log
           WHERE status IN ('received', 'processing')
@@ -884,7 +887,7 @@ export function claimResumableOrphans(): ClaimResult {
       //    exhausted / over-cap) → surface for a re-send notice, BEFORE drop.
       const recentOrphans = conn
         .prepare(
-          `SELECT chat_id AS chatId, input_type AS inputType,
+          `SELECT chat_id AS chatId, session_key AS sessionKey, input_type AS inputType,
                   raw_content AS rawContent, received_at AS receivedAt, privacy
              FROM input_log
             WHERE status IN ('received','processing')

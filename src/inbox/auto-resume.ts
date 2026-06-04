@@ -32,6 +32,7 @@ import type { Bot } from 'grammy';
 import { queueRequest } from '../claude/request-queue.js';
 import { sendToAgent, StaleTurnError } from '../claude/agent.js';
 import { splitMessage } from '../telegram/markdown.js';
+import { parseSessionKey } from '../utils/session-key.js';
 import {
   hasNewerDuplicate,
   markDone,
@@ -64,10 +65,17 @@ export function buildResendNotice(rawContent: string): string {
  * Send a (possibly long) PLAIN-text reply, chunked to Telegram's limit. Plain
  * text (no parse_mode) avoids MarkdownV2 parse failures on arbitrary agent
  * output — same robustness as the boot re-send notices.
+ *
+ * Forum-topic awareness (2026-06-04): the resumed answer must land in the
+ * ORIGINATING topic, not the General thread. threadId is losslessly encoded in
+ * the row's sessionKey (`${chatId}:${threadId}`) → recovered by the caller via
+ * parseSessionKey and passed here as `message_thread_id` (only when defined, so
+ * non-forum chats stay byte-identical). Mirrors agent.ts:1136-1140.
  */
-async function sendChunked(bot: Bot, chatId: number, text: string): Promise<void> {
+async function sendChunked(bot: Bot, chatId: number, text: string, threadId?: number): Promise<void> {
+  const sendOpts = threadId !== undefined ? { message_thread_id: threadId } : {};
   for (const chunk of splitMessage(text)) {
-    await bot.api.sendMessage(chatId, chunk);
+    await bot.api.sendMessage(chatId, chunk, sendOpts);
   }
 }
 
@@ -81,6 +89,8 @@ async function replayOne(bot: Bot, row: ResumableOrphan): Promise<void> {
     markDropped(row.id, 'auto_resume_deduped_newer');
     return;
   }
+  // Forum-topic thread of the originating message (undefined in regular chats).
+  const threadId = parseSessionKey(row.sessionKey).threadId;
   try {
     const response = await queueRequest(row.sessionKey, row.rawContent, async (turnEpoch) =>
       sendToAgent(row.sessionKey, row.rawContent, {
@@ -94,12 +104,12 @@ async function replayOne(bot: Bot, row: ResumableOrphan): Promise<void> {
       // push-tools). Notice FIRST, then markError (Codex round-2 P2): a process
       // crash between must leave the row 'processing' (→ re-claimed/retried next
       // boot), never 'error' with the user never told.
-      await sendChunked(bot, row.chatId, buildResendNotice(row.rawContent));
+      await sendChunked(bot, row.chatId, buildResendNotice(row.rawContent), threadId);
       markError(row.id, 'auto_resume_empty_response');
       return;
     }
     // Reply FIRST, then mark done — a send failure must never look "answered".
-    await sendChunked(bot, row.chatId, buildResumePreface(row.rawContent) + answer);
+    await sendChunked(bot, row.chatId, buildResumePreface(row.rawContent) + answer, threadId);
     markDone(row.id);
   } catch (err) {
     if (err instanceof StaleTurnError) {
@@ -119,7 +129,7 @@ async function replayOne(bot: Bot, row: ResumableOrphan): Promise<void> {
     // between must leave the row 'processing' (re-claimed next boot), not a
     // silent 'error' the user never heard about.
     try {
-      await sendChunked(bot, row.chatId, buildResendNotice(row.rawContent));
+      await sendChunked(bot, row.chatId, buildResendNotice(row.rawContent), threadId);
     } catch { /* best-effort */ }
     markError(row.id, `auto_resume_error:${msg.slice(0, 80)}`);
   }

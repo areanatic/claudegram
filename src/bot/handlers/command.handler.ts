@@ -1344,9 +1344,13 @@ export async function handleRestartBot(ctx: Context): Promise<void> {
 
   // Send restore buttons immediately — the process gets killed too fast for a delayed send
   const restartChatId = ctx.chat?.id;
+  // Forum-topic awareness (2026-06-04): keep the restore buttons in the
+  // originating topic (undefined in regular chats → unchanged).
+  const restartThreadId = getSessionKeyFromCtx(ctx)?.threadId;
   if (restartChatId) {
     try {
       await ctx.api.sendMessage(restartChatId, '👇 Restore your session after restart:', {
+        ...(restartThreadId !== undefined ? { message_thread_id: restartThreadId } : {}),
         reply_markup: {
           inline_keyboard: [
             [
@@ -1464,7 +1468,7 @@ export async function handleCancel(ctx: Context): Promise<void> {
 export async function handleReset(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
   if (!keyInfo) return;
-  const { chatId, sessionKey } = keyInfo;
+  const { chatId, sessionKey, threadId } = keyInfo;
 
   const wasProcessing = isProcessing(sessionKey);
   const reset = await resetRequest(sessionKey);
@@ -1484,9 +1488,11 @@ export async function handleReset(ctx: Context): Promise<void> {
     await replyMd(ctx, '🔄 Session reset\\.');
   }
 
-  // Show restore buttons (same UX as /restartbot)
+  // Show restore buttons (same UX as /restartbot). Keep them in the originating
+  // forum topic (threadId undefined in regular chats → unchanged).
   try {
     await ctx.api.sendMessage(chatId, '👇 Restore or start a new session:', {
+      ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
       reply_markup: {
         inline_keyboard: [
           [

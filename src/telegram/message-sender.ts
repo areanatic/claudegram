@@ -430,7 +430,11 @@ export class MessageSender {
       console.error('[Stream] finishStreaming: no keyInfo from ctx');
       return;
     }
-    const { chatId, sessionKey } = keyInfo;
+    const { chatId, sessionKey, threadId } = keyInfo;
+    // Forum-topic awareness (2026-06-04): the raw error-fallback notices below
+    // use ctx.api.sendMessage (no ctx auto-attach) → thread them explicitly so a
+    // failure notice lands in the originating topic. undefined → byte-identical.
+    const sendOpts = threadId !== undefined ? { message_thread_id: threadId } : {};
     console.log(`[Stream] finishStreaming: chat=${chatId}, content length=${finalContent.length}`);
 
     const state = this.streamStates.get(sessionKey);
@@ -534,7 +538,7 @@ export class MessageSender {
               } catch (sendErr) {
                 console.error('[Stream] sendMessage fallback failed, sending plain error notice:', sendErr);
                 try {
-                  await ctx.api.sendMessage(chatId, '⚠️ Fehler beim Senden der Antwort. Bitte nochmal versuchen.');
+                  await ctx.api.sendMessage(chatId, '⚠️ Fehler beim Senden der Antwort. Bitte nochmal versuchen.', sendOpts);
                 } catch { /* cannot send anything */ }
               }
               return;
@@ -544,7 +548,7 @@ export class MessageSender {
           console.error('Error finishing stream:', error);
           // Last resort: notify user so they don't stare at a spinning indicator
           try {
-            await ctx.api.sendMessage(chatId, '⚠️ Fehler beim Verarbeiten der Antwort. Bitte nochmal versuchen.');
+            await ctx.api.sendMessage(chatId, '⚠️ Fehler beim Verarbeiten der Antwort. Bitte nochmal versuchen.', sendOpts);
           } catch { /* cannot send anything */ }
         }
       }

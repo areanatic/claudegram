@@ -32,6 +32,8 @@ interface QueuedRow {
   id: number;
   chat_id: string;
   message_id: number;
+  /** Forum-topic id of the originating message (NULL in regular chats / General). */
+  message_thread_id: number | null;
   capture_type: string;
   telegram_file_id: string | null;
   raw_text: string | null;
@@ -71,7 +73,7 @@ function findQueuedRecoverable(): QueuedRow[] {
     const placeholders = RECOVERABLE_TYPES.map(() => '?').join(',');
     return conn
       .prepare(
-        `SELECT id, chat_id, message_id, capture_type, telegram_file_id,
+        `SELECT id, chat_id, message_id, message_thread_id, capture_type, telegram_file_id,
                 raw_text, source_url, created_at, privacy
          FROM captures
          WHERE bot_id = ?
@@ -218,10 +220,15 @@ async function deliverToChat(
   const body = transcript;
   const fullText = header + body;
 
+  // Forum-topic awareness (2026-06-04): captures persist message_thread_id, so
+  // the recovered content lands back in the originating topic, not the General
+  // thread. NULL → regular chat → {} → byte-identical. Mirrors agent.ts:1136-1140.
+  const sendOpts = cap.message_thread_id != null ? { message_thread_id: cap.message_thread_id } : {};
+
   // Telegram limit is 4096 chars per message
   const MAX = 3900;
   if (fullText.length <= MAX) {
-    await bot.api.sendMessage(Number(chatId), fullText);
+    await bot.api.sendMessage(Number(chatId), fullText, sendOpts);
     return;
   }
   // Split by chars; first chunk has header
@@ -234,7 +241,7 @@ async function deliverToChat(
     const prefix = part === 1
       ? `${header}[${part}/${totalParts}]\n`
       : `[${part}/${totalParts}] (Capture #${cap.id})\n`;
-    await bot.api.sendMessage(Number(chatId), prefix + chunk);
+    await bot.api.sendMessage(Number(chatId), prefix + chunk, sendOpts);
     part++;
   }
 }
@@ -311,6 +318,7 @@ export async function runCaptureRecovery(bot: Bot): Promise<void> {
         await bot.api.sendMessage(
           Number(cap.chat_id),
           `⚠️ Capture #${cap.id} (${cap.capture_type} vom ${cap.created_at.slice(0, 16)}) konnte nicht recovered werden: ${msg}`,
+          cap.message_thread_id != null ? { message_thread_id: cap.message_thread_id } : {},
         );
       } catch { /* best-effort only */ }
     }

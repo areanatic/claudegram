@@ -39,6 +39,7 @@ import { queueRequest } from '../claude/request-queue.js';
 import { sendToAgent, forgetChatSession } from '../claude/agent.js';
 import { sessionManager } from '../claude/session-manager.js';
 import { splitMessage } from '../telegram/markdown.js';
+import { parseSessionKey } from '../utils/session-key.js';
 import {
   markDoneRecovered,
   markDropped,
@@ -129,6 +130,15 @@ export async function tryAutoDispatch(args: AutoDispatchArgs): Promise<AutoDispa
   const isLong = rawContent.length >= config.INPUT_AUTODISPATCH_LONG_VOICE_CHARS;
   const prompt = isLong ? `${LONG_VOICE_DECOMPOSE_INSTRUCTION}\n\n${rawContent}` : rawContent;
 
+  // Forum-topic awareness (2026-06-04): sessionKey losslessly encodes the
+  // originating thread (`${chatId}:${threadId}`) → recover it so the recovered
+  // answer lands in the right topic, not the General thread. The edits below
+  // target statusMessageId (already in-thread); only the fresh api.sendMessage
+  // fallbacks need it. undefined in regular chats → byte-identical behavior.
+  // Mirrors agent.ts:1136-1140.
+  const threadId = parseSessionKey(sessionKey).threadId;
+  const sendOpts = threadId !== undefined ? { message_thread_id: threadId } : {};
+
   // RF-4 (User-Kernwunsch 2026-06-02): honest, slim working-status so the user sees
   // the bot is ON it (not hung) during the recovery window. Reuse the ack bubble if
   // provided → no stale "🎤 Transcribing…" bubble left behind (RF-2), no extra clutter.
@@ -179,16 +189,16 @@ export async function tryAutoDispatch(args: AutoDispatchArgs): Promise<AutoDispa
     let firstDelivered = false;
     if (statusMessageId != null) {
       try { await api.editMessageText(chatId, statusMessageId, chunks[0]); firstDelivered = true; }
-      catch { try { await api.sendMessage(chatId, chunks[0]); firstDelivered = true; } catch { /* handled below */ } }
+      catch { try { await api.sendMessage(chatId, chunks[0], sendOpts); firstDelivered = true; } catch { /* handled below */ } }
     } else {
-      try { await api.sendMessage(chatId, chunks[0]); firstDelivered = true; } catch { /* handled below */ }
+      try { await api.sendMessage(chatId, chunks[0], sendOpts); firstDelivered = true; } catch { /* handled below */ }
     }
     if (!firstDelivered) {
       console.error(`[AutoDispatch] row ${rowId} could not deliver the answer — falling back`);
       return 'fallback';
     }
     for (const c of chunks.slice(1)) {
-      try { await api.sendMessage(chatId, c); } catch { /* best-effort follow-up chunk */ }
+      try { await api.sendMessage(chatId, c, sendOpts); } catch { /* best-effort follow-up chunk */ }
     }
     // Answer delivered → finalize as recovered (not a silent 'done', not 'dropped').
     markDoneRecovered(rowId, reason);
