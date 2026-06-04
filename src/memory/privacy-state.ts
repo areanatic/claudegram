@@ -23,11 +23,44 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { config } from '../config.js';
 
-// Env-overridable ONLY for deterministic tests (point at a throwaway dir so a test never
-// writes the live privacy-state.json). Prod leaves it unset → identical to the constant.
-const NEXUS_ROOT = process.env.NEXUS_ROOT_PATH || '/Volumes/AstronOne/NEXUS_miniM_13-03-26';
-const STATE_DIR = path.join(NEXUS_ROOT, '.nexus-memory');
+// P0 FIX 2026-06-04 (bug_private_cross_bot_sessionkey_collision): the privacy
+// state MUST be per-bot, not global. Previously this lived at the shared
+// NEXUS_ROOT/.nexus-memory/privacy-state.json, while the sessionKey is just the
+// chatId — and in private Telegram DMs the chatId is the user-id, IDENTICAL across
+// all bots for the same user. Result: `/private on` in ONE Astron-bot toggled
+// every bot (memo/dev1/dev2/dev3/family/work + master) for that user.
+//
+// Fix: anchor the state file in the bot's own DATA_DIR (~/.nexusgram-<slug>),
+// exactly like input-log.db / captures.db / sessions.json already do. Each bot
+// process has a distinct DATA_DIR → distinct privacy-state.json → true isolation.
+//
+// Resolution order (Codex P1 2026-06-04: config.DATA_DIR MUST win over the legacy
+// NEXUS_ROOT_PATH fallback, otherwise a stray prod NEXUS_ROOT_PATH would silently
+// re-share the state across bots and re-open the leak):
+//   1. NEXUS_PRIVACY_STATE_DIR — explicit per-test throwaway dir (highest prio).
+//   2. config.DATA_DIR — PROD: per-bot DATA_DIR (~/.nexusgram-<slug>) = the
+//      load-bearing isolation. Default ~/.nexusgram only if a bot sets no DATA_DIR
+//      (deployment asserts a distinct DATA_DIR per bot).
+//   3. NEXUS_ROOT_PATH — legacy test fallback ONLY, lowest prio. Pre-existing
+//      harnesses (dirigent-bridge.test) set this and no DATA_DIR, so they still work,
+//      but it can never override a real bot's DATA_DIR.
+function resolveStateDir(): string {
+  const explicit = process.env.NEXUS_PRIVACY_STATE_DIR;
+  if (explicit) return explicit;
+  // config.DATA_DIR is set whenever a bot configures DATA_DIR (all 6 Astron bots do).
+  // Only when it falls back to the bare default AND a legacy test set NEXUS_ROOT_PATH
+  // do we honor the legacy path — never letting it shadow a configured DATA_DIR.
+  const dataDir = config.DATA_DIR;
+  const defaultDataDir = path.join(process.env.HOME || '.', '.nexusgram');
+  if (dataDir === defaultDataDir && process.env.NEXUS_ROOT_PATH) {
+    return path.join(process.env.NEXUS_ROOT_PATH, '.nexus-memory');
+  }
+  return dataDir;
+}
+
+const STATE_DIR = resolveStateDir();
 const STATE_FILE = path.join(STATE_DIR, 'privacy-state.json');
 
 export type PrivacyMode = 'public' | 'private';
