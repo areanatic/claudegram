@@ -936,14 +936,49 @@ export async function sendToAgent(
     // (cross_review_restart-sigterm-mystery_2026-05-22.md). This hard runtime
     // gate denies service-/process-management commands regardless of session
     // content, loaded settings, or permissionMode.
+    // Process-/service-management verbs are ALWAYS denied (these restart/kill the bot).
     const SELF_MANAGEMENT_CMD =
-      /\b(launchctl|kickstart|bootout|killall|pkill|kill|shutdown|reboot|halt)\b/i;
+      /\b(launchctl|kickstart|bootout|killall|pkill|shutdown|reboot|halt)\b/i;
+    // `kill` is special: KILL-GUARD FIX (2026-06-05, dev1.err.log:10 OMI-conversation). The
+    // old bare `kill` alternative blocked shell JOB-control (`kill %1`, `kill $!`) — used to
+    // clean up the bot's OWN backgrounded jobs (e.g. `ssh … & sleep 3; kill %1` connectivity
+    // test) — exactly like killing the bot PID. That denied a harmless diagnostic and made the
+    // bot burn its tool budget retrying. `kill` is now denied ONLY when a target is a PID /
+    // $VAR / command-substitution (process mgmt), and ALLOWED only when EVERY target is a
+    // job-spec (%N/%+/%-) or last-bg-pid ($!). Codex M-11 P1: validate ALL targets (a mixed
+    // list `kill %1 123` must DENY — the 123 is a PID). (Tested: security-killguard.test.ts, 30 cases.)
+    const killIsProcessMgmt = (cmd: string): boolean => {
+      const re = /\bkill\b([^;|&\n]*)/gi;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(cmd)) !== null) {
+        const args = m[1].trim();
+        const toks = args.length ? args.split(/\s+/) : [];
+        const targets: string[] = [];
+        for (let k = 0; k < toks.length; k++) {
+          const t = toks[k];
+          if (t === '--') continue;
+          if (/^-[A-Za-z0-9]+$/.test(t)) {
+            if ((t === '-s' || t === '-n') && k + 1 < toks.length) k++; // skip signal arg
+            continue;
+          }
+          targets.push(t);
+        }
+        if (targets.length === 0) return true; // bare `kill` → conservative DENY
+        const clean = (t: string) => t.replace(/^["'`()]+/, '').replace(/["'`()]+$/, '');
+        const allJobControl = targets.every((t) => {
+          const c = clean(t);
+          return /^%[0-9+\-A-Za-z]*$/.test(c) || c === '$!';
+        });
+        if (!allJobControl) return true; // any PID/$VAR/$()/`` target → process mgmt → DENY
+      }
+      return false;
+    };
     const securityPreToolUse: HookCallbackMatcher = {
       hooks: [async (input) => {
         const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
         if (i.tool_name === 'Bash') {
           const cmd = String(i.tool_input?.command ?? '');
-          if (SELF_MANAGEMENT_CMD.test(cmd)) {
+          if (SELF_MANAGEMENT_CMD.test(cmd) || killIsProcessMgmt(cmd)) {
             console.warn(`[Security] BLOCKED self-management command: ${cmd.slice(0, 160)}`);
             return {
               hookSpecificOutput: {
@@ -1523,6 +1558,23 @@ export async function sendToAgent(
     fullText = fullText.trim()
       ? `⚠️ Ich habe das Tool-Limit für diese Anfrage erreicht — hier mein Zwischenstand:\n\n${fullText}`
       : 'Diese Anfrage hat mein Tool-Limit gesprengt, bevor ich antworten konnte. Bitte stell sie etwas enger — am besten eine Sache nach der anderen.';
+    // CANCEL-FALSE-ATTRIBUTION FIX (2026-06-05, OMI-Konversation T6 "du hast abgebrochen"):
+    // interruptForToolBudget() called q.interrupt(), which makes the SDK append a USER-role
+    // turn "[Request interrupted by user]" to the resumable session transcript. If the NEXT
+    // turn resumes that session, the model reads its own history, sees a user-attributed
+    // interruption, and tells the user "du hast den letzten Befehl abgebrochen" — a flat lie
+    // (violates the never-gaslight rule). Drop the poisoned session so the next turn starts
+    // fresh and rebuilds context from our OWN history/transcript (which correctly record the
+    // tool-limit stop, no user-cancel). Mirrors the /cancel + context-overflow recovery path.
+    // Codex M-11 P1: epoch-guard the rotation — a late-released OLD budget turn must NOT
+    // wipe the session a NEWER turn now owns. Same isStillOwnerTurn() gate as the session-id
+    // store (agent.ts:1399). If we're no longer the owner, leave shared session state alone.
+    if (isStillOwnerTurn()) {
+      forgetChatSession(sessionKey);
+      sessionManager.forceFreshSession(sessionKey);
+    } else {
+      logAt('basic', `[Claude] Budget-stop session-rotation skipped for ${sessionKey} — a newer turn owns the session`);
+    }
   }
 
   // Add assistant response to history and persist to transcript
@@ -1788,6 +1840,20 @@ export function getModel(sessionKey: string): string {
 
 export function clearModel(sessionKey: string): void {
   chatModels.delete(sessionKey);
+}
+
+// QUIET MODE (2026-06-05) — per-chat suppression of the "🐌 brauche länger" heartbeat.
+// User feedback (Screenshot 2026-06-05): the long-running status fires "fast immer", felt
+// like noise/half-truth (esp. while merely WAITING for an MCP permission). This lets a user
+// mute the progress nudge per chat without touching the global HANDLER_LONG_RUNNING_MESSAGE
+// (which would affect every bot). Same in-memory per-session pattern as chatModels.
+const quietChats: Set<string> = new Set();
+export function setQuiet(sessionKey: string, quiet: boolean): void {
+  if (quiet) quietChats.add(sessionKey);
+  else quietChats.delete(sessionKey);
+}
+export function isQuiet(sessionKey: string): boolean {
+  return quietChats.has(sessionKey);
 }
 
 export function isDangerousMode(): boolean {

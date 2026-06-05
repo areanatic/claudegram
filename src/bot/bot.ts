@@ -15,6 +15,7 @@ import {
   handleProjectCallback,
   handleStatus,
   handleMode,
+  handleQuiet,
   handleModeCallback,
   handleTTS,
   handleTTSCallback,
@@ -223,6 +224,7 @@ export async function createBot(): Promise<Bot> {
   bot.command('newproject', handleNewProject);
   bot.command('status', handleStatus);
   bot.command('mode', handleMode);
+  bot.command('quiet', handleQuiet);
   bot.command('terminalui', handleTerminalUI);
   bot.command('tts', handleTTS);
   bot.command('botstatus', handleBotStatus);

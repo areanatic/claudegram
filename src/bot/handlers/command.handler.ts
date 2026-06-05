@@ -11,6 +11,8 @@ import {
   assertTurnIsCurrent,
   forgetChatSession,
   discardCancelledTurnState,
+  setQuiet,
+  isQuiet,
 } from '../../claude/agent.js';
 import { occupancyTokens } from '../../claude/context-pressure.js';
 import { config } from '../../config.js';
@@ -939,6 +941,31 @@ export async function handleMode(ctx: Context): Promise<void> {
       parse_mode: 'MarkdownV2',
       reply_markup: { inline_keyboard: keyboard },
     }
+  );
+}
+
+/**
+ * /quiet [on|off] — per-chat toggle for the "🐌 brauche länger" progress heartbeat.
+ * User feedback 2026-06-05: the status fired "fast immer" and felt like noise / a half-truth
+ * (esp. while merely waiting for an MCP permission). No arg = toggle. The agent keeps working
+ * either way; this only mutes the non-finalizing nudge. Default (no /quiet) = updates ON.
+ */
+export async function handleQuiet(ctx: Context): Promise<void> {
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (!keyInfo) return;
+  const { sessionKey } = keyInfo;
+  const arg = (ctx.message?.text || '').split(/\s+/).slice(1).join(' ').trim().toLowerCase();
+  const wasQuiet = isQuiet(sessionKey);
+  const next = arg === 'on' ? true : arg === 'off' ? false : !wasQuiet;
+  setQuiet(sessionKey, next);
+  // Plain text (no parse_mode) — avoids MarkdownV2 escaping pitfalls. The earlier MarkdownV2
+  // version threw a live GrammyError "Character '-' is reserved" on the unescaped '-' in
+  // "Status-Updates" / "/quiet off" (caught only by the E2E test, not the unit test).
+  await ctx.reply(
+    next
+      ? '🔇 Status-Updates aus. Ich melde mich nur noch mit dem Ergebnis (kein „🐌 brauche länger" mehr). Wieder an: /quiet off'
+      : '🔔 Status-Updates an. Bei längeren Tasks gebe ich wieder kurz Bescheid. Aus: /quiet on',
+    { parse_mode: undefined },
   );
 }
 

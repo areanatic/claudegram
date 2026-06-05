@@ -6,6 +6,7 @@ import {
   CLAUDE_CANCEL_SENTINEL_TEXT,
   StaleTurnError,
   assertTurnIsCurrent,
+  isQuiet,
   type AgentUsage,
 } from '../../claude/agent.js';
 import { runPostAgentSuccess } from './post-agent.js';
@@ -96,6 +97,9 @@ function buildContextCallbacks(ctx: Context): {
   const onLongRunning = async (reqCtx: RequestContext): Promise<void> => {
     const msg = config.HANDLER_LONG_RUNNING_MESSAGE;
     if (!msg) return;
+    // QUIET MODE (2026-06-05): user muted progress nudges for this chat via /quiet.
+    // The agent stream keeps running; we just skip the "🐌 brauche länger" heartbeat.
+    if (isQuiet(reqCtx.sessionKey)) return;
     try {
       await ctx.reply(msg, { parse_mode: undefined });
     } catch (err) {

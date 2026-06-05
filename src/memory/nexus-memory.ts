@@ -439,13 +439,20 @@ export function searchMemoryReadOnly(
     const phraseQuery = `"${query.replace(/"/g, '""')}"`;
     let rows = buildStmt().all(...buildParams(phraseQuery)) as RawRow[];
 
-    // Fallback: when phrase-search returns 0, try a bare token search
+    // Fallback: when phrase-search returns 0, try a bare token search.
+    // FTS5-CRASH-FIX (2026-06-05, dev1.err.log:1 "no such column: Sync"): each token
+    // MUST be wrapped as its own quoted phrase. An unquoted token like `OMI-Sync` makes
+    // FTS5 read `-Sync` as column-negation → "no such column: Sync" (the live OMI bug);
+    // bare `NOT`/`@`/`*`/`AND` likewise hit FTS5 operator syntax → SqliteError → caught →
+    // silent [] → bot says "nothing found" although the memory exists. Per-token quoting
+    // keeps OR-across-tokens semantics while treating each token as literal content.
     if (rows.length === 0) {
       const tokenQuery = query
         .replace(/[^\p{L}\p{N}\s@-]/gu, ' ')
         .trim()
         .split(/\s+/)
         .filter(Boolean)
+        .map((t) => `"${t.replace(/"/g, '""')}"`)
         .join(' OR ');
       if (tokenQuery) {
         rows = buildStmt().all(...buildParams(tokenQuery)) as RawRow[];
