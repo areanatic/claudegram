@@ -37,7 +37,14 @@ import { join } from 'path';
 import Database from 'better-sqlite3';
 import { config } from '../config.js';
 
-const NEXUS_MEMORY_DB = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/memory.db';
+const PROD_NEXUS_MEMORY_DB = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/memory.db';
+// The postcondition reads the SAME DB the OMI Python writers mutate. To unit-test
+// it against a throwaway fixture we use a DEDICATED override env (OMI_WATCHER_TEST_DB),
+// NOT the generic NEXUS_MEMORY_DB. Codex M-11 finding (2026-06-07): the writers
+// hardcode the prod DB, so honoring NEXUS_MEMORY_DB here would let an accidental
+// service-env value point the check at a different DB than the writers touch —
+// real leaks would go undetected. A dedicated test-only var can't be set by accident.
+const NEXUS_MEMORY_DB = process.env.OMI_WATCHER_TEST_DB || PROD_NEXUS_MEMORY_DB;
 const OMI_BRIDGE_DB = '/Volumes/AstronOne/shared-memory/omi-bridge/indexed/omi_bridge.db';
 const WATCHER_LOG = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/omi-bridge-sync.log';
 const STATE_FILE = '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/omi-bridge-watcher-state.json';
@@ -47,12 +54,33 @@ const OCR_LOCK_DIR = '/Volumes/AstronOne/shared-memory/omi-bridge/.locks/ocr.loc
 
 const BOOT_RECOVERY_STALE_THRESHOLD_MS = 30 * 60 * 1000;  // 30min — anything older is definitely dead
 
-// Must stay in sync with DEFAULT_TRUSTED_PRIVATE_SOURCES in src/memory/nexus-memory.ts.
-// Used by privacy postcondition only — checks that writer-phases never leave
-// trusted-private source rows tagged as public.
+// Retrieval allowlist — kept here ONLY as a documentation anchor that must stay
+// in sync with DEFAULT_TRUSTED_PRIVATE_SOURCES in src/memory/nexus-memory.ts
+// (which is the real allowlist deciding what an operator bot may privately READ).
+// This watcher no longer uses it for the privacy postcondition — see
+// OMI_WRITER_SOURCES below for why.
 const TRUSTED_PRIVATE_SOURCES = [
   'omi', 'omi-bridge', 'omi-bridge-task', 'omi-synthesis',
   'scanner-pro', 'nexusgram', 'link-inbox', 'auto-index',
+] as const;
+
+// Sources actually WRITTEN by the OMI-Bridge pipeline phases this watcher runs
+// (pipeline → ocr → ner → tasks). Includes both the legacy writer name
+// (`scanner-pro-original`) and the current ones — every row a watcher phase can
+// create must be private. The privacy postcondition checks ONLY these.
+//
+// Why this differs from TRUSTED_PRIVATE_SOURCES: that list also contains
+// `nexusgram`, `link-inbox` and `auto-index`, which the watcher does NOT write
+// and which legitimately hold public rows (e.g. shared TikTok links). Checking
+// them after an OMI run produced false PRIVACY VIOLATIONS → 3 consecutive
+// failures → watcher self-disabled (2026-05-27). A writer-phase postcondition
+// must only assert about the rows the writer phases can touch.
+// Exported so a test can pin the inventory and catch drift (Codex M-11 finding):
+// a future typo or a new writer source added outside this list would silently
+// slip past the exact `source IN (...)` check.
+export const OMI_WRITER_SOURCES = [
+  'omi', 'omi-bridge', 'omi-bridge-task', 'omi-synthesis',
+  'scanner-pro', 'scanner-pro-original',
 ] as const;
 
 const SIGTERM_GRACE_MS = 8_000;
@@ -239,19 +267,22 @@ function childEnv(): NodeJS.ProcessEnv {
   };
 }
 
-/** Codex P0-4: privacy postcondition — trusted-private sources MUST NOT have public rows. */
-function privacyPostcondition(): { ok: boolean; details: string } {
+/** Codex P0-4: privacy postcondition — OMI writer-phase sources MUST NOT have
+ *  public rows. Exported so it can be unit-tested against a fixture DB
+ *  (NEXUS_MEMORY_DB env override). Checks OMI_WRITER_SOURCES only (the rows the
+ *  watcher's phases can actually create), NOT the broader retrieval allowlist. */
+export function privacyPostcondition(): { ok: boolean; details: string } {
   let conn: Database.Database | null = null;
   try {
     conn = new Database(NEXUS_MEMORY_DB, { readonly: true, fileMustExist: true });
     conn.pragma('busy_timeout = 3000');
-    const placeholders = TRUSTED_PRIVATE_SOURCES.map(() => '?').join(',');
+    const placeholders = OMI_WRITER_SOURCES.map(() => '?').join(',');
     const rows = conn.prepare(
       `SELECT source, COUNT(*) AS n FROM memories
        WHERE source IN (${placeholders})
          AND COALESCE(privacy,'public')='public'
        GROUP BY source`
-    ).all(...TRUSTED_PRIVATE_SOURCES) as Array<{ source: string; n: number }>;
+    ).all(...OMI_WRITER_SOURCES) as Array<{ source: string; n: number }>;
     if (rows.length === 0) return { ok: true, details: 'clean' };
     const details = rows.map(r => `${r.source}:${r.n}`).join(',');
     return { ok: false, details };
