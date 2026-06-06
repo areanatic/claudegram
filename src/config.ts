@@ -359,6 +359,20 @@ const envSchema = z.object({
   BOT_TOOLS: z.string()
     .default('Bash,Read,Write,Edit,Glob,Grep,Task')
     .transform(val => val.split(',').map(s => s.trim())),
+  // RI-24 (2026-06-06): hard tool DENY list (deny wins over any allow, even under
+  // DANGEROUS_MODE/bypassPermissions — SDK semantics). For person-bots (e.g. Alina/
+  // Family) set BOT_DISALLOWED_TOOLS=Bash,Task so raw `notmuch` via Bash cannot bypass
+  // the per-account mail scope. Empty default = no behavior change for existing bots.
+  BOT_DISALLOWED_TOOLS: z.string()
+    .default('')
+    .transform(val => val.split(',').map(s => s.trim()).filter(Boolean)),
+  // RI-24 (2026-06-06): per-bot scoped mail MCP. When set, this bot gets its OWN
+  // nexus-mail MCP server (via the given wrapper, e.g. nexus-mail-mcp-alina.sh which
+  // exports NEXUS_ACCOUNT_SCOPE=alina.scope.json) instead of inheriting the master
+  // nexus-mail from the shared NEXUS-root .mcp.json. Combine with BOT_SETTING_SOURCES=user
+  // (drops the project .mcp.json inheritance) so the ONLY mail server is this scoped one.
+  // Empty default = no scoped mail server for this bot.
+  BOT_NEXUS_MAIL_MCP_COMMAND: z.string().default(''),
   // WAVE-2 Light-Path (2026-06-03): which SDK settingSources to load. Default
   // 'project,user' = byte-identical old behavior. The 'project' source pulls the
   // NEXUS-root CLAUDE.md AND the 60 .claude/agents/ subagent bodies (~90k tok est.)

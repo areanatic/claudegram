@@ -807,9 +807,21 @@ export async function sendToAgent(
     // Schlachtplan Akt 1.3 Fix C (2026-05-21): in voiceMode, drop `Task` from
     // the allowed tools. A Voice turn must never spawn subagent cascades — that
     // is the exact escalation behind the 30-tool / 6-minute incident.
-    const effectiveBotTools = voiceMode
+    // RI-24 (2026-06-06): hard DENY list, passed to the SDK as disallowedTools so
+    // bare-denied tools are removed from the model's tool context BEFORE any permission
+    // decision (verified in SDK cli.js: deny rules strip tools up-front, applies even
+    // under DANGEROUS_MODE). For person-bots BOT_DISALLOWED_TOOLS=Bash,Task makes raw
+    // `notmuch` via Bash structurally impossible → it cannot bypass the per-account mail
+    // scope. Codex M-11 hardening: also filter denied tools out of the allow set below,
+    // so there is never a contradictory allow+deny config (runtime checks allow before
+    // deny; pre-filtering keeps the two consistent). Empty list (default) = no change.
+    const disallowedTools = config.BOT_DISALLOWED_TOOLS;
+    const disallowedToolsOption = disallowedTools.length > 0 ? disallowedTools : undefined;
+
+    const effectiveBotTools = (voiceMode
       ? config.BOT_TOOLS.filter((t) => t !== 'Task')
-      : config.BOT_TOOLS;
+      : config.BOT_TOOLS
+    ).filter((t) => !disallowedTools.includes(t));
 
     const toolsOption = config.DANGEROUS_MODE
       ? { type: 'preset' as const, preset: 'claude_code' as const }
@@ -1080,6 +1092,20 @@ export async function sendToAgent(
       mcpServers['nexusgram-tools'] = server;
     }
 
+    // RI-24 (2026-06-06): per-bot SCOPED mail MCP. When BOT_NEXUS_MAIL_MCP_COMMAND is set
+    // (e.g. a person-bot like Alina), wire THIS bot's own nexus-mail server via the scoped
+    // wrapper instead of inheriting the master nexus-mail from the shared NEXUS-root
+    // .mcp.json. The wrapper exports NEXUS_ACCOUNT_SCOPE (server-side fail-closed). This
+    // in-code mcpServers entry is authoritative; pair with BOT_SETTING_SOURCES=user so the
+    // project .mcp.json (master mail) is not loaded at all → only the scoped server exists.
+    if (config.BOT_NEXUS_MAIL_MCP_COMMAND) {
+      mcpServers['nexus-mail'] = {
+        type: 'stdio',
+        command: 'bash',
+        args: [config.BOT_NEXUS_MAIL_MCP_COMMAND],
+      };
+    }
+
     const nexusBridgePrompt = buildNexusBridgePrompt(cwd);
     const sessionIsPrivate = isPrivate(sessionKey);
     // In private mode we still allow the bot to see private memories the user
@@ -1116,6 +1142,12 @@ export async function sendToAgent(
       cwd,
       tools: toolsOption,
       ...(allowedToolsOption ? { allowedTools: allowedToolsOption } : {}),
+      ...(disallowedToolsOption ? { disallowedTools: disallowedToolsOption } : {}),
+      // RI-24 Codex M-11 P1 hardening: when a scoped mail server is wired, enforce
+      // strictMcpConfig so the SDK does NOT additionally load the project/root .mcp.json
+      // (which still defines the MASTER nexus-mail). Belt-and-suspenders with
+      // BOT_SETTING_SOURCES=user → the master mail server cannot reach a person-bot.
+      ...(config.BOT_NEXUS_MAIL_MCP_COMMAND ? { strictMcpConfig: true } : {}),
       permissionMode,
       abortController: controller,
       systemPrompt: {
