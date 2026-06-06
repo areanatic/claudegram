@@ -1369,6 +1369,21 @@ export async function sendToAgent(
             sessionId: sysMsg.session_id,
           };
           logAt('basic', `[Claude] SESSION INIT: model=${sysMsg.model}, session=${sysMsg.session_id}`);
+          // RI-24 Codex M-11: log actual MCP-server connect status + visible mail tools so we
+          // can see WHY a scoped mail server is/ isn't reaching the bot (PID up != connected).
+          try {
+            const mcpStatus = (sysMsg.mcp_servers || []).map((s) => `${s.name}:${s.status}`).join(', ') || '(none)';
+            const mailTools = (sysMsg.tools || []).filter((t) => /mail/i.test(t));
+            logAt('basic', `[Claude] MCP-INIT: servers=[${mcpStatus}] mailTools=[${mailTools.join(', ') || 'none'}]`);
+            // Hard fail-loud if a scoped mail server was wired but did not connect / expose tools.
+            if (config.BOT_NEXUS_MAIL_MCP_COMMAND) {
+              const mailConnected = (sysMsg.mcp_servers || []).some((s) => s.name === 'nexus-mail' && s.status === 'connected');
+              const hasMailSearch = (sysMsg.tools || []).some((t) => t === 'mcp__nexus-mail__mail_search');
+              if (!mailConnected || !hasMailSearch) {
+                console.error(`[Claude] ⚠️ RI-24 MCP WARN: scoped nexus-mail wired but not usable — connected=${mailConnected} mail_search=${hasMailSearch} (servers: ${mcpStatus})`);
+              }
+            }
+          } catch (e) { console.error('[Claude] MCP-INIT log error:', e); }
         } else if (responseMessage.subtype === 'status') {
           const statusMsg = responseMessage as SDKStatusMessage;
           if (statusMsg.status === 'compacting') {
