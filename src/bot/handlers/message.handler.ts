@@ -40,7 +40,7 @@ import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
 import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.middleware.js';
-import { markProcessing, markDone, markDropped, markError } from '../../inbox/input-log.js';
+import { markProcessing, markDone, markDropped, markError, markHandledNoAgent } from '../../inbox/input-log.js';
 import {
   createRequestContext,
   disposeRequestContext,
@@ -273,6 +273,9 @@ export async function handleMessage(ctx: Context): Promise<void> {
     const inboxUrl = detectInboxUrl(trimmedText);
     if (inboxUrl) {
       await processLinkInbox(ctx, inboxUrl, sessionKey);
+      // RI-23 (2026-06-06, Codex M-11): this is a SUCCESSFUL non-agent outcome (link saved,
+      // no Claude turn). Tag it honestly so the catch-all doesn't mislabel it 'handler_no_finalize'.
+      markHandledNoAgent(getInputLogRowId(chatId, messageId), 'link_inbox');
       return;
     }
   }

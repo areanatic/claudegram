@@ -408,14 +408,19 @@ export function recordInput(opts: RecordInputOptions): number | null {
   }
 }
 
-/** Transition a row to status='processing'. Best-effort. */
+/** Transition a row to status='processing'. Best-effort.
+ *  RI-23 (2026-06-06): clear any prior dropped_reason. The catch-all finalizeIfOpen can race
+ *  ahead of a slow handler (e.g. document's setTimeout confirmation) and stamp
+ *  'handler_no_finalize'; once the handler actually starts processing, that stale reason must go. */
 export function markProcessing(rowId: number | null): void {
-  updateStatus(rowId, 'processing', { processed_at: new Date().toISOString() });
+  updateStatus(rowId, 'processing', { processed_at: new Date().toISOString(), dropped_reason: null });
 }
 
-/** Transition a row to status='done' and stamp response_sent_at. Best-effort. */
+/** Transition a row to status='done' and stamp response_sent_at. Best-effort.
+ *  RI-23 (2026-06-06): also clear dropped_reason — a successful turn must not keep a stale
+ *  'handler_no_finalize' that finalizeIfOpen may have set in a race (Codex M-11 Q4). */
 export function markDone(rowId: number | null): void {
-  updateStatus(rowId, 'done', { response_sent_at: new Date().toISOString() });
+  updateStatus(rowId, 'done', { response_sent_at: new Date().toISOString(), dropped_reason: null });
 }
 
 /**
@@ -570,7 +575,7 @@ export function attachContent(rowId: number | null, content: string): void {
 function updateStatus(
   rowId: number | null,
   status: InputStatus,
-  extra: { processed_at?: string; response_sent_at?: string; dropped_reason?: string } = {},
+  extra: { processed_at?: string; response_sent_at?: string; dropped_reason?: string | null } = {},
 ): void {
   const conn = getDb();
   if (!conn || rowId == null) return;

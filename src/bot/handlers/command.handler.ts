@@ -71,7 +71,7 @@ import {
   snapshotRegistry,
 } from '../../handler/request-registry.js';
 import { markCancelled } from '../../handler/request-context.js';
-import { countPending as countPendingInputs, countHandlerNoFinalize } from '../../inbox/input-log.js';
+import { countPending as countPendingInputs, countHandlerNoFinalize, markProcessing, markDone, markDropped, markError, markHandledNoAgent } from '../../inbox/input-log.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -1199,7 +1199,7 @@ export async function handleBrief(ctx: Context): Promise<void> {
   // overwhelming default) still get the same Stage 2c behaviour.
   const briefIsPrivate = isPrivate(sessionKey);
   try {
-    const { recordInput, markDone } = await import('../../inbox/input-log.js');
+    const { recordInput } = await import('../../inbox/input-log.js');
     rowId = recordInput({
       messageId,
       chatId: chatId ?? 0,
@@ -1209,7 +1209,7 @@ export async function handleBrief(ctx: Context): Promise<void> {
       fileId: null,
       privacy: briefIsPrivate ? 'private' : 'public',
     });
-    if (rowId != null) markDone(rowId);
+    if (rowId != null) markDone(rowId); // markDone now top-level imported (Z.74)
   } catch (err) {
     console.error('[Brief] recordInput failed:', err);
   }
@@ -2921,8 +2921,17 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
   console.log(`[TranscribeAudio] file_id=${audio.file_id} mime=${audio.mime_type} size=${audio.file_size} transcribeOnly=${isTranscribeOnly}`);
   const transcript = await transcribeAndSend(ctx, audio.file_id, audio.mime_type);
 
+  // RI-23 (2026-06-06, Codex M-11 R2): transcribe-only — tag honestly ONLY when transcription
+  // actually succeeded; a null transcript means transcribeAndSend failed → mark error, not success.
+  if (isTranscribeOnly) {
+    const rid = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
+    if (transcript) markHandledNoAgent(rid, 'transcribe_only');
+    else markError(rid, 'transcribe_failed');
+    return;
+  }
+
   // For plain forwarded audio (not /transcribe ForceReply), also feed transcript to Claude
-  if (!isTranscribeOnly && transcript) {
+  if (transcript) {
     const keyInfo = getSessionKeyFromCtx(ctx);
     if (!keyInfo) return;
     const { sessionKey } = keyInfo;
@@ -2938,6 +2947,7 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
     await queueRequest(sessionKey, transcript, async (turnEpoch) => {
       // D0 Hardening Item 1 / Amendment A (2026-05-27): Audio pre-side-effect guard.
       assertTurnIsCurrent(sessionKey, turnEpoch);
+      markProcessing(inputLogRowId); // RI-23: forwarded-audio agent path was input-log-blind
       if (isVoiceActive(sessionKey)) {
         await ctx.replyWithChatAction('typing');
         const abortController = new AbortController();
@@ -2953,6 +2963,7 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
         await messageSender.sendMessage(ctx, response.text);
         await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
         await runPostAgentSuccess(ctx, sessionKey, response);
+        markDone(inputLogRowId);
       } else if (getStreamingMode() === 'streaming') {
         await messageSender.startStreaming(ctx);
         const abortController = new AbortController();
@@ -2969,6 +2980,7 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
           await maybeSendVoiceReply(ctx, response.text, {});
           await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
           await runPostAgentSuccess(ctx, sessionKey, response);
+          markDone(inputLogRowId);
         } catch (error) {
           await messageSender.cancelStreaming(ctx);
           throw error;
@@ -2987,16 +2999,19 @@ export async function handleTranscribeAudio(ctx: Context): Promise<void> {
         await maybeSendVoiceReply(ctx, response.text, {});
         await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
         await runPostAgentSuccess(ctx, sessionKey, response);
+        markDone(inputLogRowId);
       }
     });
     } catch (error) {
       if (error instanceof StaleTurnError) {
         console.log(`[TranscribeAudio] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+        markDropped(inputLogRowId, 'superseded');
         return;
       }
-      if ((error as Error).message === 'Queue cleared') return;
+      if ((error as Error).message === 'Queue cleared') { markDropped(inputLogRowId, 'queue_cleared'); return; }
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       console.error('[TranscribeAudio] Agent error:', errorMessage);
+      markError(inputLogRowId, errorMessage.slice(0, 200));
     }
   }
 }
@@ -3013,7 +3028,12 @@ export async function handleTranscribeDocument(ctx: Context): Promise<void> {
   const doc = ctx.message?.document;
   if (!doc || !doc.mime_type?.startsWith('audio/')) return;
 
-  await transcribeAndSend(ctx, doc.file_id, doc.mime_type);
+  const transcript = await transcribeAndSend(ctx, doc.file_id, doc.mime_type);
+  // RI-23 (2026-06-06, Codex M-11 R2): tag success honestly ONLY when transcription succeeded;
+  // null transcript = failure → markError, not a fake 'transcribe_only' success.
+  const rid = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
+  if (transcript) markHandledNoAgent(rid, 'transcribe_only');
+  else markError(rid, 'transcribe_failed');
 }
 
 // ── /extract command ───────────────────────────────────────────────

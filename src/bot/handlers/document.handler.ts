@@ -21,6 +21,7 @@ import { config } from '../../config.js';
 import { sendToAgent, StaleTurnError, assertTurnIsCurrent } from '../../claude/agent.js';
 import { runPostAgentSuccess } from './post-agent.js';
 import { getInputLogRowId } from '../middleware/input-log.middleware.js';
+import { markProcessing, markDone, markDropped, markError } from '../../inbox/input-log.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -278,15 +279,15 @@ async function sendSingleFileConfirmation(
       'Keep your response short (1-3 sentences).',
     ].join('\n');
 
+    // RI-23 (2026-06-06, Codex M-11): hoist rowId out of the callback so the outer catch can tag.
+    // Document handler never marked its row → catch-all 'handler_no_finalize' false-tag.
+    const inputLogRowId = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
     try {
       await queueRequest(sessionKey, agentPrompt, async (turnEpoch) => {
         // D0 Hardening Item 1 / Amendment A (2026-05-27): close pre-side-effect
         // race-window before startStreaming/setAbortController/sendToAgent.
         assertTurnIsCurrent(sessionKey, turnEpoch);
-        // Tier-1: thread the input-log row + run the shared post-agent hook
-        // (Bug-A guard was document-blind). telegramCtx intentionally NOT added
-        // here — it would change the doc agent's MCP tool surface (untested).
-        const inputLogRowId = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
+        markProcessing(inputLogRowId);
         if (getStreamingMode() === 'streaming') {
           await messageSender.startStreaming(ctx);
           const abortController = new AbortController();
@@ -303,11 +304,14 @@ async function sendSingleFileConfirmation(
             });
             await messageSender.finishStreaming(ctx, response.text);
             await runPostAgentSuccess(ctx, sessionKey, response);
+            markDone(inputLogRowId);
           } catch (error) {
             await messageSender.cancelStreaming(ctx);
-            if (error instanceof StaleTurnError) throw error; // bubble to outer
-            // Fallback to simple confirmation
+            if (error instanceof StaleTurnError) throw error; // bubble to outer (tagged there)
+            // Codex M-11: agent failed but the file IS saved + confirmation sent → this is a
+            // SUCCESSFUL non-agent outcome, not a lost input. Tag it honestly, not as no_finalize.
             await messageSender.sendMessage(ctx, confirmMsg);
+            markDone(inputLogRowId);
           }
         } else {
           await ctx.replyWithChatAction('typing');
@@ -316,14 +320,19 @@ async function sendSingleFileConfirmation(
           const response = await sendToAgent(sessionKey, agentPrompt, { abortController, currentInputLogRowId: inputLogRowId, turnEpoch });
           await messageSender.sendMessage(ctx, response.text);
           await runPostAgentSuccess(ctx, sessionKey, response);
+          markDone(inputLogRowId);
         }
       });
     } catch (error) {
       // Codex round 7: stale turn superseded — swallow silently.
       if (error instanceof StaleTurnError) {
         console.log(`[Document] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+        markDropped(inputLogRowId, 'superseded');
       } else if ((error as Error).message !== 'Queue cleared') {
         console.error('[Document] Agent error:', error instanceof Error ? error.message : error);
+        markError(inputLogRowId, (error instanceof Error ? error.message : String(error)).slice(0, 200));
+      } else {
+        markDropped(inputLogRowId, 'queue_cleared');
       }
     }
   } else {

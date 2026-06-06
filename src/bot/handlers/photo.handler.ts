@@ -5,6 +5,7 @@ import { config } from '../../config.js';
 import { sendToAgent, StaleTurnError, assertTurnIsCurrent } from '../../claude/agent.js';
 import { runPostAgentSuccess } from './post-agent.js';
 import { getInputLogRowId } from '../middleware/input-log.middleware.js';
+import { markProcessing, markDone, markDropped, markError } from '../../inbox/input-log.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -93,14 +94,17 @@ async function handleSavedImage(
     await ctx.reply(`⏳ Queued \(position ${position}\)`, { parse_mode: 'MarkdownV2' });
   }
 
+  // RI-23 (2026-06-06, Codex M-11 Q2): hoist the input-log row id OUT of the queueRequest
+  // callback so the outer catch can tag it. Without explicit marking, the catch-all
+  // finalizeIfOpen tagged every successful photo turn 'handler_no_finalize' (= measurement
+  // artefact, not data loss). Mirror message.handler.ts: markProcessing → markDone / markError.
+  const inputLogRowId = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
   try {
     await queueRequest(sessionKey, agentPrompt, async (turnEpoch) => {
       // D0 Hardening Item 1 / Amendment A (2026-05-27): close pre-side-effect
       // race-window before startStreaming/setAbortController/sendToAgent.
       assertTurnIsCurrent(sessionKey, turnEpoch);
-      // Tier-1: thread the input-log row so contextAvailability excludes this very
-      // input, and run the shared post-agent hook (Bug-A guard was photo-blind).
-      const inputLogRowId = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
+      markProcessing(inputLogRowId);
       if (getStreamingMode() === 'streaming') {
         await messageSender.startStreaming(ctx);
 
@@ -120,6 +124,7 @@ async function handleSavedImage(
 
           await messageSender.finishStreaming(ctx, response.text);
           await runPostAgentSuccess(ctx, sessionKey, response);
+          markDone(inputLogRowId);
         } catch (error) {
           await messageSender.cancelStreaming(ctx);
           throw error;
@@ -137,17 +142,20 @@ async function handleSavedImage(
         });
         await messageSender.sendMessage(ctx, response.text);
         await runPostAgentSuccess(ctx, sessionKey, response);
+        markDone(inputLogRowId);
       }
     });
   } catch (error) {
-    if ((error as Error).message === 'Queue cleared') return;
+    if ((error as Error).message === 'Queue cleared') { markDropped(inputLogRowId, 'queue_cleared'); return; }
     // Codex round 7: stale turn superseded — swallow silently.
     if (error instanceof StaleTurnError) {
       console.log(`[Photo] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+      markDropped(inputLogRowId, 'superseded');
       return;
     }
     const errorMessage = sanitizeError(error);
     console.error('[Photo] Agent error:', errorMessage);
+    markError(inputLogRowId, errorMessage.slice(0, 200));
     await ctx.reply(`Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
   }
 }
