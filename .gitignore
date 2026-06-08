@@ -5,6 +5,7 @@ dist.*/
 .env.*
 !.env.example
 _backups/
+_snapshots/
 *.log
 .DS_Store
 .telegraph-account.json
