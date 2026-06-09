@@ -311,7 +311,12 @@ export async function generateSpeech(text: string, voice?: string, options?: Gen
       return await generateSpeechGroq(text, voice);
     } catch (err) {
       const msg = String(err);
-      if (msg.includes('429') && config.OPENAI_API_KEY) {
+      // RI-27 (2026-06-09): the Groq-429 → OpenAI fallback must ALSO respect
+      // TTS_NONENGLISH_OPENAI_FALLBACK. Otherwise, with the OpenAI quota dead, a
+      // transient Groq 429 made us hammer a known-dead OpenAI key → repeated 429
+      // spam in every voice turn (the log noise behind the Pixi incident). When the
+      // fallback is off, degrade cleanly to text-only instead of calling dead OpenAI.
+      if (msg.includes('429') && config.OPENAI_API_KEY && config.TTS_NONENGLISH_OPENAI_FALLBACK) {
         const mappedVoice = voice ? (GROQ_TO_OPENAI_VOICE[voice] || 'onyx') : undefined;
         console.log(`[TTS] Groq rate limit (429) — falling back to OpenAI TTS (voice: ${voice} → ${mappedVoice})`);
         return generateSpeechOpenAI(text, mappedVoice);

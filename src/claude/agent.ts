@@ -818,8 +818,15 @@ export async function sendToAgent(
     const disallowedTools = config.BOT_DISALLOWED_TOOLS;
     const disallowedToolsOption = disallowedTools.length > 0 ? disallowedTools : undefined;
 
+    // RI-27 (2026-06-09): in voiceMode, drop the heavy generic shell/file tools too,
+    // not just Task. A voice turn ("alle Pixi-Termine absagen") must use the focused
+    // domain tools (cal_*/gcal_*), never fall back to Bash loops that blow the tight
+    // voice tool-budget. Bash/Write/Edit are the escalation surface behind the budget
+    // sprenger. They stay available in text mode (where the budget is larger and the
+    // user can see/steer). Quick-win pending the structural bulk-tool fix (RI-27).
+    const VOICE_DROP = new Set(['Task', 'Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
     const effectiveBotTools = (voiceMode
-      ? config.BOT_TOOLS.filter((t) => t !== 'Task')
+      ? config.BOT_TOOLS.filter((t) => !VOICE_DROP.has(t))
       : config.BOT_TOOLS
     ).filter((t) => !disallowedTools.includes(t));
 
