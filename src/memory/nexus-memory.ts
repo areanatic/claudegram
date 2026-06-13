@@ -484,7 +484,16 @@ export function searchMemoryReadOnly(
       bot: r.bot ?? null,
     }));
   } catch (err) {
-    console.error('[NexusMemory/MCP] searchMemoryReadOnly error:', err);
+    // RI-25 (2026-06-07): log the RAW query + derived MATCH exprs so the next real
+    // FTS5 crash ("no such column: X") shows the actual offending input instead of
+    // forcing us to guess. The aktuelle dist passes all synthetic repros — the live
+    // crasher is a bot-generated query we have not yet captured.
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (/no such column|fts5|syntax error|malformed MATCH/i.test(errMsg)) {
+      console.error(`[NexusMemory/MCP] RI-25 FTS5-CRASH on rawQuery=${JSON.stringify(query)} | err=${errMsg}`);
+    } else {
+      console.error('[NexusMemory/MCP] searchMemoryReadOnly error:', err);
+    }
     return [];
   } finally {
     try { conn?.close(); } catch { /* swallow */ }
