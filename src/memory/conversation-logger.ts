@@ -5,15 +5,50 @@
  * plain-text log file. maintenance.sh synthesizes these nightly via Ollama
  * and saves the synthesis to SQLite L2 Memory.
  *
- * File pattern: {NEXUS_ROOT}/logs/conversations/YYYY-MM-DD_{botName}.log
+ * File pattern: {LOG_DIR}/YYYY-MM-DD_{botName}.log
  * Bot-space isolation: BOT_NAME per bot → separate files → separate synthesis.
+ *
+ * Silo isolation (2026-06-13): a bot that owns its own world (e.g. Alina/family)
+ * sets CONVERSATION_LOG_DIR so its conversation logs stay inside its silo instead
+ * of the shared NEXUS root. Unset → shared default, so master + every existing bot
+ * are unchanged and maintenance.sh keeps globbing their logs for nightly synthesis.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 
 const NEXUS_ROOT = '/Volumes/AstronOne/NEXUS_miniM_13-03-26';
-const LOG_DIR = path.join(NEXUS_ROOT, 'logs', 'conversations');
+
+/**
+ * Resolve the conversation-log directory.
+ *
+ * - unset  → shared default in the NEXUS root (master + all existing bots).
+ * - set & absolute → the bot's own silo (isolation honoured verbatim).
+ * - set & relative → MISCONFIG. A relative path would resolve against the
+ *   process cwd (the NEXUS root) and silently re-leak an isolated bot's
+ *   conversations into the shared space. We refuse that: anchor it to the
+ *   bot's own DATA_DIR instead, and shout about it — never fall back to the
+ *   shared root once isolation was requested.
+ */
+function resolveLogDir(): string {
+  const sharedDefault = path.join(NEXUS_ROOT, 'logs', 'conversations');
+  const override = process.env.CONVERSATION_LOG_DIR?.trim();
+  if (!override) return sharedDefault;
+  if (path.isAbsolute(override)) return override;
+
+  const dataDir = process.env.DATA_DIR?.trim();
+  const anchored =
+    dataDir && path.isAbsolute(dataDir)
+      ? path.resolve(dataDir, override)
+      : path.resolve(override);
+  console.error(
+    `[conversation-logger] CONVERSATION_LOG_DIR ("${override}") is not absolute — ` +
+      `anchored to "${anchored}" to avoid leaking into the shared NEXUS root.`,
+  );
+  return anchored;
+}
+
+const LOG_DIR = resolveLogDir();
 
 // Max chars per turn to keep logs manageable (enough for synthesis)
 const MAX_USER_CHARS = 500;
@@ -62,8 +97,14 @@ export function logConversationTurn(
       ].join('\n');
 
       fs.appendFileSync(logPath, entry, 'utf-8');
-    } catch {
-      // Must never crash the bot — silent fail
+    } catch (err) {
+      // Must never crash the bot — but a swallowed failure means a silo's logs
+      // silently vanish (data loss, not a leak). Surface it on stderr so the
+      // bot's launchd err-log makes the loss visible instead of invisible.
+      console.error(
+        `[conversation-logger] failed to write turn to "${LOG_DIR}": ` +
+          `${(err as Error)?.message ?? String(err)}`,
+      );
     }
   });
 }
