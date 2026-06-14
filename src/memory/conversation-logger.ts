@@ -19,33 +19,60 @@ import * as path from 'path';
 
 const NEXUS_ROOT = '/Volumes/AstronOne/NEXUS_miniM_13-03-26';
 
+/** True iff `child` is `parent` itself or lexically nested under it. */
+function isWithin(parent: string, child: string): boolean {
+  const rel = path.relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
 /**
- * Resolve the conversation-log directory.
+ * Resolve the conversation-log directory — hardened (Codex review 2026-06-14).
  *
  * - unset  → shared default in the NEXUS root (master + all existing bots).
- * - set & absolute → the bot's own silo (isolation honoured verbatim).
- * - set & relative → MISCONFIG. A relative path would resolve against the
- *   process cwd (the NEXUS root) and silently re-leak an isolated bot's
- *   conversations into the shared space. We refuse that: anchor it to the
- *   bot's own DATA_DIR instead, and shout about it — never fall back to the
- *   shared root once isolation was requested.
+ * - set, when the bot owns a silo (DATA_DIR absolute): the log dir MUST stay
+ *   inside that silo. We anchor relative paths to DATA_DIR (never the process
+ *   cwd — under launchd that is the shared repo root = re-leak) and REFUSE any
+ *   resolved path that escapes DATA_DIR (typo/stale config), falling back to the
+ *   canonical in-silo `DATA_DIR/logs/conversations`. So a misconfigured override
+ *   can never write into another bot's world or back into the shared NEXUS root.
+ * - set but no absolute DATA_DIR to anchor against → cannot place safely; refuse
+ *   the override and use the shared default (loudly), rather than guess via cwd.
+ *
+ * Residual (accepted): containment is lexical, not symlink-resolved — a symlink
+ * planted INSIDE the silo that points out would not be caught. That requires
+ * write access to the silo itself (a bigger compromise) and is out of scope here.
  */
 function resolveLogDir(): string {
   const sharedDefault = path.join(NEXUS_ROOT, 'logs', 'conversations');
   const override = process.env.CONVERSATION_LOG_DIR?.trim();
   if (!override) return sharedDefault;
-  if (path.isAbsolute(override)) return override;
 
   const dataDir = process.env.DATA_DIR?.trim();
-  const anchored =
-    dataDir && path.isAbsolute(dataDir)
-      ? path.resolve(dataDir, override)
-      : path.resolve(override);
-  console.error(
-    `[conversation-logger] CONVERSATION_LOG_DIR ("${override}") is not absolute — ` +
-      `anchored to "${anchored}" to avoid leaking into the shared NEXUS root.`,
-  );
-  return anchored;
+  const dataDirAbs =
+    dataDir && path.isAbsolute(dataDir) ? path.resolve(dataDir) : null;
+
+  let dir: string;
+  if (path.isAbsolute(override)) {
+    dir = path.resolve(override);
+  } else if (dataDirAbs) {
+    dir = path.resolve(dataDirAbs, override);
+  } else {
+    console.error(
+      `[conversation-logger] CONVERSATION_LOG_DIR ("${override}") is relative and ` +
+        `DATA_DIR is unset/relative — cannot anchor safely; using shared default.`,
+    );
+    return sharedDefault;
+  }
+
+  if (dataDirAbs && !isWithin(dataDirAbs, dir)) {
+    const safe = path.join(dataDirAbs, 'logs', 'conversations');
+    console.error(
+      `[conversation-logger] CONVERSATION_LOG_DIR ("${dir}") escapes DATA_DIR ` +
+        `("${dataDirAbs}") — refusing and using in-silo "${safe}".`,
+    );
+    return safe;
+  }
+  return dir;
 }
 
 const LOG_DIR = resolveLogDir();
