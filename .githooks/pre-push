@@ -1,0 +1,34 @@
+#!/bin/bash
+# nexusgram pre-push hook (V2.4-2)
+# Block direct push to production-Branch — production wird nur via merge von incubator/* erreicht
+# Source: stdin liest "<local_ref> <local_sha> <remote_ref> <remote_sha>" pro Zeile
+# (V2.3 prüfte 'git symbolic-ref HEAD' — falsch, weil refspec-override bypassed das)
+
+set -u
+
+PROTECTED='refs/heads/production'
+BLOCKED=0
+
+while read local_ref local_sha remote_ref remote_sha; do
+  if [ -z "$remote_ref" ]; then continue; fi
+
+  if [ "$remote_ref" = "$PROTECTED" ]; then
+    echo "❌ Direct push to production blocked." >&2
+    echo "   local_ref=$local_ref → remote_ref=$remote_ref" >&2
+    echo "   production wird nur via merge aus incubator/* erreicht (Promotion-Gate)." >&2
+    echo "   Bypass: 'allow-direct-production-push: reason=\"...\"' in commit-msg body." >&2
+    BLOCKED=1
+  fi
+done
+
+if [ "$BLOCKED" = "1" ]; then
+  # Check bypass via last commit-msg-body
+  LAST_MSG=$(git log -1 --pretty=%B 2>/dev/null || echo "")
+  if echo "$LAST_MSG" | grep -qE 'allow-direct-production-push:[[:space:]]*reason='; then
+    echo "⚠️ Bypass marker detected in last commit-msg — allowing direct push." >&2
+    exit 0
+  fi
+  exit 1
+fi
+
+exit 0

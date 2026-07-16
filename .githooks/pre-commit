@@ -1,0 +1,48 @@
+#!/bin/bash
+# nexusgram pre-commit hook
+# V2.3 Phase 0.1 Cluster G — Block hard-coded magic numbers + controller.abort()
+# Bypass via commit-msg-body marker: "allow-hardcoded: reason=\"...\""
+
+set -u
+
+STAGED_DIFF=$(git diff --cached -- 'src/' 2>/dev/null || true)
+ANY_FAIL=0
+
+# Check 1: hard-coded magic numbers (X * Y patterns) in NEW lines
+HARD_NUM_HITS=$(echo "$STAGED_DIFF" | grep -nE '^\+[^+]' | grep -E '[0-9]+[[:space:]]*\*[[:space:]]*[0-9]+' | grep -vE 'config\.|test|spec|allow-hardcoded' || true)
+
+if [ -n "$HARD_NUM_HITS" ]; then
+  echo "❌ pre-commit: Hard-coded number patterns in NEW lines (src/):"
+  echo "$HARD_NUM_HITS" | head -20
+  echo ""
+  echo "Fix options:"
+  echo "  1) Move constant to src/config.ts as env-konfigurierbare var"
+  echo "  2) Add inline comment '// allow-hardcoded: reason=\"...\"' to that line"
+  echo "  3) Put 'allow-hardcoded: reason=\"...\"' into commit-msg body (bypass)"
+  ANY_FAIL=1
+fi
+
+# Check 2: controller.abort() outside gracefulCancel (RI-09 Forensik, 8x verbotene Stellen)
+ABORT_HITS=$(echo "$STAGED_DIFF" | grep -nE '^\+[^+].*controller\.abort\(\)' | grep -v 'gracefulCancel' || true)
+if [ -n "$ABORT_HITS" ]; then
+  echo "❌ pre-commit: controller.abort() in NEW lines (Code-Comment: 'Do NOT call' — crashes SDK):"
+  echo "$ABORT_HITS" | head -10
+  echo "Use gracefulCancel(sessionKey, reason) instead (V2.3 Phase B.4)."
+  ANY_FAIL=1
+fi
+
+# Bypass via commit-msg-body marker (read prepared COMMIT_EDITMSG)
+if [ "$ANY_FAIL" = "1" ] && [ -f "$(git rev-parse --git-dir)/COMMIT_EDITMSG" ]; then
+  if grep -qE 'allow-hardcoded:[[:space:]]*reason=' "$(git rev-parse --git-dir)/COMMIT_EDITMSG"; then
+    echo "⚠️  Bypass marker 'allow-hardcoded:' detected in commit message — allowing." >&2
+    exit 0
+  fi
+fi
+
+if [ "$ANY_FAIL" = "1" ]; then
+  echo ""
+  echo "Manual §7 BANNED REFLEX — do not use --no-verify. Fix root cause."
+  exit 1
+fi
+
+exit 0
