@@ -36,6 +36,7 @@ import { logConversationTurn } from '../memory/conversation-logger.js';
 import { isPrivate } from '../memory/privacy-state.js';
 import { buildRecentUploadsContext } from '../memory/recent-uploads.js';
 import { getLatestInputLog, markSideEffectStarted } from '../inbox/input-log.js';
+import { getEngineSelection, runAlternativeEngine } from '../engines/engine.js';
 
 /**
  * Privacy Mode Phase 1 — neutralizing system-prompt suffix.
@@ -191,7 +192,7 @@ interface ConversationMessage {
   content: string;
 }
 
-interface AgentOptions {
+export interface AgentOptions {
   onProgress?: (text: string) => void;
   onToolStart?: (toolName: string, input?: Record<string, unknown>) => void;
   onToolEnd?: () => void;
@@ -707,6 +708,32 @@ export async function sendToAgent(
 
   if (!session) {
     throw new Error('No active session. Use /project to set working directory.');
+  }
+
+  // Cross-engine dispatch. Anthropic keeps the established Agent SDK path
+  // untouched below; Ollama and Codex are explicit alternatives with no
+  // fallback to Claude on failure. A session-level selection is intentionally
+  // in-memory: changing it affects this running conversation only.
+  const engineSelection = getEngineSelection(sessionKey);
+  if (engineSelection.engine !== 'anthropic') {
+    const enginePrompt = command === 'explore' ? `Explore the codebase and answer: ${message}` : message;
+    sessionManager.updateActivity(sessionKey, message);
+    const response = await runAlternativeEngine(engineSelection, {
+      sessionKey,
+      prompt: enginePrompt,
+      workingDirectory: session.workingDirectory,
+      abortSignal: abortController?.signal,
+      onProgress,
+    });
+    recordTranscript(sessionKey, 'user', message);
+    recordTranscript(sessionKey, 'assistant', response.text);
+    logConversationTurn(
+      config.BOT_NAME,
+      enginePrompt,
+      response.text,
+      isPrivate(sessionKey) ? 'private' : 'public',
+    );
+    return response;
   }
 
   // If session was rotated (new day), clear stale in-memory Claude session ID

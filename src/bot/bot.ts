@@ -60,6 +60,8 @@ import {
   handleHealth,
   handleBrief,
   handleWith,
+  handleEngine,
+  handleCodex,
 } from './handlers/command.handler.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
@@ -81,6 +83,9 @@ function getSequentializeKey(ctx: Context): string | undefined {
 }
 
 export async function createBot(): Promise<Bot> {
+  // Registered only for the Master bot. The handlers additionally check the
+  // allowed user ID, which keeps the restriction a code gate rather than UI.
+  const masterEngineCommandsEnabled = config.BOT_NAME === 'Nexusgram';
   // Stage 2b Action 9: defensive RequestContext registry sweep. Eager-remove
   // happens in `disposeRequestContext()`; this periodic safety-net catches
   // contexts whose handler crashed outside the try/finally guard. 60s cadence.
@@ -128,6 +133,10 @@ export async function createBot(): Promise<Bot> {
     { command: 'tts', description: t.tts },
     ...(config.DOCUMENT_INBOX_ENABLED ? [{ command: 'inbox', description: t.inbox }] : []),
     ...(config.TRANSCRIBE_ENABLED ? [{ command: 'transcribe', description: t.transcribe }] : []),
+    ...(masterEngineCommandsEnabled ? [
+      { command: 'engine', description: '⚙️ Show or switch AI engine' },
+      { command: 'codex', description: '🤖 Run a read-only Codex task' },
+    ] : []),
     { command: 'status', description: t.status },
   ] : [
     { command: 'start', description: '🚀 Show help and getting started' },
@@ -161,6 +170,10 @@ export async function createBot(): Promise<Bot> {
     { command: 'tts', description: '🔊 Toggle voice replies' },
     { command: 'health', description: '🩺 Compliance + observability dashboard' },
     { command: 'with', description: '🧠 Show recent OMI/memory mentions for a person' },
+    ...(masterEngineCommandsEnabled ? [
+      { command: 'engine', description: '⚙️ Show or switch AI engine' },
+      { command: 'codex', description: '🤖 Run a read-only Codex task' },
+    ] : []),
     { command: 'commands', description: '📜 List all commands' },
   ];
 
@@ -230,6 +243,10 @@ export async function createBot(): Promise<Bot> {
   bot.command('botstatus', handleBotStatus);
   bot.command('restartbot', handleRestartBot);
   bot.command('context', handleContext);
+  if (masterEngineCommandsEnabled) {
+    bot.command('engine', handleEngine);
+    bot.command('codex', handleCodex);
+  }
 
   bot.command('commands', handleCommands);
   bot.command('model', handleModelCommand);

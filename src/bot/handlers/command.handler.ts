@@ -72,6 +72,16 @@ import {
 } from '../../handler/request-registry.js';
 import { markCancelled } from '../../handler/request-context.js';
 import { countPending as countPendingInputs, countHandlerNoFinalize, markProcessing, markDone, markDropped, markError, markHandledNoAgent } from '../../inbox/input-log.js';
+import {
+  ENGINE_NAMES,
+  checkEngineAvailability,
+  getEngineSelection,
+  isEngineName,
+  isMasterEngineLane,
+  isSafeEngineModel,
+  runCodex,
+  setEngineSelection,
+} from '../../engines/engine.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -1550,7 +1560,83 @@ export async function handleResetCallback(ctx: Context): Promise<void> {
 }
 
 export async function handleCommands(ctx: Context): Promise<void> {
-  await replyMd(ctx, getAvailableCommands());
+  const isMasterLane = isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id);
+  const engineSection = isMasterLane
+    ? '\n\n*Engine Commands:*\n\n• `/engine` \\- Show or switch the active engine\n• `/codex <task>` \\- Run a read\\-only Codex task'
+    : '';
+  await replyMd(ctx, `${getAvailableCommands()}${engineSection}`);
+}
+
+/** Master-lane only. The registration gate in bot.ts hides this completely from person-bots. */
+export async function handleEngine(ctx: Context): Promise<void> {
+  if (!isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id)) return;
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (!keyInfo) return;
+  const { sessionKey } = keyInfo;
+  const args = (ctx.message?.text ?? '').trim().split(/\s+/).slice(1);
+
+  if (args.length === 0 || !args[0]) {
+    const current = getEngineSelection(sessionKey);
+    const statuses = await Promise.all(ENGINE_NAMES.map((engine) => checkEngineAvailability(engine)));
+    const availability = statuses
+      .map((status) => `• ${status.available ? '✅' : '❌'} ${status.engine}: ${status.detail}`)
+      .join('\n');
+    await ctx.reply(
+      `⚙️ Engine: ${current.engine}\n🤖 Model: ${current.model}\n\nAvailable:\n${availability}\n\nSwitch: /engine <anthropic|ollama|codex> [model]`,
+      { parse_mode: undefined },
+    );
+    return;
+  }
+
+  const requested = args[0].toLowerCase();
+  if (!isEngineName(requested)) {
+    await ctx.reply(`Unknown engine "${requested}". Available: ${ENGINE_NAMES.join(', ')}`, { parse_mode: undefined });
+    return;
+  }
+  const requestedModel = args.slice(1).join(' ');
+  if (requestedModel && !isSafeEngineModel(requestedModel)) {
+    await ctx.reply('Invalid model identifier. Use only letters, numbers, dots, colons, underscores, and hyphens.', { parse_mode: undefined });
+    return;
+  }
+
+  // Availability is checked BEFORE mutating the session. Failure leaves the
+  // active engine exactly as it was; there is deliberately no fallback.
+  const status = await checkEngineAvailability(requested);
+  if (!status.available) {
+    await ctx.reply(`Cannot switch to ${requested}: ${status.detail}. Active engine unchanged.`, { parse_mode: undefined });
+    return;
+  }
+  const selection = setEngineSelection(sessionKey, requested, requestedModel);
+  await ctx.reply(`✅ Active engine: ${selection.engine}\n🤖 Model: ${selection.model}`, { parse_mode: undefined });
+}
+
+/** Direct Codex escape hatch. Its fixed, read-only process invocation lives in engines/engine.ts. */
+export async function handleCodex(ctx: Context): Promise<void> {
+  if (!isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id)) return;
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (!keyInfo) return;
+  const task = (ctx.message?.text ?? '').replace(/^\/codex(?:@\w+)?\s*/i, '').trim();
+  if (!task) {
+    await ctx.reply('Usage: /codex <task>', { parse_mode: undefined });
+    return;
+  }
+  const session = sessionManager.getOrResumeSession(keyInfo.sessionKey);
+  if (!session) {
+    await ctx.reply('Set a project first with /project, then run /codex.', { parse_mode: undefined });
+    return;
+  }
+  const activeEngine = getEngineSelection(keyInfo.sessionKey);
+  const model = activeEngine.engine === 'codex'
+    ? activeEngine.model
+    : 'gpt-5.6-terra';
+  try {
+    await ctx.reply(`⏳ Codex is working (${model}, read-only)…`, { parse_mode: undefined });
+    const response = await runCodex(model, task, session.workingDirectory);
+    await ctx.reply(response.text, { parse_mode: undefined });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'unknown error';
+    await ctx.reply(`Codex failed: ${detail}`, { parse_mode: undefined });
+  }
 }
 
 export async function handleModelCommand(ctx: Context): Promise<void> {

@@ -26,6 +26,7 @@ import {
   QueueWaitTimeoutError,
 } from '../../claude/request-queue.js';
 import { isClaudeCommand } from '../../claude/command-parser.js';
+import { isMasterEngineLane, isRestrictedEngineCommand } from '../../engines/engine.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
 import { createTelegraphFromFile } from '../../telegram/telegraph.js';
 import { getStreamingMode, executeRedditFetch, executeMediumFetch, showExtractMenu, projectStatusSuffix, resumeCommandMessage } from './command.handler.js';
@@ -152,6 +153,13 @@ export async function handleMessage(ctx: Context): Promise<void> {
 
   if (!keyInfo || !text || !messageId || !messageDate) return;
   const { chatId, sessionKey } = keyInfo;
+
+  // Person-bots have no /engine or /codex capability. Because no command
+  // handler is registered for them, suppress manually typed variants here too
+  // so they are neither advertised nor forwarded to Claude as plain text.
+  if (isRestrictedEngineCommand(text) && !isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id)) {
+    return;
+  }
 
   // Deactivate voice-first mode when user switches to typing
   setVoiceFirstMode(sessionKey, false);

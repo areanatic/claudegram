@@ -45,6 +45,17 @@ const envSchema = z.object({
   // = fast default (user strategy); Opus only on-demand via /model opus. Both
   // effectiveModel AND getModel read this via resolveModel() → display==computed.
   CLAUDE_DEFAULT_MODEL: z.string().default('sonnet'),
+  // Cross-engine routing. The bot remains Claude/Anthropic by default so existing
+  // deployments keep their exact behaviour until an engine is explicitly chosen.
+  BOT_ENGINE: z.enum(['anthropic', 'ollama', 'codex']).default('anthropic'),
+  BOT_ENGINE_MODEL: z.string().default('').refine(
+    (value) => value === '' || /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value),
+    'BOT_ENGINE_MODEL must be a model identifier, not CLI arguments',
+  ),
+  // Local-only by default. Do not point this at a remote endpoint without an
+  // explicit privacy review.
+  OLLAMA_BASE_URL: z.string().url().default('http://127.0.0.1:11434'),
+  CODEX_EXECUTABLE_PATH: z.string().default('codex'),
   STREAMING_MODE: z.enum(['streaming', 'wait']).default('streaming'),
   STREAMING_DEBOUNCE_MS: z
     .string()
