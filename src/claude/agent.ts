@@ -69,7 +69,25 @@ export interface AgentUsage {
   windowTokens: number;
 }
 
-interface AgentResponse {
+/** Last MCP inventory reported by the SDK for a Telegram conversation.
+ *
+ * This is intentionally an observed runtime snapshot, not a reconstruction from
+ * configuration. Commands that describe capabilities must not claim an MCP is
+ * usable until the SDK has actually reported it as connected for that session.
+ */
+export interface McpInventorySnapshot {
+  observedAt: string;
+  servers: Array<{ name: string; status: string }>;
+  tools: string[];
+}
+
+const lastMcpInventories = new Map<string, McpInventorySnapshot>();
+
+export function getLastMcpInventory(sessionKey: string): McpInventorySnapshot | undefined {
+  return lastMcpInventories.get(sessionKey);
+}
+
+export interface AgentResponse {
   text: string;
   toolsUsed: string[];
   buttons?: string[];
@@ -1402,6 +1420,14 @@ export async function sendToAgent(
             model: sysMsg.model,
             sessionId: sysMsg.session_id,
           };
+          lastMcpInventories.set(sessionKey, {
+            observedAt: new Date().toISOString(),
+            servers: (sysMsg.mcp_servers || []).map((server) => ({
+              name: server.name,
+              status: server.status,
+            })),
+            tools: [...(sysMsg.tools || [])],
+          });
           logAt('basic', `[Claude] SESSION INIT: model=${sysMsg.model}, session=${sysMsg.session_id}`);
           // RI-24 Codex M-11: log actual MCP-server connect status + visible mail tools so we
           // can see WHY a scoped mail server is/ isn't reaching the bot (PID up != connected).

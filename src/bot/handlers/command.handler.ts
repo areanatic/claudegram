@@ -13,6 +13,7 @@ import {
   discardCancelledTurnState,
   setQuiet,
   isQuiet,
+  getLastMcpInventory,
 } from '../../claude/agent.js';
 import { occupancyTokens } from '../../claude/context-pressure.js';
 import { config } from '../../config.js';
@@ -1245,6 +1246,22 @@ export async function handleBrief(ctx: Context): Promise<void> {
     ? 'private (session ist in `/private on` — Brief NICHT via public MCP-Search findbar; nutze ihn direkt in der Folgefrage oder `/private off` vor `/brief`)'
     : 'public (Brief ist via input_log_search für den nächsten Agent-Turn findbar)';
 
+  // This answers the capability question from the SDK's last observed init
+  // event. Configuration alone is not evidence that an MCP process connected.
+  const mcpInventory = getLastMcpInventory(sessionKey);
+  const connectedServers = mcpInventory?.servers
+    .filter((server) => server.status === 'connected')
+    .map((server) => server.name) ?? [];
+  const connectedMcpTools = mcpInventory?.tools.filter((tool) => tool.startsWith('mcp__')) ?? [];
+  const mailTools = mcpInventory?.tools.filter((tool) => /(?:^|__)mail[_-]/i.test(tool)) ?? [];
+  const capabilityLines = mcpInventory
+    ? [
+        `- Letzter Agent-Start (${mcpInventory.observedAt.slice(0, 16).replace('T', ' ')} UTC): ${connectedServers.length ? `verbundene MCP-Server: ${connectedServers.join(', ')}` : 'keine verbundenen MCP-Server gemeldet'}`,
+        `- MCP-Werkzeuge: ${connectedMcpTools.length ? connectedMcpTools.join(', ') : 'keine gemeldet'}`,
+        `- Mail-Werkzeuge: ${mailTools.length ? `aktiv (${mailTools.length})` : 'nicht als verfügbar gemeldet'}`,
+      ]
+    : ['- Noch kein SDK-MCP-Inventar für diese Sitzung. Sende zuerst einen normalen Text-Turn; erst dessen Init ist ein Verfügbarkeitsbeweis.'];
+
   const lines: string[] = [
     `✅ Brief gespeichert${rowId != null ? ` (input_log id=${rowId})` : ''}`,
     `   Scope: ${briefScopeLabel}`,
@@ -1253,9 +1270,12 @@ export async function handleBrief(ctx: Context): Promise<void> {
     `- input_log letzte 10 Inputs: ${recentCount}${droppedCount > 0 ? ` (davon ${droppedCount} dropped — über input_log_search abrufbar)` : ''}`,
     `- Daily ${today}: ${dailyPresent ? 'vorhanden' : 'noch nicht angelegt'}`,
     '',
-    '*Was ich NICHT sehe:*',
+    '*Tatsächlich verbundene Fähigkeiten:*',
+    ...capabilityLines,
+    '',
+    '*Nicht automatisch eingebunden:*',
     '- ChatGPT-Sessions auf MacBook (keine Capture-Pipeline)',
-    '- Andere Apps ausserhalb NEXUS (Notes, Mail, Browser, etc.)',
+    '- Andere Apps ohne im letzten Agent-Start bestätigtes MCP',
     '',
     'Stelle deine Frage jetzt — ich nehme den Brief als Kontext.',
   ];
