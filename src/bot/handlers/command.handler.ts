@@ -1249,16 +1249,15 @@ export async function handleBrief(ctx: Context): Promise<void> {
   // This answers the capability question from the SDK's last observed init
   // event. Configuration alone is not evidence that an MCP process connected.
   const mcpInventory = getLastMcpInventory(sessionKey);
-  const connectedServers = mcpInventory?.servers
-    .filter((server) => server.status === 'connected')
-    .map((server) => server.name) ?? [];
-  const connectedMcpTools = mcpInventory?.tools.filter((tool) => tool.startsWith('mcp__')) ?? [];
-  const mailTools = mcpInventory?.tools.filter((tool) => /(?:^|__)mail[_-]/i.test(tool)) ?? [];
+  const capabilityHealth = mcpInventory?.capabilityHealth;
   const capabilityLines = mcpInventory
     ? [
-        `- Letzter Agent-Start (${mcpInventory.observedAt.slice(0, 16).replace('T', ' ')} UTC): ${connectedServers.length ? `verbundene MCP-Server: ${connectedServers.join(', ')}` : 'keine verbundenen MCP-Server gemeldet'}`,
-        `- MCP-Werkzeuge: ${connectedMcpTools.length ? connectedMcpTools.join(', ') : 'keine gemeldet'}`,
-        `- Mail-Werkzeuge: ${mailTools.length ? `aktiv (${mailTools.length})` : 'nicht als verfügbar gemeldet'}`,
+        `- Letzter Agent-Start (${mcpInventory.observedAt.slice(0, 16).replace('T', ' ')} UTC): ${capabilityHealth?.connectedServers.length ? `verbundene MCP-Server: ${capabilityHealth.connectedServers.join(', ')}` : 'keine verbundenen MCP-Server gemeldet'}`,
+        `- MCP-Werkzeuge live: ${capabilityHealth?.totalMcpTools ?? 0}; pro Server: ${Object.entries(capabilityHealth?.toolCountByServer ?? {}).map(([server, count]) => `${server}=${count}`).join(', ') || 'keine gemeldet'}`,
+        `- Mail-Konten: lokal ${capabilityHealth?.localMailAccountCount ?? 'unbekannt'}; Master gesamt ${capabilityHealth?.totalMasterMailAccountCount ?? 'unbekannt'} (inkl. mastor.prime nur bei workspace-google-rw-Verbindung)`,
+        ...(capabilityHealth?.missingServers.length
+          ? [`- ⚠️ WARNUNG: Soll-MCP fehlt oder ist nicht verbunden: ${capabilityHealth.missingServers.join(', ')}`]
+          : []),
       ]
     : ['- Noch kein SDK-MCP-Inventar für diese Sitzung. Sende zuerst einen normalen Text-Turn; erst dessen Init ist ein Verfügbarkeitsbeweis.'];
 

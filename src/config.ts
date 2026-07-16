@@ -384,6 +384,15 @@ const envSchema = z.object({
   // (drops the project .mcp.json inheritance) so the ONLY mail server is this scoped one.
   // Empty default = no scoped mail server for this bot.
   BOT_NEXUS_MAIL_MCP_COMMAND: z.string().default(''),
+  // Welle 1 (2026-07-16): Master has an explicit, strict MCP allow-list.
+  // The legacy BOT_NEXUS_MAIL_MCP_COMMAND remains the compatibility fallback
+  // for the already deployed master and the scoped person-bot wrappers.
+  // Do not put credentials in either variable; both values are executable
+  // wrapper paths only.
+  BOT_MASTER_NEXUS_MAIL_MCP_COMMAND: z.string().default(''),
+  BOT_MASTER_WORKSPACE_GOOGLE_MCP_COMMAND: z.string().default(
+    '/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/dirigent/mail/auth/workspace-mcp-rw.sh',
+  ),
   // WAVE-2 Light-Path (2026-06-03): which SDK settingSources to load. Default
   // 'project,user' = byte-identical old behavior. The 'project' source pulls the
   // NEXUS-root CLAUDE.md AND the 60 .claude/agents/ subagent bodies (~90k tok est.)
@@ -456,10 +465,14 @@ if (!parsed.success) {
 
 export const config = parsed.data;
 
+// The production Master is deliberately identified once and then used by the
+// MCP wiring and capability-health checks. Person bots never enter this path.
+export const isMasterBot = config.BOT_NAME === 'Nexusgram';
+
 // Phase 7.1 boot-assertion: master-bot must explicitly declare its scope.
 // Family-/test-bot default-fail-closed to 'public' (no assertion needed).
 // Identifier: BOT_NAME='Nexusgram' is the master-bot per master .env.
-if (config.BOT_NAME === 'Nexusgram' && config.NEXUS_MEMORY_SCOPE !== 'self_private') {
+if (isMasterBot && config.NEXUS_MEMORY_SCOPE !== 'self_private') {
   console.error(
     '❌ Master-bot boot-assertion failed (Phase 7.1):\n' +
     `   BOT_NAME='${config.BOT_NAME}' but NEXUS_MEMORY_SCOPE='${config.NEXUS_MEMORY_SCOPE ?? '(unset)'}'.\n` +

@@ -18,7 +18,7 @@ import { resolveModel } from './model-resolution.js';
 import { setActiveQuery, clearActiveQuery, isCancelled, clearCancelled, gracefulCancel, isCurrentTurnEpoch } from './request-queue.js';
 import { getActiveContextsForSession } from '../handler/request-registry.js';
 import type { Context } from 'grammy';
-import { config } from '../config.js';
+import { config, isMasterBot } from '../config.js';
 import { AgentWatchdog } from './agent-watchdog.js';
 import { createNexusgramMcpServer } from './mcp-tools.js';
 import {
@@ -37,6 +37,10 @@ import { isPrivate } from '../memory/privacy-state.js';
 import { buildRecentUploadsContext } from '../memory/recent-uploads.js';
 import { getLatestInputLog, markSideEffectStarted } from '../inbox/input-log.js';
 import { getEngineSelection, runAlternativeEngine } from '../engines/engine.js';
+import {
+  evaluateMcpCapabilityHealth,
+  type McpCapabilityHealth,
+} from './capability-health.js';
 
 /**
  * Privacy Mode Phase 1 — neutralizing system-prompt suffix.
@@ -79,12 +83,28 @@ export interface McpInventorySnapshot {
   observedAt: string;
   servers: Array<{ name: string; status: string }>;
   tools: string[];
+  capabilityHealth: McpCapabilityHealth;
 }
 
 const lastMcpInventories = new Map<string, McpInventorySnapshot>();
 
 export function getLastMcpInventory(sessionKey: string): McpInventorySnapshot | undefined {
   return lastMcpInventories.get(sessionKey);
+}
+
+const LOCAL_MAIL_ACCOUNTS_REGISTRY =
+  '/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/dirigent/mail/localsync/config/accounts.json';
+
+function getLocalMailAccountCount(): number | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(LOCAL_MAIL_ACCOUNTS_REGISTRY, 'utf8')) as {
+      accounts?: Record<string, unknown>;
+    };
+    return parsed.accounts ? Object.keys(parsed.accounts).length : null;
+  } catch (error) {
+    console.error(`[Claude] ⚠️ CAPABILITY WARN: local mail registry unreadable (${LOCAL_MAIL_ACCOUNTS_REGISTRY}):`, error);
+    return null;
+  }
 }
 
 export interface AgentResponse {
@@ -1144,13 +1164,33 @@ export async function sendToAgent(
       mcpServers['nexusgram-tools'] = server;
     }
 
+    // Welle 1: the Master uses an explicit allow-list, rather than inheriting
+    // the root .mcp.json. This preserves the RI-24 strict-MCP protection for
+    // person bots and additionally gives the Master its separate
+    // workspace-google-rw OAuth server for mastor.prime.
+    if (isMasterBot) {
+      const masterMailCommand = config.BOT_MASTER_NEXUS_MAIL_MCP_COMMAND
+        || config.BOT_NEXUS_MAIL_MCP_COMMAND
+        || '/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/dirigent/mail/localsync/bin/nexus-mail-mcp-master.sh';
+      const masterWorkspaceGoogleCommand = config.BOT_MASTER_WORKSPACE_GOOGLE_MCP_COMMAND
+        || '/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/dirigent/mail/auth/workspace-mcp-rw.sh';
+      mcpServers['nexus-mail'] = {
+        type: 'stdio',
+        command: 'bash',
+        args: [masterMailCommand],
+      };
+      mcpServers['workspace-google-rw'] = {
+        type: 'stdio',
+        command: 'bash',
+        args: [masterWorkspaceGoogleCommand],
+      };
     // RI-24 (2026-06-06): per-bot SCOPED mail MCP. When BOT_NEXUS_MAIL_MCP_COMMAND is set
     // (e.g. a person-bot like Alina), wire THIS bot's own nexus-mail server via the scoped
     // wrapper instead of inheriting the master nexus-mail from the shared NEXUS-root
     // .mcp.json. The wrapper exports NEXUS_ACCOUNT_SCOPE (server-side fail-closed). This
     // in-code mcpServers entry is authoritative; pair with BOT_SETTING_SOURCES=user so the
     // project .mcp.json (master mail) is not loaded at all → only the scoped server exists.
-    if (config.BOT_NEXUS_MAIL_MCP_COMMAND) {
+    } else if (config.BOT_NEXUS_MAIL_MCP_COMMAND) {
       mcpServers['nexus-mail'] = {
         type: 'stdio',
         command: 'bash',
@@ -1199,7 +1239,7 @@ export async function sendToAgent(
       // strictMcpConfig so the SDK does NOT additionally load the project/root .mcp.json
       // (which still defines the MASTER nexus-mail). Belt-and-suspenders with
       // BOT_SETTING_SOURCES=user → the master mail server cannot reach a person-bot.
-      ...(config.BOT_NEXUS_MAIL_MCP_COMMAND ? { strictMcpConfig: true } : {}),
+      ...(isMasterBot || config.BOT_NEXUS_MAIL_MCP_COMMAND ? { strictMcpConfig: true } : {}),
       permissionMode,
       abortController: controller,
       systemPrompt: {
@@ -1420,13 +1460,22 @@ export async function sendToAgent(
             model: sysMsg.model,
             sessionId: sysMsg.session_id,
           };
+          const servers = (sysMsg.mcp_servers || []).map((server) => ({
+            name: server.name,
+            status: server.status,
+          }));
+          const tools = [...(sysMsg.tools || [])];
+          const capabilityHealth = evaluateMcpCapabilityHealth({
+            isMasterBot,
+            servers,
+            tools,
+            localMailAccountCount: isMasterBot ? getLocalMailAccountCount() : null,
+          });
           lastMcpInventories.set(sessionKey, {
             observedAt: new Date().toISOString(),
-            servers: (sysMsg.mcp_servers || []).map((server) => ({
-              name: server.name,
-              status: server.status,
-            })),
-            tools: [...(sysMsg.tools || [])],
+            servers,
+            tools,
+            capabilityHealth,
           });
           logAt('basic', `[Claude] SESSION INIT: model=${sysMsg.model}, session=${sysMsg.session_id}`);
           // RI-24 Codex M-11: log actual MCP-server connect status + visible mail tools so we
@@ -1435,6 +1484,20 @@ export async function sendToAgent(
             const mcpStatus = (sysMsg.mcp_servers || []).map((s) => `${s.name}:${s.status}`).join(', ') || '(none)';
             const mailTools = (sysMsg.tools || []).filter((t) => /mail/i.test(t));
             logAt('basic', `[Claude] MCP-INIT: servers=[${mcpStatus}] mailTools=[${mailTools.join(', ') || 'none'}]`);
+            const serverToolCounts = Object.entries(capabilityHealth.toolCountByServer)
+              .map(([server, count]) => `${server}:${count}`)
+              .join(', ') || '(none)';
+            const mailCount = capabilityHealth.totalMasterMailAccountCount == null
+              ? 'unknown'
+              : String(capabilityHealth.totalMasterMailAccountCount);
+            if (capabilityHealth.missingServers.length) {
+              console.error(
+                `[Claude] ⚠️ CAPABILITY WARN: Master MCP degraded; missing=${capabilityHealth.missingServers.join(', ')} ` +
+                `connected=${capabilityHealth.connectedServers.join(', ') || '(none)'} tools=[${serverToolCounts}] mailAccounts=${mailCount}`,
+              );
+            } else if (isMasterBot) {
+              logAt('basic', `[Claude] CAPABILITY-OK: servers=[${capabilityHealth.connectedServers.join(', ')}] tools=[${serverToolCounts}] mailAccounts=${mailCount}`);
+            }
             // Hard fail-loud if a scoped mail server was wired but did not connect / expose tools.
             if (config.BOT_NEXUS_MAIL_MCP_COMMAND) {
               const mailConnected = (sysMsg.mcp_servers || []).some((s) => s.name === 'nexus-mail' && s.status === 'connected');
