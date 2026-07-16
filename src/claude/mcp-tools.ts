@@ -26,6 +26,7 @@ import {
   type EntitySearchHit,
 } from '../memory/nexus-memory.js';
 import { isPrivate } from '../memory/privacy-state.js';
+import { mailOverviewTool } from '../memory/mail-readonly.js';
 import { searchInputLog } from '../inbox/input-log.js';
 
 // Lazy imports to avoid circular deps and unnecessary module loading
@@ -126,6 +127,7 @@ function buildToolList(toolsCtx: McpToolsContext) {
   tools.push(nexusgramInputLogSearchTool(toolsCtx));
   tools.push(nexusgramReadDailyTool(toolsCtx));
   tools.push(nexusgramReadL1Tool(toolsCtx));
+  tools.push(mailOverviewTool(toolsCtx));   // P6: read-only mail overview (operator-gated, counts only)
 
   return tools;
 }
