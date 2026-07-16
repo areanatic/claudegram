@@ -41,6 +41,7 @@ import {
   evaluateMcpCapabilityHealth,
   type McpCapabilityHealth,
 } from './capability-health.js';
+import { buildVoiceCapabilityPrompt } from './voice-capabilities.js';
 
 /**
  * Privacy Mode Phase 1 — neutralizing system-prompt suffix.
@@ -902,6 +903,9 @@ export async function sendToAgent(
     const allowedToolsOption = config.DANGEROUS_MODE
       ? undefined
       : effectiveBotTools;
+    const voiceCapabilityPrompt = voiceMode
+      ? buildVoiceCapabilityPrompt(effectiveBotTools)
+      : '';
 
     // Schlachtplan Akt 1.3 Fix C: per-turn tool budget. When the agent issues
     // more tool_use blocks than this, the turn is aborted as a controlled
@@ -1245,7 +1249,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${todayContext}${previousDayContext}${recentUploadsContext}${contextAvailabilityContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
+        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}${voiceCapabilityPrompt}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${todayContext}${previousDayContext}${recentUploadsContext}${contextAvailabilityContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
       },
       settingSources: config.BOT_SETTING_SOURCES as SettingSource[],
       model: effectiveModel,

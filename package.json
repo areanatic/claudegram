@@ -9,7 +9,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test:capability-health": "node --import tsx src/claude/capability-health.test.ts"
+    "test:capability-health": "node --import tsx src/claude/capability-health.test.ts",
+    "test:voice-capabilities": "node --import tsx src/claude/voice-capabilities.test.ts"
   },
   "keywords": [
     "telegram",
