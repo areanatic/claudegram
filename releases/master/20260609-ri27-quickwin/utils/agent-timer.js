@@ -1,0 +1,73 @@
+/**
+ * Agent timer utility for tracking elapsed time during agent queries.
+ * Provides human-readable duration formatting and timing state management.
+ */
+/**
+ * Create a new agent timer initialized to the current time.
+ */
+export function createAgentTimer() {
+    const now = Date.now();
+    return {
+        startTime: now,
+        lastMessageTime: now,
+        messageCount: 0,
+    };
+}
+/**
+ * Record that a message was received, updating the last message time.
+ */
+export function recordMessage(timer) {
+    timer.lastMessageTime = Date.now();
+    timer.messageCount++;
+}
+/**
+ * Get elapsed milliseconds since timer start.
+ */
+export function getElapsedMs(timer) {
+    return Date.now() - timer.startTime;
+}
+/**
+ * Get milliseconds since last message was recorded.
+ */
+export function getSinceLastMessageMs(timer) {
+    return Date.now() - timer.lastMessageTime;
+}
+/**
+ * Format a duration in milliseconds to human-readable string.
+ * Examples: "0s", "45s", "1m 30s", "2m 0s"
+ */
+export function formatDuration(ms) {
+    const totalSeconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (minutes === 0) {
+        return `${seconds}s`;
+    }
+    return `${minutes}m ${seconds}s`;
+}
+/**
+ * Get a timing report string for logging.
+ */
+export function getTimingReport(timer) {
+    const elapsed = formatDuration(getElapsedMs(timer));
+    return `${elapsed} elapsed, ${timer.messageCount} messages`;
+}
+/**
+ * RF-6 Latenz-Marker (Wave 1 / Stream 1): freundliche, grobe Dauer für den User
+ * ("⏱ ~2 Min") auf langsamen Antworten. Auf ganze Minuten AUFGERUNDET (ehrliche
+ * Grob-Angabe, kein Pseudo-Präzises "1m 30s"); die Tilde signalisiert "ungefähr".
+ * Unter 60s fällt es auf Sekunden ("Xs") zurück — nur relevant, wenn
+ * LATENCY_MARKER_MIN_MS testweise < 60000 gesetzt ist. Reuse des bestehenden
+ * Elapsed-Mechanismus (getElapsedMs/AgentTimer) — KEIN zweiter Timer.
+ * Negative Inputs werden auf 0 geklemmt (Codex P2-Guard).
+ */
+export function formatLatencyMarker(ms) {
+    const safeMs = Math.max(0, ms);
+    const totalSeconds = Math.floor(safeMs / 1000);
+    if (totalSeconds < 60) {
+        return `${totalSeconds}s`;
+    }
+    const minutes = Math.ceil(safeMs / 60000);
+    return `~${minutes} Min`;
+}
+//# sourceMappingURL=agent-timer.js.map

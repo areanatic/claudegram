@@ -1,0 +1,292 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import { config } from '../../config.js';
+import { sendToAgent, StaleTurnError, assertTurnIsCurrent } from '../../claude/agent.js';
+import { runPostAgentSuccess } from './post-agent.js';
+import { getInputLogRowId } from '../middleware/input-log.middleware.js';
+import { markProcessing, markDone, markDropped, markError } from '../../inbox/input-log.js';
+import { sessionManager } from '../../claude/session-manager.js';
+import { messageSender } from '../../telegram/message-sender.js';
+import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
+import { isStaleMessage, shouldNotifyStale, getStaleAgeMinutes } from '../middleware/stale-filter.js';
+import { queueRequest, isProcessing, getQueuePosition, setAbortController, } from '../../claude/request-queue.js';
+import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
+import { getStreamingMode } from './command.handler.js';
+import { downloadFileSecure, getTelegramFileUrl } from '../../utils/download.js';
+import { sanitizeError } from '../../utils/sanitize.js';
+import { isValidImageFile, getFileType } from '../../utils/file-type.js';
+import { getSessionKeyFromCtx } from '../../utils/session-key.js';
+import { recordUpload } from '../../memory/recent-uploads.js';
+const UPLOADS_DIR = '.nexusgram/uploads';
+function sanitizeFileName(name) {
+    return path.basename(name).replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+function ensureUploadsDir(projectDir) {
+    const dir = path.join(projectDir, UPLOADS_DIR);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return dir;
+}
+function pickLargestPhoto(photoSizes) {
+    return photoSizes.reduce((best, current) => {
+        const bestSize = best.file_size || 0;
+        const currentSize = current.file_size || 0;
+        return currentSize > bestSize ? current : best;
+    });
+}
+async function downloadTelegramFile(ctx, fileId, destPath) {
+    const file = await ctx.api.getFile(fileId);
+    if (!file.file_path) {
+        throw new Error('Telegram did not provide file_path for this image.');
+    }
+    const fileUrl = getTelegramFileUrl(config.TELEGRAM_BOT_TOKEN, file.file_path);
+    await downloadFileSecure(fileUrl, destPath);
+    return file.file_path;
+}
+async function handleSavedImage(ctx, savedPath, caption) {
+    const keyInfo = getSessionKeyFromCtx(ctx);
+    if (!keyInfo)
+        return;
+    const { sessionKey } = keyInfo;
+    const session = sessionManager.getSession(sessionKey);
+    if (!session)
+        return;
+    const relativePath = path.relative(session.workingDirectory, savedPath);
+    // Record in sidecar so we can recover the path after context compaction.
+    recordUpload(session.workingDirectory, {
+        path: savedPath,
+        caption: caption || '',
+    });
+    const captionText = caption?.trim();
+    const noteLines = [
+        'User uploaded an image to the project.',
+        `Saved at: ${savedPath}`,
+        `Relative path: ${relativePath}`,
+        captionText ? `Caption: "${captionText}"` : 'Caption: (none)',
+        'If the caption includes a question or request, answer it. Otherwise, acknowledge briefly and ask if they want any analysis or edits.',
+        'You can inspect the image with tools if needed (e.g. Python + PIL).',
+    ];
+    const agentPrompt = noteLines.join('\n');
+    if (isProcessing(sessionKey)) {
+        const position = getQueuePosition(sessionKey) + 1;
+        await ctx.reply(`⏳ Queued \(position ${position}\)`, { parse_mode: 'MarkdownV2' });
+    }
+    // RI-23 (2026-06-06, Codex M-11 Q2): hoist the input-log row id OUT of the queueRequest
+    // callback so the outer catch can tag it. Without explicit marking, the catch-all
+    // finalizeIfOpen tagged every successful photo turn 'handler_no_finalize' (= measurement
+    // artefact, not data loss). Mirror message.handler.ts: markProcessing → markDone / markError.
+    const inputLogRowId = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
+    try {
+        await queueRequest(sessionKey, agentPrompt, async (turnEpoch) => {
+            // D0 Hardening Item 1 / Amendment A (2026-05-27): close pre-side-effect
+            // race-window before startStreaming/setAbortController/sendToAgent.
+            assertTurnIsCurrent(sessionKey, turnEpoch);
+            markProcessing(inputLogRowId);
+            if (getStreamingMode() === 'streaming') {
+                await messageSender.startStreaming(ctx);
+                const abortController = new AbortController();
+                setAbortController(sessionKey, abortController, turnEpoch);
+                try {
+                    const response = await sendToAgent(sessionKey, agentPrompt, {
+                        onProgress: (progressText) => {
+                            messageSender.updateStream(ctx, progressText);
+                        },
+                        abortController,
+                        telegramCtx: ctx,
+                        currentInputLogRowId: inputLogRowId,
+                        turnEpoch,
+                    });
+                    await messageSender.finishStreaming(ctx, response.text);
+                    await runPostAgentSuccess(ctx, sessionKey, response);
+                    markDone(inputLogRowId);
+                }
+                catch (error) {
+                    await messageSender.cancelStreaming(ctx);
+                    throw error;
+                }
+            }
+            else {
+                await ctx.replyWithChatAction('typing');
+                const abortController = new AbortController();
+                setAbortController(sessionKey, abortController, turnEpoch);
+                const response = await sendToAgent(sessionKey, agentPrompt, {
+                    abortController,
+                    telegramCtx: ctx,
+                    currentInputLogRowId: inputLogRowId,
+                    turnEpoch,
+                });
+                await messageSender.sendMessage(ctx, response.text);
+                await runPostAgentSuccess(ctx, sessionKey, response);
+                markDone(inputLogRowId);
+            }
+        });
+    }
+    catch (error) {
+        if (error.message === 'Queue cleared') {
+            markDropped(inputLogRowId, 'queue_cleared');
+            return;
+        }
+        // Codex round 7: stale turn superseded — swallow silently.
+        if (error instanceof StaleTurnError) {
+            console.log(`[Photo] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
+            markDropped(inputLogRowId, 'superseded');
+            return;
+        }
+        const errorMessage = sanitizeError(error);
+        console.error('[Photo] Agent error:', errorMessage);
+        markError(inputLogRowId, errorMessage.slice(0, 200));
+        await ctx.reply(`Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+    }
+}
+export async function handlePhoto(ctx) {
+    const keyInfo = getSessionKeyFromCtx(ctx);
+    const messageId = ctx.message?.message_id;
+    const messageDate = ctx.message?.date;
+    const photos = ctx.message?.photo;
+    if (!keyInfo || !messageId || !messageDate || !photos || photos.length === 0)
+        return;
+    const { sessionKey } = keyInfo;
+    if (isStaleMessage(messageDate)) {
+        console.log(`[Photo] Ignoring stale photo message ${messageId}`);
+        if (shouldNotifyStale(sessionKey)) {
+            const mins = getStaleAgeMinutes(messageDate);
+            try {
+                await ctx.reply(`⚡ Ich war kurz offline. Deine Nachricht von vor ~${mins} Minute${mins === 1 ? '' : 'n'} habe ich leider verpasst — bitte schick sie nochmal!`);
+            }
+            catch { /* ignore — notification is best-effort */ }
+        }
+        return;
+    }
+    if (isDuplicate(messageId)) {
+        console.log(`[Photo] Ignoring duplicate photo message ${messageId}`);
+        return;
+    }
+    markProcessed(messageId);
+    const session = sessionManager.getOrResumeSession(sessionKey);
+    if (!session) {
+        await ctx.reply('⚠️ No project set\\.\n\nIf the bot restarted, use `/continue` or `/resume` to restore your last session\\.\nOr use `/project` to open a project first\\.', { parse_mode: 'MarkdownV2' });
+        return;
+    }
+    const largest = pickLargestPhoto(photos);
+    const fileSizeBytes = largest.file_size || 0;
+    const fileSizeMB = fileSizeBytes / (1024 * 1024);
+    if (fileSizeMB > config.IMAGE_MAX_FILE_SIZE_MB) {
+        await ctx.reply(`❌ Image too large \(${esc(fileSizeMB.toFixed(1))}MB\)\.
+\nPlease send images under ${esc(String(config.IMAGE_MAX_FILE_SIZE_MB))}MB\.`, { parse_mode: 'MarkdownV2' });
+        return;
+    }
+    const uploadsDir = ensureUploadsDir(session.workingDirectory);
+    const timestamp = Date.now();
+    const safeUniqueId = sanitizeFileName(largest.file_unique_id);
+    const fallbackName = `photo_${timestamp}_${safeUniqueId}.jpg`;
+    const destPath = path.join(uploadsDir, fallbackName);
+    try {
+        const filePath = await downloadTelegramFile(ctx, largest.file_id, destPath);
+        // Validate file content via magic bytes (defense against spoofed MIME types)
+        let isValid = false;
+        try {
+            isValid = isValidImageFile(destPath);
+        }
+        catch {
+            // Validation threw — treat as invalid
+        }
+        if (!isValid) {
+            if (fs.existsSync(destPath))
+                fs.unlinkSync(destPath);
+            throw new Error('Downloaded file is not a valid image.');
+        }
+        // Get actual file type from magic bytes instead of trusting extension
+        const actualType = getFileType(destPath);
+        const rawExt = actualType?.extension || path.extname(filePath) || '.jpg';
+        const ext = rawExt.startsWith('.') ? rawExt : `.${rawExt}`;
+        const finalPath = ext && ext !== '.jpg'
+            ? destPath.replace(/\.jpg$/, ext)
+            : destPath;
+        if (finalPath !== destPath) {
+            fs.renameSync(destPath, finalPath);
+        }
+        const buffer = fs.readFileSync(finalPath);
+        if (!buffer.length) {
+            throw new Error('Downloaded image is empty.');
+        }
+        await handleSavedImage(ctx, finalPath, ctx.message?.caption);
+    }
+    catch (error) {
+        const errorMessage = sanitizeError(error);
+        console.error('[Photo] Error:', errorMessage);
+        await ctx.reply(`❌ Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+    }
+}
+export async function handleImageDocument(ctx) {
+    const keyInfo = getSessionKeyFromCtx(ctx);
+    const messageId = ctx.message?.message_id;
+    const messageDate = ctx.message?.date;
+    const document = ctx.message?.document;
+    if (!keyInfo || !messageId || !messageDate || !document)
+        return;
+    const { sessionKey } = keyInfo;
+    // Only handle image documents
+    if (!document.mime_type || !document.mime_type.startsWith('image/')) {
+        return;
+    }
+    if (isStaleMessage(messageDate)) {
+        console.log(`[ImageDoc] Ignoring stale document ${messageId}`);
+        if (shouldNotifyStale(sessionKey)) {
+            const mins = getStaleAgeMinutes(messageDate);
+            try {
+                await ctx.reply(`⚡ Ich war kurz offline. Deine Nachricht von vor ~${mins} Minute${mins === 1 ? '' : 'n'} habe ich leider verpasst — bitte schick sie nochmal!`);
+            }
+            catch { /* ignore — notification is best-effort */ }
+        }
+        return;
+    }
+    if (isDuplicate(messageId)) {
+        console.log(`[ImageDoc] Ignoring duplicate document ${messageId}`);
+        return;
+    }
+    markProcessed(messageId);
+    const session = sessionManager.getOrResumeSession(sessionKey);
+    if (!session) {
+        await ctx.reply('⚠️ No project set\\.\n\nIf the bot restarted, use `/continue` or `/resume` to restore your last session\\.\nOr use `/project` to open a project first\\.', { parse_mode: 'MarkdownV2' });
+        return;
+    }
+    const fileSizeBytes = document.file_size || 0;
+    const fileSizeMB = fileSizeBytes / (1024 * 1024);
+    if (fileSizeMB > config.IMAGE_MAX_FILE_SIZE_MB) {
+        await ctx.reply(`❌ Image too large \(${esc(fileSizeMB.toFixed(1))}MB\)\.
+\nPlease send images under ${esc(String(config.IMAGE_MAX_FILE_SIZE_MB))}MB\.`, { parse_mode: 'MarkdownV2' });
+        return;
+    }
+    const uploadsDir = ensureUploadsDir(session.workingDirectory);
+    const timestamp = Date.now();
+    const originalName = document.file_name ? sanitizeFileName(document.file_name) : '';
+    const ext = originalName.includes('.') ? '' : '.jpg';
+    const baseName = originalName || `image_${timestamp}_${document.file_unique_id}${ext}`;
+    const destPath = path.join(uploadsDir, `${timestamp}_${baseName}`);
+    try {
+        await downloadTelegramFile(ctx, document.file_id, destPath);
+        // Validate file content via magic bytes (defense against spoofed MIME types)
+        let isValid = false;
+        try {
+            isValid = isValidImageFile(destPath);
+        }
+        catch {
+            // Validation threw — treat as invalid
+        }
+        if (!isValid) {
+            if (fs.existsSync(destPath))
+                fs.unlinkSync(destPath);
+            throw new Error('Downloaded file is not a valid image.');
+        }
+        const buffer = fs.readFileSync(destPath);
+        if (!buffer.length) {
+            throw new Error('Downloaded image is empty.');
+        }
+        await handleSavedImage(ctx, destPath, ctx.message?.caption);
+    }
+    catch (error) {
+        const errorMessage = sanitizeError(error);
+        console.error('[ImageDoc] Error:', errorMessage);
+        await ctx.reply(`❌ Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+    }
+}
+//# sourceMappingURL=photo.handler.js.map

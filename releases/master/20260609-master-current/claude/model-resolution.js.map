@@ -1,0 +1,1 @@
+{"version":3,"file":"model-resolution.js","sourceRoot":"","sources":["../../src/claude/model-resolution.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;GAYG;AACH,MAAM,CAAC,MAAM,sBAAsB,GAAG,QAAQ,CAAC;AAE/C,MAAM,UAAU,YAAY,CAC1B,QAA4B,EAC5B,UAA8B,EAC9B,aAAiC;IAEjC,OAAO,QAAQ,IAAI,UAAU,IAAI,aAAa,IAAI,sBAAsB,CAAC;AAC3E,CAAC"}
