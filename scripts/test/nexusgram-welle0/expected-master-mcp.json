@@ -1,9 +1,33 @@
 {
   "servers": ["nexusgram-tools", "nexus-mail"],
   "tools": [
+    "mcp__nexusgram-tools__nexusgram_list_projects",
+    "mcp__nexusgram-tools__nexusgram_switch_project",
+    "mcp__nexusgram-tools__nexusgram_send_file",
+    "mcp__nexusgram-tools__nexusgram_memory_search",
+    "mcp__nexusgram-tools__nexus_memory_recent",
+    "mcp__nexusgram-tools__omi_task_search",
+    "mcp__nexusgram-tools__omi_person_timeline",
+    "mcp__nexusgram-tools__omi_entity_search",
+    "mcp__nexusgram-tools__nexusgram_input_log_search",
+    "mcp__nexusgram-tools__nexusgram_read_daily",
+    "mcp__nexusgram-tools__nexusgram_read_l1",
+    "mcp__nexusgram-tools__nexusgram_mail_overview",
     "mcp__nexus-mail__mail_search",
     "mcp__nexus-mail__mail_read",
     "mcp__nexus-mail__mail_recent",
-    "mcp__nexus-mail__mail_send"
+    "mcp__nexus-mail__mail_send",
+    "mcp__nexus-mail__cal_upcoming",
+    "mcp__nexus-mail__cal_search",
+    "mcp__nexus-mail__cal_icloud_upcoming",
+    "mcp__nexus-mail__cal_list",
+    "mcp__nexus-mail__cal_create",
+    "mcp__nexus-mail__cal_delete",
+    "mcp__nexus-mail__cal_mkcalendar",
+    "mcp__nexus-mail__gcal_list",
+    "mcp__nexus-mail__gcal_upcoming",
+    "mcp__nexus-mail__gcal_create",
+    "mcp__nexus-mail__gcal_delete",
+    "mcp__nexus-mail__gcal_mkcalendar"
   ]
 }
