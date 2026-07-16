@@ -1,0 +1,9 @@
+{
+  "servers": ["nexusgram-tools", "nexus-mail"],
+  "tools": [
+    "mcp__nexus-mail__mail_search",
+    "mcp__nexus-mail__mail_read",
+    "mcp__nexus-mail__mail_recent",
+    "mcp__nexus-mail__mail_send"
+  ]
+}
