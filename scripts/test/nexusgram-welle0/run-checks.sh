@@ -43,7 +43,9 @@ except Exception: print("")'
 }
 
 if need_file "$EXPECTED_MCP_JSON" "mcp-inventory" && need_file "$ACCOUNTS_JSON" "master-accounts"; then
-  if inventory="$(turn "$MASTER_BOT_USERNAME" '/brief')"; then
+  # /brief without text intentionally returns usage and does not expose the
+  # observed MCP snapshot. A bounded persisted probe is therefore required.
+  if inventory="$(turn "$MASTER_BOT_USERNAME" '/brief WELLE0 MCP inventory probe')"; then
     reply="$(printf '%s' "$inventory" | json_reply)"
     if printf '%s' "$reply" | "$PYTHON_BIN" -c 'import json, sys
 expected = json.load(open(sys.argv[1]))

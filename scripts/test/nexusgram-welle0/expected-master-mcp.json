@@ -1,5 +1,5 @@
 {
-  "servers": ["nexusgram-tools", "nexus-mail"],
+  "servers": ["nexusgram-tools", "nexus-mail", "workspace-google-rw"],
   "tools": [
     "mcp__nexusgram-tools__nexusgram_list_projects",
     "mcp__nexusgram-tools__nexusgram_switch_project",

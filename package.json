@@ -8,7 +8,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:capability-health": "node --import tsx src/claude/capability-health.test.ts"
   },
   "keywords": [
     "telegram",
