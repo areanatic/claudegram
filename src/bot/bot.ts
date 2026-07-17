@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { buildSessionKey } from '../utils/session-key.js';
 import { authMiddleware } from './middleware/auth.middleware.js';
 import { inputLogMiddleware } from './middleware/input-log.middleware.js';
+import { taskLedgerMiddleware } from './middleware/task-ledger.middleware.js';
 import {
   handleStart,
   handleClear,
@@ -207,6 +208,10 @@ export async function createBot(): Promise<Bot> {
 
   // Apply auth middleware to all updates
   bot.use(authMiddleware);
+
+  // Sprint 3: this is a hard write-ahead gate. A content update does not reach
+  // a handler until its per-bot task record is safely on disk.
+  bot.use(taskLedgerMiddleware);
 
   // Schlachtplan Akt 1.2: durable Input-Log. Registered AFTER auth, BEFORE
   // sequentialize — every content update is persisted to SQLite + ACKed the

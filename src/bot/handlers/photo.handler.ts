@@ -5,7 +5,9 @@ import { config } from '../../config.js';
 import { sendToAgent, StaleTurnError, assertTurnIsCurrent } from '../../claude/agent.js';
 import { runPostAgentSuccess } from './post-agent.js';
 import { getInputLogRowId } from '../middleware/input-log.middleware.js';
+import { getTaskLedgerId } from '../middleware/task-ledger.middleware.js';
 import { markProcessing, markDone, markDropped, markError } from '../../inbox/input-log.js';
+import { completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -99,11 +101,13 @@ async function handleSavedImage(
   // finalizeIfOpen tagged every successful photo turn 'handler_no_finalize' (= measurement
   // artefact, not data loss). Mirror message.handler.ts: markProcessing → markDone / markError.
   const inputLogRowId = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
+  const taskLedgerId = getTaskLedgerId(ctx.chat?.id, ctx.message?.message_id);
   try {
     await queueRequest(sessionKey, agentPrompt, async (turnEpoch) => {
       // D0 Hardening Item 1 / Amendment A (2026-05-27): close pre-side-effect
       // race-window before startStreaming/setAbortController/sendToAgent.
       assertTurnIsCurrent(sessionKey, turnEpoch);
+      startTask(taskLedgerId);
       markProcessing(inputLogRowId);
       if (getStreamingMode() === 'streaming') {
         await messageSender.startStreaming(ctx);
@@ -125,6 +129,7 @@ async function handleSavedImage(
           await messageSender.finishStreaming(ctx, response.text);
           await runPostAgentSuccess(ctx, sessionKey, response);
           markDone(inputLogRowId);
+          completeTask(taskLedgerId);
         } catch (error) {
           await messageSender.cancelStreaming(ctx);
           throw error;
@@ -143,19 +148,22 @@ async function handleSavedImage(
         await messageSender.sendMessage(ctx, response.text);
         await runPostAgentSuccess(ctx, sessionKey, response);
         markDone(inputLogRowId);
+        completeTask(taskLedgerId);
       }
     });
   } catch (error) {
-    if ((error as Error).message === 'Queue cleared') { markDropped(inputLogRowId, 'queue_cleared'); return; }
+    if ((error as Error).message === 'Queue cleared') { markDropped(inputLogRowId, 'queue_cleared'); interruptTask(taskLedgerId, 'queue_cleared'); return; }
     // Codex round 7: stale turn superseded — swallow silently.
     if (error instanceof StaleTurnError) {
       console.log(`[Photo] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
       markDropped(inputLogRowId, 'superseded');
+      interruptTask(taskLedgerId, 'superseded');
       return;
     }
     const errorMessage = sanitizeError(error);
     console.error('[Photo] Agent error:', errorMessage);
     markError(inputLogRowId, errorMessage.slice(0, 200));
+    failTask(taskLedgerId, errorMessage);
     await ctx.reply(`Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
   }
 }
@@ -168,6 +176,7 @@ export async function handlePhoto(ctx: Context): Promise<void> {
 
   if (!keyInfo || !messageId || !messageDate || !photos || photos.length === 0) return;
   const { sessionKey } = keyInfo;
+  const taskLedgerId = getTaskLedgerId(ctx.chat?.id, messageId);
 
   if (isStaleMessage(messageDate)) {
     console.log(`[Photo] Ignoring stale photo message ${messageId}`);
@@ -214,6 +223,7 @@ export async function handlePhoto(ctx: Context): Promise<void> {
   const destPath = path.join(uploadsDir, fallbackName);
 
   try {
+    startTask(taskLedgerId);
     const filePath = await downloadTelegramFile(ctx, largest.file_id, destPath);
 
     // Validate file content via magic bytes (defense against spoofed MIME types)
@@ -248,6 +258,7 @@ export async function handlePhoto(ctx: Context): Promise<void> {
     await handleSavedImage(ctx, finalPath, ctx.message?.caption);
   } catch (error) {
     const errorMessage = sanitizeError(error);
+    failTask(taskLedgerId, errorMessage);
     console.error('[Photo] Error:', errorMessage);
     await ctx.reply(`❌ Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
   }
@@ -261,6 +272,7 @@ export async function handleImageDocument(ctx: Context): Promise<void> {
 
   if (!keyInfo || !messageId || !messageDate || !document) return;
   const { sessionKey } = keyInfo;
+  const taskLedgerId = getTaskLedgerId(ctx.chat?.id, messageId);
 
   // Only handle image documents
   if (!document.mime_type || !document.mime_type.startsWith('image/')) {
@@ -312,6 +324,7 @@ export async function handleImageDocument(ctx: Context): Promise<void> {
   const destPath = path.join(uploadsDir, `${timestamp}_${baseName}`);
 
   try {
+    startTask(taskLedgerId);
     await downloadTelegramFile(ctx, document.file_id, destPath);
 
     // Validate file content via magic bytes (defense against spoofed MIME types)
@@ -334,6 +347,7 @@ export async function handleImageDocument(ctx: Context): Promise<void> {
     await handleSavedImage(ctx, destPath, ctx.message?.caption);
   } catch (error) {
     const errorMessage = sanitizeError(error);
+    failTask(taskLedgerId, errorMessage);
     console.error('[ImageDoc] Error:', errorMessage);
     await ctx.reply(`❌ Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
   }

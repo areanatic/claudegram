@@ -6,6 +6,7 @@ import { preventSleep, allowSleep } from './utils/caffeinate.js';
 import { stopCleanup } from './telegram/deduplication.js';
 import { closeMemoryDb } from './memory/nexus-memory.js';
 import { closeInputLog, ensureInputLogInitialized, claimResumableOrphans } from './inbox/input-log.js';
+import { closeTaskLedger, ensureTaskLedgerInitialized, recoverOpenTasks, type OpenTask } from './inbox/task-ledger.js';
 import { runAutoResume } from './inbox/auto-resume.js';
 import { acquireLock, releaseLock } from './utils/pid-lock.js';
 import { cancelAllRequests, getActiveSessionKeys } from './claude/request-queue.js';
@@ -13,6 +14,31 @@ import { parseSessionKey } from './utils/session-key.js';
 import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
 import { startScannerProWatcher, stopScannerProWatcher } from './scanners/scanner-pro-watcher.js';
 import { startOmiBridgeWatcher, stopOmiBridgeWatcher } from './scanners/omi-bridge-watcher.js';
+
+async function notifyOpenTasks(bot: Awaited<ReturnType<typeof createBot>>, tasks: OpenTask[]): Promise<void> {
+  if (!tasks.length) return;
+  const bySession = new Map<string, OpenTask[]>();
+  for (const task of tasks) {
+    const list = bySession.get(task.sessionKey) ?? [];
+    list.push(task);
+    bySession.set(task.sessionKey, list);
+  }
+  for (const [sessionKey, sessionTasks] of bySession) {
+    const { chatId, threadId } = parseSessionKey(sessionKey);
+    // Do not echo task text at boot: a recovery message can be visible in a
+    // group/topic. Kind and failure reason are sufficient to resume safely.
+    const previews = sessionTasks.slice(0, 3).map((task) =>
+      `• ${task.taskKind}${task.reason ? ` (${task.reason})` : ''}`,
+    );
+    const remainder = sessionTasks.length > previews.length ? `\n… und ${sessionTasks.length - previews.length} weitere.` : '';
+    const message = `⚠️ Ich habe noch ${sessionTasks.length} offene Aufträge aus der vorherigen Sitzung:\n${previews.join('\n')}${remainder}\n\nSchreib „weiter“, wenn ich einen davon fortsetzen soll.`;
+    try {
+      await bot.api.sendMessage(chatId, message, threadId === undefined ? {} : { message_thread_id: threadId });
+    } catch (error) {
+      console.error(`[TaskLedger] open-task recovery notice failed for ${sessionKey}:`, error);
+    }
+  }
+}
 
 async function main() {
   // Clear CLAUDECODE so claude subprocesses can start even when launched
@@ -47,6 +73,10 @@ async function main() {
   // migration + FTS rebuild while a parallel session held a connection.
   // Deterministic boot-time init removes that lock-risk surface.
   ensureInputLogInitialized();
+  // Fail loud before polling: accepting a task without its durable ledger would
+  // recreate the exact restart/timeout loss this sprint closes.
+  ensureTaskLedgerInitialized();
+  const openTasks = recoverOpenTasks();
 
   // INV-01 Auto-Resume + boot-recovery: any input_log row still
   // 'received'/'processing' is orphaned from a previous process. claimResumableOrphans
@@ -108,6 +138,7 @@ async function main() {
   // runner is polling (the per-session queue + agent need the bot live), exactly
   // like the watchers above — boot latency must never block responsiveness.
   void runAutoResume(bot, recovery);
+  void notifyOpenTasks(bot, openTasks);
 
   // FIX 4 (2026-05-22): tell users whose in-flight message was lost to a
   // crash/restart. With INV-01 these are now only the NON-replayable recent
@@ -208,6 +239,7 @@ async function main() {
     stopCleanup();
     closeMemoryDb();
     closeInputLog();
+    closeTaskLedger();
 
     console.log('[Shutdown] Done. Exiting.');
     process.exit(0);

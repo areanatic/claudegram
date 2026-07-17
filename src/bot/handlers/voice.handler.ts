@@ -33,7 +33,9 @@ import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/foll
 import { runPostAgentSuccess } from './post-agent.js';
 import { takeFreshTranscribeReply } from './transcribe-pending.js';
 import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.middleware.js';
+import { getTaskLedgerId } from '../middleware/task-ledger.middleware.js';
 import { markProcessing, markDone, markDropped, markError, attachContent, markHandledNoAgent } from '../../inbox/input-log.js';
+import { completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
 import { tryAutoDispatch } from '../../inbox/input-auto-dispatch.js';
 import { withHardTimeout, HardTimeoutError } from '../../utils/hard-timeout.js';
 
@@ -50,6 +52,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
   // before sequentialize. Track its lifecycle so a watchdog-cancel or error
   // leaves an honest status on disk instead of a silently-lost input.
   const inputLogRowId = getInputLogRowId(chatId, messageId);
+  const taskLedgerId = getTaskLedgerId(chatId, messageId);
 
   // Stale/duplicate filters
   if (isStaleMessage(messageDate)) {
@@ -282,6 +285,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
       // + withHardTimeout BEFORE the existing sendToAgent epoch-guard would
       // fire. Same pattern as message.handler.
       assertTurnIsCurrent(sessionKey, turnEpoch);
+      startTask(taskLedgerId);
       // Input-Log: turn has been dequeued and is now actually running.
       markProcessing(inputLogRowId);
 
@@ -373,6 +377,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
           // before, so a voice-heavy session could fill the window unchecked.
           await runPostAgentSuccess(ctx, sessionKey, response);
           markDone(inputLogRowId);
+          completeTask(taskLedgerId);
         },
         voiceHardCapMs,
         () => {
@@ -389,6 +394,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
   } catch (error) {
     if ((error as Error).message === 'Queue cleared') {
       markDropped(inputLogRowId, 'queue_cleared');
+      interruptTask(taskLedgerId, 'queue_cleared');
       return;
     }
     // Codex round 7: a stale turn was superseded by a newer one. Swallow
@@ -396,6 +402,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
     if (error instanceof StaleTurnError) {
       console.log(`[Voice] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
       markDropped(inputLogRowId, 'superseded');
+      interruptTask(taskLedgerId, 'superseded');
       return;
     }
 
@@ -439,9 +446,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
       // briefing was lost (2026-05-24 21:39 ChatGPT-briefing voice_hard_timeout).
       errorMessage = '⏱️ Das hat zu lange gedauert und wurde abgebrochen.\n📝 Dein Transkript ist gespeichert (input_log) und ich kann später drauf zugreifen.\nWenn du eine Antwort brauchst, schick die Frage nochmal — gern etwas kürzer.';
       markDropped(inputLogRowId, 'voice_hard_timeout');
+      interruptTask(taskLedgerId, 'voice_hard_timeout');
     } else {
       errorMessage = sanitizeError(error);
       markError(inputLogRowId, errorMessage.slice(0, 200));
+      failTask(taskLedgerId, errorMessage);
     }
     console.error('[Voice] Error:', isHardTimeout ? 'voice-hard-timeout' : errorMessage);
 
