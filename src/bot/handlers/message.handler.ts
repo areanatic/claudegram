@@ -11,7 +11,7 @@ import {
 } from '../../claude/agent.js';
 import { runPostAgentSuccess } from './post-agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
-import { config } from '../../config.js';
+import { config, isMasterBot } from '../../config.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
 import { isStaleMessage, shouldNotifyStale, getStaleAgeMinutes } from '../middleware/stale-filter.js';
@@ -57,6 +57,7 @@ import {
   type RequestOrigin,
 } from '../../handler/request-context.js';
 import { recordSuccessfulTurn } from '../../health/bot-health.js';
+import { enqueueRelay, isRestrictedCrossBotCommand, parseMasterRelay } from '../../crossbot/relay.js';
 
 async function replyFeatureDisabled(ctx: Context, feature: string): Promise<void> {
   await ctx.reply(`⚠️ ${feature} feature is disabled in configuration.`, { parse_mode: undefined });
@@ -170,7 +171,10 @@ export async function handleMessage(ctx: Context): Promise<void> {
   // Person-bots have no /engine or /codex capability. Because no command
   // handler is registered for them, suppress manually typed variants here too
   // so they are neither advertised nor forwarded to Claude as plain text.
-  if (isRestrictedEngineCommand(text) && !isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id, config.BOT_ROLE)) {
+  if (
+    (isRestrictedEngineCommand(text) || isRestrictedCrossBotCommand(text)) &&
+    !isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id, config.BOT_ROLE)
+  ) {
     return;
   }
 
@@ -313,11 +317,33 @@ export async function handleMessage(ctx: Context): Promise<void> {
     return;
   }
 
+  // Sprint 7: this is an actual relay, not a prompt promise. Only the master
+  // writes an append-only JSONL inbox for the selected recipient.
+  const relay = isMasterBot ? parseMasterRelay(text) : null;
+  if (relay) {
+    try {
+      enqueueRelay({
+        relayDir: config.CROSSBOT_RELAY_DIR,
+        target: relay.target,
+        kind: relay.kind,
+        payload: relay.payload,
+        sourceUserId: ctx.from?.id ?? 0,
+      });
+      await ctx.reply(`📨 An ${relay.target === 'alina' ? 'Alina' : relay.target === 'mom' ? 'Mom' : 'Dad'} weitergegeben. Die Nachricht erscheint beim nächsten Turn in ihrem Bot.`, { parse_mode: undefined });
+      markHandledNoAgent(getInputLogRowId(chatId, messageId), 'crossbot_relay');
+      return;
+    } catch (error) {
+      console.error('[CrossBot] relay write failed:', error);
+      await ctx.reply('⚠️ Übergabe nicht gespeichert. Ich behaupte deshalb nicht, sie weitergegeben zu haben.', { parse_mode: undefined });
+      markError(getInputLogRowId(chatId, messageId), 'crossbot_relay_write_failed');
+      return;
+    }
+  }
+
   // Sprint 5 capture contract: surface already-due items at the next turn,
   // then persist any explicit memory/term/commitment BEFORE acknowledging it.
   // A failed durable write is terminal for this capture; we never claim it was
   // remembered merely because the input-log received the Telegram update.
-  await sendProactiveRecall(ctx, sessionKey);
   const capture = detectCapture(text);
   if (capture) {
     try {
@@ -341,6 +367,10 @@ export async function handleMessage(ctx: Context): Promise<void> {
       return;
     }
   }
+
+  // Capture proof has priority over a session-start digest so a successful
+  // durable write can never be visually displaced by unrelated reminders.
+  await sendProactiveRecall(ctx, sessionKey);
 
   // Check for active session — auto-resume from disk if bot restarted
   const session = sessionManager.getOrResumeSession(sessionKey);

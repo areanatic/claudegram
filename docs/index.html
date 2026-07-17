@@ -1681,6 +1681,11 @@
             <p>Bounded Telegram bootstrap retries and a per-bot health heartbeat record both successful getMe round-trips and the last delivered turn, not merely whether a process exists.</p>
           </div>
           <div class="feature-card" data-category="core">
+            <div class="feature-icon">🤖</div>
+            <h3>Master Bot Family</h3>
+            <p>The master can view the family’s live health and relay a message into a recipient bot’s own inbox. Person bots only receive their own inbox.</p>
+          </div>
+          <div class="feature-card" data-category="core">
             <div class="feature-icon">🔘</div>
             <h3>Safe Context Actions</h3>
             <p>Capture, task, and digest replies offer inline actions. Compact callback tokens keep payloads server-side, enforce user/session access, and make repeated taps safe.</p>
@@ -1974,6 +1979,10 @@
             <div class="command-row">
               <code class="command-code">/wo_stehen_wir</code>
               <span class="command-desc">Show due reminders and open durable commitments (or write “wo stehen wir”)</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/bots</code>
+              <span class="command-desc">Master only: show the bot family, live health, and latest activity</span>
             </div>
           </div>
         </div>

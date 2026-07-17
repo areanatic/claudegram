@@ -16,7 +16,7 @@ import {
   getLastMcpInventory,
 } from '../../claude/agent.js';
 import { occupancyTokens } from '../../claude/context-pressure.js';
-import { config } from '../../config.js';
+import { config, isMasterBot } from '../../config.js';
 import { getBotEffectivenessHealth } from '../../health/bot-health.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { getUptimeFormatted } from '../middleware/stale-filter.js';
@@ -90,6 +90,7 @@ import {
 } from '../../engines/engine.js';
 import { buildWhereAreWe, sendProactiveRecall } from '../../memory/proactive-recall.js';
 import { openTaskActionKeyboard } from '../../telegram/action-buttons.js';
+import { botFamily, formatBotFamilyHealth, readBotFamilyHealth } from '../../crossbot/relay.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -402,6 +403,15 @@ export async function handleWhereAreWe(ctx: Context): Promise<void> {
     parse_mode: undefined,
     reply_markup: openTaskActionKeyboard(ctx, keyInfo.sessionKey),
   });
+}
+
+/** Sprint 7: only the Master sees the family registry and its health files. */
+export async function handleBots(ctx: Context): Promise<void> {
+  if (!isMasterBot || ctx.from?.id === undefined || !config.ALLOWED_USER_IDS.includes(ctx.from.id)) return;
+  await ctx.reply(
+    formatBotFamilyHealth(readBotFamilyHealth(botFamily(config.DATA_DIR))),
+    { parse_mode: undefined },
+  );
 }
 
 export async function handleClear(ctx: Context): Promise<void> {

@@ -10,6 +10,7 @@ import {
   mergeProactiveItems,
   normalizeProactiveContent,
 } from '../src/memory/capture-ledger.js';
+import { formatProactiveRecall } from '../src/memory/proactive-recall.js';
 
 function newLedger(): { ledger: CaptureLedger; dbPath: string } {
   const dir = mkdtempSync(path.join(tmpdir(), 'nexusgram-capture-test-'));
@@ -46,6 +47,13 @@ test('captured reminders survive a process restart and retain their structured d
   const restarted = new CaptureLedger(dbPath);
   assert.equal(restarted.pendingForSession('42', new Date('2026-07-17T09:00:00Z')).length, 1);
   restarted.close();
+});
+
+test('proactive digest advertises the valid underscore command', () => {
+  assert.match(
+    formatProactiveRecall([{ text: 'Offener Auftrag: Aurora', dueAtUtc: null }]),
+    /Abruf: \/wo_stehen_wir$/,
+  );
 });
 
 test('a due reminder is reserved for the next turn exactly once per session/day', () => {

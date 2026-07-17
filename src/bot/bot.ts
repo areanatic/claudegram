@@ -64,7 +64,9 @@ import {
   handleEngine,
   handleCodex,
   handleWhereAreWe,
+  handleBots,
 } from './handlers/command.handler.js';
+import { markRelayDelivered, pendingRelays, resolveCurrentBotId } from '../crossbot/relay.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
 import { handlePhoto, handleImageDocument } from './handlers/photo.handler.js';
@@ -161,6 +163,7 @@ export async function createBot(): Promise<Bot> {
     ...(masterEngineCommandsEnabled ? [
       { command: 'engine', description: '⚙️ Show or switch AI engine' },
       { command: 'codex', description: '🤖 Run a read-only Codex task' },
+      { command: 'bots', description: '🤖 Bot-Familie und Live-Status' },
     ] : []),
     { command: 'wo_stehen_wir', description: '📌 Erinnerungen und Aufträge' },
     { command: 'status', description: t.status },
@@ -200,6 +203,7 @@ export async function createBot(): Promise<Bot> {
     ...(masterEngineCommandsEnabled ? [
       { command: 'engine', description: '⚙️ Show or switch AI engine' },
       { command: 'codex', description: '🤖 Run a read-only Codex task' },
+      { command: 'bots', description: '🤖 Bot-Familie und Live-Status' },
     ] : []),
     { command: 'commands', description: '📜 List all commands' },
   ];
@@ -217,6 +221,30 @@ export async function createBot(): Promise<Bot> {
 
   // Apply auth middleware to all updates
   bot.use(authMiddleware);
+
+  // A recipient sees only its own fixed inbox on its next incoming turn. The
+  // master-written target inbox is never altered; a local receipt prevents a
+  // replay on later turns.
+  bot.use(async (ctx, next) => {
+    const currentBot = resolveCurrentBotId({
+      isMaster: isMasterBot,
+      configuredId: config.CROSSBOT_BOT_ID,
+      botName: config.BOT_NAME,
+    });
+    if (currentBot && currentBot !== 'master' && ctx.message) {
+      const relays = pendingRelays({
+        relayDir: config.CROSSBOT_RELAY_DIR,
+        recipient: currentBot,
+        recipientDataDir: config.DATA_DIR,
+      });
+      for (const relay of relays) {
+        const lead = relay.kind === 'ask' ? 'Arash wollte dich fragen:' : 'Nachricht von Arash:';
+        await ctx.reply(`📨 ${lead}\n${relay.payload}`, { parse_mode: undefined });
+        markRelayDelivered(config.DATA_DIR, relay.id);
+      }
+    }
+    await next();
+  });
 
   // Sprint 3: this is a hard write-ahead gate. A content update does not reach
   // a handler until its per-bot task record is safely on disk.
@@ -239,6 +267,7 @@ export async function createBot(): Promise<Bot> {
   // so register before the sequentialize middleware (same tier as /ping).
   bot.command('health', handleHealth);
   bot.command('wo_stehen_wir', handleWhereAreWe);
+  if (masterEngineCommandsEnabled) bot.command('bots', handleBots);
 
   // Sequentialize: same-chat updates are processed in order.
   // This runs AFTER /cancel so cancel bypasses it.

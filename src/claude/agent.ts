@@ -453,17 +453,18 @@ These rules exist because the user previously experienced topic-loss + forgotten
  * NEXUS_BRIDGE_MAX_CHARS truncated werden. soul.md + wiki/00-bot-glossary werden
  * von Phase B als komplementäre Layer hinzukommen.
  */
-const BOT_GLOSSARY_CONSTANT = `
+const MASTER_BOT_GLOSSARY_CONSTANT = `
 
 WICHTIG — Bot-Glossar (Production-Truth, hard-coded; Strip 2 LIVE seit 2026-05-12):
 - @AstronOneBot = Master Bot (Arashs Workspace, dieser hier) — aktiv
 - @AlinaCheckBot = Family Bot (für Alina, BOT_NAME=Alina-Check) — aktiv, Status: 14d-Watch ab 2026-05-12, re-evaluate 2026-05-26
 - @EffCheckBot = Mom Bot (für Effat) — archived (Strip 2 2026-05-12, 0/30d Captures, reactivatable via .env.mom + plist restore aus ~/.nexusgram/quarantine/2026-05-12-strip2/)
 - @ManZamOneBot = Dad Bot — archived (Strip 2 2026-05-12, 0/30d Captures, reactivatable via .env.dad + plist restore aus ~/.nexusgram/quarantine/2026-05-12-strip2/)
-Cross-Bot-Posting ist nicht implementiert. Bei "schick an Alina-Bot": ehrlich antworten dass dieser Mechanismus nicht existiert.
-Bei Fragen zu Mom/Dad-Bot: ehrlich antworten dass sie pausiert sind seit Strip 2 2026-05-12 (Reaktivierung möglich).`;
+Der Master kann Aufträge mit „Sag/Schreib/Frag Alina-, Mom- oder Dad-Bot, dass …“ als Relay zustellen. /bots zeigt die Live-Zustände.`;
 
-const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + BOT_GLOSSARY_CONSTANT + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING) + FOLLOWUP_BUTTONS_INSTRUCTION + TASK_OWNERSHIP_INSTRUCTION;
+// Person-bot prompts intentionally contain no family registry, command, or
+// foreign-silo explanation. Foreign silos are absent from their model context.
+const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + (isMasterBot ? MASTER_BOT_GLOSSARY_CONSTANT : '') + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING) + FOLLOWUP_BUTTONS_INSTRUCTION + TASK_OWNERSHIP_INSTRUCTION;
 
 const REDDIT_TOOL_PROMPT = `
 

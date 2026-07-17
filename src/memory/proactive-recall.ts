@@ -36,6 +36,11 @@ function taskLedgerItems(sessionKey: string, includeActive: boolean): ProactiveI
     }));
 }
 
+export function formatProactiveRecall(items: ReadonlyArray<Pick<ProactiveItem, 'text' | 'dueAtUtc'>>): string {
+  const lines = items.map((item) => `• ${item.text}${formatDue(item.dueAtUtc)}`);
+  return `🔔 Zum Start noch offen oder fällig:\n${lines.join('\n')}\n\nAbruf: /wo_stehen_wir`;
+}
+
 export function buildProactiveRecall(sessionKey: string, now = new Date()): {
   items: ProactiveItem[];
   text: string;
@@ -51,10 +56,9 @@ export function buildProactiveRecall(sessionKey: string, now = new Date()): {
   );
   const items = ledger.reserveForDelivery(sessionKey, candidates, now);
   if (items.length === 0) return null;
-  const lines = items.map((item) => `• ${item.text}${formatDue(item.dueAtUtc)}`);
   return {
     items,
-    text: `🔔 Zum Start noch offen oder fällig:\n${lines.join('\n')}\n\nAbruf: /wo-stehen-wir`,
+    text: formatProactiveRecall(items),
   };
 }
 

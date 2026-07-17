@@ -44,6 +44,11 @@ const envSchema = z.object({
   // continue to infer master from BOT_NAME='Nexusgram'. Test lanes can opt in
   // with BOT_ROLE=master without borrowing the production name.
   BOT_ROLE: z.enum(['master', 'person']).optional(),
+  // Sprint 7: a person bot receives only its own relay inbox. Unknown person
+  // bot identities fail closed (no relay read) instead of guessing a silo.
+  CROSSBOT_BOT_ID: z.enum(['master', 'alina', 'mom', 'dad']).optional(),
+  CROSSBOT_RELAY_DIR: z.string().default('/Volumes/AstronOne/shared-memory/nexusgram-crossbot'),
+  BOT_FAMILY_HEALTH_FRESHNESS_MS: z.coerce.number().int().min(60_000).max(3_600_000).default(300_000),
   BOT_MODE: z.enum(['dev', 'prod']).default('dev'),
   // Bounded bootstrap retry: covers Telegram 401/429/5xx/network turbulence
   // before polling starts. It never retries a 409 poller conflict in-process.
