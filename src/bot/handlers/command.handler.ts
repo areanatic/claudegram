@@ -66,6 +66,7 @@ import {
 } from '../../handler/request-registry.js';
 import { markCancelled } from '../../handler/request-context.js';
 import { countPending as countPendingInputs } from '../../inbox/input-log.js';
+import { buildWhereAreWe, sendProactiveRecall } from '../../memory/proactive-recall.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -333,6 +334,8 @@ function buildTelegraphMenu(sessionKey: string) {
 }
 
 export async function handleStart(ctx: Context): Promise<void> {
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (keyInfo) await sendProactiveRecall(ctx, keyInfo.sessionKey);
   // Use custom welcome file if configured (Space-Bots)
   if (config.BOT_WELCOME_FILE) {
     try {
@@ -366,6 +369,13 @@ I bridge your messages to Claude Code running on your local machine\\.
 Current mode: ${config.STREAMING_MODE}${dangerousWarning}`;
 
   await replyMd(ctx, welcomeMessage);
+}
+
+/** Sprint 5: explicit, read-only view of durable captures and the task ledger. */
+export async function handleWhereAreWe(ctx: Context): Promise<void> {
+  const keyInfo = getSessionKeyFromCtx(ctx);
+  if (!keyInfo) return;
+  await ctx.reply(buildWhereAreWe(keyInfo.sessionKey), { parse_mode: undefined });
 }
 
 export async function handleClear(ctx: Context): Promise<void> {

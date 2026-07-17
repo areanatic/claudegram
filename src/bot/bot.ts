@@ -59,6 +59,7 @@ import {
   handleHealth,
   handleBrief,
   handleWith,
+  handleWhereAreWe,
 } from './handlers/command.handler.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
@@ -127,6 +128,7 @@ export async function createBot(): Promise<Bot> {
     { command: 'tts', description: t.tts },
     ...(config.DOCUMENT_INBOX_ENABLED ? [{ command: 'inbox', description: t.inbox }] : []),
     ...(config.TRANSCRIBE_ENABLED ? [{ command: 'transcribe', description: t.transcribe }] : []),
+    { command: 'wo-stehen-wir', description: '📌 Erinnerungen und Aufträge' },
     { command: 'status', description: t.status },
   ] : [
     { command: 'start', description: '🚀 Show help and getting started' },
@@ -159,6 +161,7 @@ export async function createBot(): Promise<Bot> {
     { command: 'terminalui', description: '🖥️ Toggle terminal-style display' },
     { command: 'tts', description: '🔊 Toggle voice replies' },
     { command: 'health', description: '🩺 Compliance + observability dashboard' },
+    { command: 'wo-stehen-wir', description: '📌 Fällige Erinnerungen und offene Aufträge' },
     { command: 'with', description: '🧠 Show recent OMI/memory mentions for a person' },
     { command: 'commands', description: '📜 List all commands' },
   ];
@@ -210,6 +213,7 @@ export async function createBot(): Promise<Bot> {
   // /health is read-only and must respond even when sequentialize is backed up,
   // so register before the sequentialize middleware (same tier as /ping).
   bot.command('health', handleHealth);
+  bot.command('wo-stehen-wir', handleWhereAreWe);
 
   // Sequentialize: same-chat updates are processed in order.
   // This runs AFTER /cancel so cancel bypasses it.
