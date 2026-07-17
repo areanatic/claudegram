@@ -31,7 +31,7 @@ import * as fs from 'fs';
 import { config } from '../config.js';
 import { isPrivate as isSessionPrivate } from '../memory/privacy-state.js';
 
-export type InputType = 'text' | 'voice' | 'audio' | 'photo' | 'document' | 'other';
+export type InputType = 'text' | 'voice' | 'audio' | 'photo' | 'document' | 'video' | 'other';
 export type InputStatus = 'received' | 'processing' | 'done' | 'dropped' | 'error';
 
 let db: Database.Database | null = null;

@@ -71,6 +71,7 @@ import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
 import { handlePhoto, handleImageDocument } from './handlers/photo.handler.js';
 import { handleDocument } from './handlers/document.handler.js';
+import { handleVideo } from './handlers/video.handler.js';
 import { handleFollowUpCallback } from '../telegram/followup-buttons.js';
 import { handleContextActionCallback } from '../telegram/action-buttons.js';
 import { startRegistrySweep } from '../handler/request-registry.js';
@@ -406,6 +407,9 @@ export async function createBot(): Promise<Bot> {
 
   // Handle images
   bot.on('message:photo', handlePhoto);
+
+  // Sprint 8: videos are durable media inputs too; captions are executable jobs.
+  bot.on('message:video', handleVideo);
 
   // Handle documents: audio transcribe → image documents → general documents (INBOX)
   bot.on('message:document', async (ctx) => {

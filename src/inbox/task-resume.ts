@@ -21,6 +21,7 @@ export async function resumeOpenTask(ctx: Context, bot: Bot, taskId: number, opt
     'The user explicitly approved resuming an interrupted task.',
     `Task kind: ${task.taskKind}`,
     `Original instruction summary: ${task.summary}`,
+    ...(task.mediaPath ? [`The original media was safely stored at: ${task.mediaPath}`, 'Inspect that exact file before answering the caption request.'] : []),
     'Continue safely. Do not execute any irreversible mutation without a fresh explicit confirmation.',
   ].join('\n');
   const { chatId, threadId } = parseSessionKey(task.sessionKey);

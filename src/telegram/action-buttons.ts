@@ -4,6 +4,7 @@ import { config } from '../config.js';
 import { getCaptureLedger } from '../memory/capture-ledger.js';
 import { completeOpenTask, discardOpenTask, getOpenTask, listOpenTasksForSession } from '../inbox/task-ledger.js';
 import { resumeOpenTask } from '../inbox/task-resume.js';
+import { cancelCalendarBulk, confirmCalendarBulk, configuredCalendarBulkExecutor, getCalendarBulkJob } from '../calendar/bulk.js';
 import { executeFollowUpText } from './followup-buttons.js';
 import type { Bot } from 'grammy';
 
@@ -17,6 +18,8 @@ export type ContextAction =
   | { type: 'task-resume'; taskId: number }
   | { type: 'task-complete'; taskId: number }
   | { type: 'task-discard'; taskId: number }
+  | { type: 'calendar-bulk-confirm'; jobId: string }
+  | { type: 'calendar-bulk-cancel'; jobId: string }
   | { type: 'text'; text: string };
 
 export type RegisteredAction = ContextAction & {
@@ -133,6 +136,23 @@ export function openTaskActionKeyboard(ctx: Context, sessionKey: string): Inline
   return keyboard;
 }
 
+/** Single-task failure card used by media handlers; the retry payload remains server-side. */
+export function taskRetryActionKeyboard(ctx: Context, sessionKey: string, taskId: number): InlineKeyboard | undefined {
+  const scope = owner(ctx, sessionKey);
+  if (!scope) return undefined;
+  return new InlineKeyboard()
+    .text('🔁 Erneut versuchen', contextActionRouter.register({ ...scope, type: 'task-resume', taskId }))
+    .text('🗑️ Verwerfen', contextActionRouter.register({ ...scope, type: 'task-discard', taskId }));
+}
+
+export function calendarBulkActionKeyboard(ctx: Context, sessionKey: string, jobId: string): InlineKeyboard | undefined {
+  const scope = owner(ctx, sessionKey);
+  if (!scope) return undefined;
+  return new InlineKeyboard()
+    .text('Bestätigen', contextActionRouter.register({ ...scope, type: 'calendar-bulk-confirm', jobId }))
+    .text('Abbrechen', contextActionRouter.register({ ...scope, type: 'calendar-bulk-cancel', jobId }));
+}
+
 /** Digest actions map to ordinary user text, never to a privileged shortcut. */
 export function digestActionKeyboard(ctx: Context, sessionKey: string): InlineKeyboard | undefined {
   const scope = owner(ctx, sessionKey);
@@ -189,6 +209,24 @@ export async function handleContextActionCallback(ctx: Context, bot: Bot): Promi
         const task = getOpenTask(action.taskId);
         if (!task || task.sessionKey !== action.sessionKey || !discardOpenTask(action.taskId)) throw new Error('task is unavailable');
         await ctx.reply('🗑️ Auftrag verworfen.', { parse_mode: undefined });
+        return;
+      }
+      case 'calendar-bulk-confirm': {
+        const job = getCalendarBulkJob(action.jobId);
+        if (!job || job.sessionKey !== action.sessionKey || job.chatId !== action.chatId || job.userId !== action.userId) throw new Error('calendar preview is unavailable');
+        const result = await confirmCalendarBulk(job.id, configuredCalendarBulkExecutor);
+        if (result.state === 'completed') {
+          const ids = result.results?.map((item, index) => `• ${index + 1}: ${item.eventId ?? 'event_id nicht verfügbar'}`).join('\n') ?? '';
+          await ctx.reply(`✅ Kalender-Bulk abgeschlossen:\n${ids}`, { parse_mode: undefined });
+        } else {
+          await ctx.reply(`⚠️ Kalender-Bulk fehlgeschlagen: ${result.failure ?? 'unbekannter Fehler'}`, { parse_mode: undefined });
+        }
+        return;
+      }
+      case 'calendar-bulk-cancel': {
+        const job = getCalendarBulkJob(action.jobId);
+        if (!job || job.sessionKey !== action.sessionKey || job.chatId !== action.chatId || job.userId !== action.userId || cancelCalendarBulk(job.id)?.state !== 'cancelled') throw new Error('calendar preview is unavailable');
+        await ctx.reply('Abgebrochen. Es wurden keine Termine verändert.', { parse_mode: undefined });
         return;
       }
       case 'text':

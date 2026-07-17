@@ -29,6 +29,9 @@ import {
 import { isPrivate } from '../memory/privacy-state.js';
 import { mailOverviewTool } from '../memory/mail-readonly.js';
 import { searchInputLog } from '../inbox/input-log.js';
+import { formatCalendarBulkPreview, prepareCalendarBulk, type CalendarBulkItem } from '../calendar/bulk.js';
+import { calendarBulkActionKeyboard } from '../telegram/action-buttons.js';
+import { isMasterBot } from '../config.js';
 
 // Lazy imports to avoid circular deps and unnecessary module loading
 async function importInbox() {
@@ -129,8 +132,37 @@ function buildToolList(toolsCtx: McpToolsContext) {
   tools.push(nexusgramReadDailyTool(toolsCtx));
   tools.push(nexusgramReadL1Tool(toolsCtx));
   tools.push(mailOverviewTool(toolsCtx));   // P6: read-only mail overview (operator-gated, counts only)
+  if (isMasterBot && config.CALENDAR_BULK_COMMAND) tools.push(calendarBulkPreviewTool(toolsCtx));
 
   return tools;
+}
+
+function calendarBulkPreviewTool(toolsCtx: McpToolsContext) {
+  return tool(
+    'nexusgram_calendar_bulk_preview',
+    'Prepare one atomic calendar bulk operation. Use this instead of per-event create/delete loops. It shows the user a Telegram Confirm/Cancel preview; only the confirm button can commit. For create, include every fully resolved event. For cancel, include every resolved account/calendar_id/event_id.',
+    {
+      operation: z.enum(['create', 'cancel']),
+      events: z.array(z.object({
+        account: z.string(), calendarId: z.string(), title: z.string(),
+        start: z.string().optional(), end: z.string().optional(), eventId: z.string().optional(),
+      })).min(1).max(100),
+    },
+    async ({ operation, events }) => {
+      const userId = toolsCtx.telegramCtx.from?.id;
+      const chatId = toolsCtx.telegramCtx.chat?.id;
+      if (!userId || !chatId) return { content: [{ type: 'text' as const, text: 'Calendar bulk preview requires a Telegram user/chat context.' }], isError: true };
+      if (operation === 'cancel' && events.some((event) => !event.eventId)) {
+        return { content: [{ type: 'text' as const, text: 'Calendar bulk cancel requires event_id for every matched event.' }], isError: true };
+      }
+      const job = prepareCalendarBulk({ userId, chatId, sessionKey: toolsCtx.sessionKey, operation, items: events as CalendarBulkItem[] });
+      await toolsCtx.telegramCtx.reply(formatCalendarBulkPreview(job), {
+        parse_mode: undefined,
+        reply_markup: calendarBulkActionKeyboard(toolsCtx.telegramCtx, toolsCtx.sessionKey, job.id),
+      });
+      return { content: [{ type: 'text' as const, text: `Calendar bulk preview ${job.id} was shown. Do not invoke individual calendar mutations; wait for the user's button choice.` }] };
+    },
+  );
 }
 
 // ── Tool Definitions ─────────────────────────────────────────────────

@@ -14,6 +14,7 @@ function classify(ctx: Context): Omit<TaskInput, 'messageId' | 'chatId' | 'sessi
   if (msg.audio) return { inputType: 'audio', text: null, fileId: msg.audio.file_id };
   if (msg.photo?.length) return { inputType: 'photo', text: msg.caption ?? null, fileId: msg.photo.at(-1)?.file_id ?? null };
   if (msg.document) return { inputType: 'document', text: msg.caption ?? null, fileId: msg.document.file_id };
+  if (msg.video) return { inputType: 'video', text: msg.caption ?? null, fileId: msg.video.file_id };
   if (typeof msg.text === 'string') return { inputType: 'text', text: msg.text, fileId: null };
   return null;
 }

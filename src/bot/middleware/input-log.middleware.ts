@@ -50,6 +50,7 @@ function classify(ctx: Context): { type: InputType; text: string | null; fileId:
     return { type: 'photo', text: msg.caption ?? null, fileId: msg.photo[msg.photo.length - 1].file_id };
   }
   if (msg.document) return { type: 'document', text: msg.caption ?? null, fileId: msg.document.file_id };
+  if (msg.video) return { type: 'video', text: msg.caption ?? null, fileId: msg.video.file_id };
   if (typeof msg.text === 'string') return { type: 'text', text: msg.text, fileId: null };
   return null;
 }

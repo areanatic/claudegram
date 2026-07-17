@@ -44,6 +44,9 @@ const envSchema = z.object({
   // continue to infer master from BOT_NAME='Nexusgram'. Test lanes can opt in
   // with BOT_ROLE=master without borrowing the production name.
   BOT_ROLE: z.enum(['master', 'person']).optional(),
+  // Sprint 8: a fixed executable (no shell string) that performs a typed,
+  // idempotency-keyed calendar bulk commit. Empty means fail-loud/no preview.
+  CALENDAR_BULK_COMMAND: z.string().default(''),
   // Sprint 7: a person bot receives only its own relay inbox. Unknown person
   // bot identities fail closed (no relay read) instead of guessing a silo.
   CROSSBOT_BOT_ID: z.enum(['master', 'alina', 'mom', 'dad']).optional(),

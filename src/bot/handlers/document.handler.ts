@@ -23,7 +23,7 @@ import { runPostAgentSuccess } from './post-agent.js';
 import { getInputLogRowId } from '../middleware/input-log.middleware.js';
 import { getTaskLedgerId } from '../middleware/task-ledger.middleware.js';
 import { markProcessing, markDone, markDropped, markError } from '../../inbox/input-log.js';
-import { completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
+import { attachTaskMediaPath, completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -38,6 +38,7 @@ import { getStreamingMode } from './command.handler.js';
 import { downloadFileSecure, getTelegramFileUrl } from '../../utils/download.js';
 import { sanitizeError } from '../../utils/sanitize.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
+import { announceMediaTaskAccepted, announceMediaTaskFailure } from './media-task-status.js';
 import {
   createInboxEntry,
   saveMetadata,
@@ -145,6 +146,8 @@ export async function handleDocument(ctx: Context): Promise<void> {
   const senderId = ctx.from?.id || 0;
   const caption = ctx.message?.caption || null;
 
+  if (caption?.trim()) await announceMediaTaskAccepted(ctx, taskLedgerId, 'Dokumentauftrag');
+
   const { metadata, destPath } = createInboxEntry({
     originalFilename,
     mimeType,
@@ -169,6 +172,7 @@ export async function handleDocument(ctx: Context): Promise<void> {
 
     // Save metadata sidecar
     saveMetadata(metadata);
+    attachTaskMediaPath(taskLedgerId, metadata.savedPath);
 
     console.log(`[Document] Saved: ${metadata.savedFilename} (${formatFileSize(fileSizeBytes)})`);
 
@@ -187,7 +191,16 @@ export async function handleDocument(ctx: Context): Promise<void> {
     }
 
     // ── Batch or immediate response ──
-    await handleBatchOrImmediate(ctx, sessionKey, metadata);
+    // A caption is an executable job, never merely metadata waiting for a later
+    // text turn. Keep uncaptioned uploads batched for quiet UX.
+    if (caption?.trim()) await executeMediaCaptionTask(ctx, sessionKey, metadata, taskLedgerId);
+    else {
+      // The durable outcome for an uncaptioned document is safe storage. Do
+      // not leave its already-working ledger row open while the UX batch timer
+      // waits to render a grouped confirmation.
+      completeTask(taskLedgerId);
+      await handleBatchOrImmediate(ctx, sessionKey, metadata);
+    }
 
   } catch (error) {
     // Clean up partial download
@@ -198,10 +211,49 @@ export async function handleDocument(ctx: Context): Promise<void> {
     const errorMessage = sanitizeError(error);
     failTask(taskLedgerId, errorMessage);
     console.error('[Document] Error:', errorMessage);
-    await ctx.reply(
-      `Failed to save document: ${esc(errorMessage)}`,
-      { parse_mode: 'MarkdownV2' }
-    );
+    await announceMediaTaskFailure(ctx, sessionKey, taskLedgerId, errorMessage);
+  }
+}
+
+export async function executeMediaCaptionTask(
+  ctx: Context,
+  sessionKey: string,
+  metadata: InboxMetadata,
+  taskLedgerId: number | null,
+): Promise<void> {
+  const session = sessionManager.getOrResumeSession(sessionKey)
+    ?? sessionManager.createSession(sessionKey, config.WORKSPACE_DIR || process.env.HOME || '.');
+  const inputLogRowId = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
+  const prompt = [
+    'A user attached a document with an executable caption request.',
+    `File: ${metadata.originalFilename}`,
+    `Saved path: ${metadata.savedPath}`,
+    `Caption request: ${metadata.caption}`,
+    'Treat the caption as the current task. Inspect the exact saved file when needed, execute the requested analysis/work now, and report the result. Do not merely confirm storage or suggest later routing.',
+  ].join('\n');
+  try {
+    await queueRequest(sessionKey, prompt, async (turnEpoch) => {
+      assertTurnIsCurrent(sessionKey, turnEpoch);
+      startTask(taskLedgerId);
+      markProcessing(inputLogRowId);
+      const abortController = new AbortController();
+      setAbortController(sessionKey, abortController, turnEpoch);
+      const response = await sendToAgent(sessionKey, prompt, {
+        abortController,
+        telegramCtx: ctx,
+        currentInputLogRowId: inputLogRowId,
+        turnEpoch,
+      });
+      await messageSender.sendMessage(ctx, response.text);
+      await runPostAgentSuccess(ctx, sessionKey, response);
+      markDone(inputLogRowId);
+      completeTask(taskLedgerId);
+    });
+  } catch (error) {
+    const reason = sanitizeError(error);
+    markError(inputLogRowId, reason.slice(0, 200));
+    failTask(taskLedgerId, reason);
+    await announceMediaTaskFailure(ctx, sessionKey, taskLedgerId, reason);
   }
 }
 

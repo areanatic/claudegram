@@ -7,7 +7,7 @@ import { runPostAgentSuccess } from './post-agent.js';
 import { getInputLogRowId } from '../middleware/input-log.middleware.js';
 import { getTaskLedgerId } from '../middleware/task-ledger.middleware.js';
 import { markProcessing, markDone, markDropped, markError } from '../../inbox/input-log.js';
-import { completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
+import { attachTaskMediaPath, completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -26,6 +26,7 @@ import { isValidImageFile, getFileType } from '../../utils/file-type.js';
 import { type PhotoSize } from 'grammy/types';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { recordUpload } from '../../memory/recent-uploads.js';
+import { announceMediaTaskAccepted, announceMediaTaskFailure } from './media-task-status.js';
 
 const UPLOADS_DIR = '.nexusgram/uploads';
 
@@ -68,8 +69,8 @@ async function handleSavedImage(
   if (!keyInfo) return;
   const { sessionKey } = keyInfo;
 
-  const session = sessionManager.getSession(sessionKey);
-  if (!session) return;
+  const session = sessionManager.getOrResumeSession(sessionKey)
+    ?? sessionManager.createSession(sessionKey, config.WORKSPACE_DIR || process.env.HOME || '.');
 
   const relativePath = path.relative(session.workingDirectory, savedPath);
 
@@ -164,7 +165,7 @@ async function handleSavedImage(
     console.error('[Photo] Agent error:', errorMessage);
     markError(inputLogRowId, errorMessage.slice(0, 200));
     failTask(taskLedgerId, errorMessage);
-    await ctx.reply(`Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+    await announceMediaTaskFailure(ctx, sessionKey, taskLedgerId, errorMessage);
   }
 }
 
@@ -194,14 +195,10 @@ export async function handlePhoto(ctx: Context): Promise<void> {
   }
   markProcessed(messageId);
 
-  const session = sessionManager.getOrResumeSession(sessionKey);
-  if (!session) {
-    await ctx.reply(
-      '⚠️ No project set\\.\n\nIf the bot restarted, use `/continue` or `/resume` to restore your last session\\.\nOr use `/project` to open a project first\\.',
-      { parse_mode: 'MarkdownV2' }
-    );
-    return;
-  }
+  const session = sessionManager.getOrResumeSession(sessionKey)
+    ?? sessionManager.createSession(sessionKey, config.WORKSPACE_DIR || process.env.HOME || '.');
+  const caption = ctx.message?.caption?.trim();
+  if (caption) await announceMediaTaskAccepted(ctx, taskLedgerId, 'Fotoauftrag');
 
   const largest = pickLargestPhoto(photos);
   const fileSizeBytes = largest.file_size || 0;
@@ -255,12 +252,13 @@ export async function handlePhoto(ctx: Context): Promise<void> {
       throw new Error('Downloaded image is empty.');
     }
 
+    attachTaskMediaPath(taskLedgerId, finalPath);
     await handleSavedImage(ctx, finalPath, ctx.message?.caption);
   } catch (error) {
     const errorMessage = sanitizeError(error);
     failTask(taskLedgerId, errorMessage);
     console.error('[Photo] Error:', errorMessage);
-    await ctx.reply(`❌ Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+    await announceMediaTaskFailure(ctx, sessionKey, taskLedgerId, errorMessage);
   }
 }
 
@@ -295,14 +293,10 @@ export async function handleImageDocument(ctx: Context): Promise<void> {
   }
   markProcessed(messageId);
 
-  const session = sessionManager.getOrResumeSession(sessionKey);
-  if (!session) {
-    await ctx.reply(
-      '⚠️ No project set\\.\n\nIf the bot restarted, use `/continue` or `/resume` to restore your last session\\.\nOr use `/project` to open a project first\\.',
-      { parse_mode: 'MarkdownV2' }
-    );
-    return;
-  }
+  const session = sessionManager.getOrResumeSession(sessionKey)
+    ?? sessionManager.createSession(sessionKey, config.WORKSPACE_DIR || process.env.HOME || '.');
+  const caption = ctx.message?.caption?.trim();
+  if (caption) await announceMediaTaskAccepted(ctx, taskLedgerId, 'Bildauftrag');
 
   const fileSizeBytes = document.file_size || 0;
   const fileSizeMB = fileSizeBytes / (1024 * 1024);
@@ -344,11 +338,12 @@ export async function handleImageDocument(ctx: Context): Promise<void> {
       throw new Error('Downloaded image is empty.');
     }
 
+    attachTaskMediaPath(taskLedgerId, destPath);
     await handleSavedImage(ctx, destPath, ctx.message?.caption);
   } catch (error) {
     const errorMessage = sanitizeError(error);
     failTask(taskLedgerId, errorMessage);
     console.error('[ImageDoc] Error:', errorMessage);
-    await ctx.reply(`❌ Image error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+    await announceMediaTaskFailure(ctx, sessionKey, taskLedgerId, errorMessage);
   }
 }

@@ -25,6 +25,7 @@ export interface OpenTask {
   state: TaskState;
   reason: string | null;
   acceptedAt: string;
+  mediaPath?: string | null;
 }
 
 export class TaskLedgerError extends Error { readonly name = 'TaskLedgerError'; }
@@ -34,7 +35,7 @@ const botId = () => (config.BOT_NAME || 'nexusgram').replace(/[^a-zA-Z0-9_-]/g, 
 const dbPath = () => path.join(config.DATA_DIR, `task-ledger-${botId()}.db`);
 
 function taskKind(input: TaskInput): string {
-  if (input.inputType === 'document' || input.inputType === 'photo') return 'upload_processing';
+  if (input.inputType === 'document' || input.inputType === 'photo' || input.inputType === 'video') return 'upload_processing';
   const value = (input.text ?? '').toLowerCase();
   if (/\b(erinner|remind)\b/.test(value)) return 'reminder';
   if (/\b(mail|e-mail|email)\b/.test(value) && /\b(entwurf|draft|schreib|formul)\b/.test(value)) return 'mail_draft';
@@ -62,7 +63,7 @@ function getDb(): Database.Database {
       CREATE TABLE IF NOT EXISTS task_ledger (
         id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id TEXT NOT NULL, chat_id INTEGER NOT NULL,
         message_id INTEGER NOT NULL, session_key TEXT NOT NULL, input_type TEXT NOT NULL,
-        task_kind TEXT NOT NULL, summary TEXT NOT NULL, file_id TEXT,
+        task_kind TEXT NOT NULL, summary TEXT NOT NULL, file_id TEXT, media_path TEXT,
         state TEXT NOT NULL CHECK(state IN ('accepted','working','interrupted','failed','completed')),
         failure_reason TEXT, accepted_at TEXT NOT NULL, started_at TEXT, terminal_at TEXT,
         updated_at TEXT NOT NULL, resume_count INTEGER NOT NULL DEFAULT 0,
@@ -70,6 +71,8 @@ function getDb(): Database.Database {
       );
       CREATE INDEX IF NOT EXISTS idx_task_ledger_open ON task_ledger(bot_id, state, accepted_at);
     `);
+    const columns = (conn.prepare('PRAGMA table_info(task_ledger)').all() as { name: string }[]).map((column) => column.name);
+    if (!columns.includes('media_path')) conn.exec('ALTER TABLE task_ledger ADD COLUMN media_path TEXT');
     db = conn;
     return conn;
   } catch (error) {
@@ -120,6 +123,13 @@ export const completeTask = (id: number | null) => transition(id, 'completed');
 export const failTask = (id: number | null, reason: string) => transition(id, 'failed', reason.slice(0, 240));
 export const interruptTask = (id: number | null, reason: string) => transition(id, 'interrupted', reason.slice(0, 240));
 
+/** Persist the locally validated media path before the agent may inspect it. */
+export function attachTaskMediaPath(id: number | null, mediaPath: string): void {
+  if (id == null) return;
+  getDb().prepare(`UPDATE task_ledger SET media_path=?, updated_at=? WHERE id=? AND state IN ('accepted','working','interrupted','failed')`)
+    .run(mediaPath, new Date().toISOString(), id);
+}
+
 /** Atomically claim a user-approved retry. A second resume press cannot execute it twice. */
 export function claimInterruptedTask(id: number): boolean {
   const conn = getDb();
@@ -161,7 +171,7 @@ export function recoverOpenTasks(now = new Date()): OpenTask[] {
     failure_reason=CASE WHEN accepted_at<=? THEN 'orphaned_over_10_minutes' ELSE 'restart_interrupted' END,
     updated_at=? WHERE bot_id=? AND state IN ('accepted','working')`).run(cutoff, nowIso, botId());
   return conn.prepare(`SELECT id,chat_id AS chatId,session_key AS sessionKey,input_type AS inputType,
-    task_kind AS taskKind,summary,state,failure_reason AS reason,accepted_at AS acceptedAt
+    task_kind AS taskKind,summary,state,failure_reason AS reason,accepted_at AS acceptedAt,media_path AS mediaPath
     FROM task_ledger WHERE bot_id=? AND state<>'completed' ORDER BY accepted_at ASC`).all(botId()) as OpenTask[];
 }
 
@@ -173,14 +183,14 @@ export function openTaskCount(): number {
 /** Read-only, session-scoped view used by the integrated recall surface. */
 export function listOpenTasksForSession(sessionKey: string): OpenTask[] {
   return getDb().prepare(`SELECT id,chat_id AS chatId,session_key AS sessionKey,input_type AS inputType,
-    task_kind AS taskKind,summary,state,failure_reason AS reason,accepted_at AS acceptedAt
+    task_kind AS taskKind,summary,state,failure_reason AS reason,accepted_at AS acceptedAt,media_path AS mediaPath
     FROM task_ledger WHERE bot_id=? AND session_key=? AND state<>'completed'
     ORDER BY accepted_at ASC`).all(botId(), sessionKey) as OpenTask[];
 }
 
 export function getOpenTask(id: number): OpenTask | null {
   const row = getDb().prepare(`SELECT id,chat_id AS chatId,session_key AS sessionKey,input_type AS inputType,
-    task_kind AS taskKind,summary,state,failure_reason AS reason,accepted_at AS acceptedAt
+    task_kind AS taskKind,summary,state,failure_reason AS reason,accepted_at AS acceptedAt,media_path AS mediaPath
     FROM task_ledger WHERE id=? AND bot_id=? AND state<>'completed'`).get(id, botId()) as OpenTask | undefined;
   return row ?? null;
 }
