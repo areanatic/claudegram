@@ -31,7 +31,16 @@ import {
 } from '../utils/agent-timer.js';
 import { recordTranscript, loadPreviousDayTranscript, loadTodayTranscript } from './transcript-logger.js';
 import { buildNexusBridgePrompt } from '../nexus/bridge.js';
-import { injectContext, saveMemory } from '../memory/nexus-memory.js';
+import {
+  botId as memoryBotId,
+  injectContext,
+  readMemoryPolicyFromEnv,
+  saveMemory,
+} from '../memory/nexus-memory.js';
+import {
+  renderModelFallbackPrompt,
+  runRecallContractForMessage,
+} from '../memory/recall-orchestrator.js';
 import { logConversationTurn } from '../memory/conversation-logger.js';
 import { isPrivate } from '../memory/privacy-state.js';
 import { buildRecentUploadsContext } from '../memory/recent-uploads.js';
@@ -749,13 +758,66 @@ export async function sendToAgent(
     throw new Error('No active session. Use /project to set working directory.');
   }
 
+  // Roadmap Sprint 4 / R17: explicit recall is resolved BEFORE engine/model
+  // dispatch. This removes the old model-choice lottery between memory, daily
+  // and transcript tools. Normal recall returns deterministic, cited evidence
+  // directly; a miss returns an honest local-source miss and never reaches a
+  // model. Only an explicit "general/model knowledge" request may continue,
+  // with a mandatory uncertainty label in the injected contract.
+  const recallStartedAt = Date.now();
+  const sessionIsPrivateForRecall = isPrivate(sessionKey);
+  const bootMemoryPolicy = readMemoryPolicyFromEnv();
+  const recallPolicy = sessionIsPrivateForRecall
+    ? { ...bootMemoryPolicy, scope: 'public' as const }
+    : bootMemoryPolicy;
+  const recallResult = runRecallContractForMessage(message, {
+    scope: {
+      kind: isMasterBot ? 'operator' : 'person',
+      project: isMasterBot ? undefined : config.BOT_MEMORY_PROJECT,
+      botId: isMasterBot ? undefined : memoryBotId(),
+      sessionKey,
+      allowSessionArchive: !sessionIsPrivateForRecall,
+      allowOperatorFiles: isMasterBot && !sessionIsPrivateForRecall,
+    },
+    policy: recallPolicy,
+  });
+  let recallModelFallbackPrompt = '';
+  if (recallResult) {
+    if (recallResult.found || !recallResult.allowModelKnowledge) {
+      sessionManager.updateActivity(sessionKey, message);
+      const directHistory = [...(conversationHistory.get(sessionKey) || [])];
+      directHistory.push({ role: 'user', content: message });
+      directHistory.push({ role: 'assistant', content: recallResult.answer });
+      conversationHistory.set(sessionKey, directHistory);
+      recordTranscript(sessionKey, 'user', message);
+      recordTranscript(sessionKey, 'assistant', recallResult.answer);
+      logConversationTurn(
+        config.BOT_NAME,
+        message,
+        recallResult.answer,
+        sessionIsPrivateForRecall ? 'private' : 'public',
+      );
+      return {
+        text: recallResult.answer,
+        toolsUsed: recallResult.searched.map((source) => `recall:${source}`),
+        durationMs: Date.now() - recallStartedAt,
+      };
+    }
+    recallModelFallbackPrompt = renderModelFallbackPrompt(recallResult);
+  }
+
   // Cross-engine dispatch. Anthropic keeps the established Agent SDK path
   // untouched below; Ollama and Codex are explicit alternatives with no
   // fallback to Claude on failure. A session-level selection is intentionally
   // in-memory: changing it affects this running conversation only.
   const engineSelection = getEngineSelection(sessionKey);
   if (engineSelection.engine !== 'anthropic') {
-    const enginePrompt = command === 'explore' ? `Explore the codebase and answer: ${message}` : message;
+    const contractedMessage = recallModelFallbackPrompt
+      ? `${message}\n\n${recallModelFallbackPrompt}`
+      : message;
+    const enginePrompt = command === 'explore'
+      ? `Explore the codebase and answer: ${contractedMessage}`
+      : contractedMessage;
     sessionManager.updateActivity(sessionKey, message);
     const response = await runAlternativeEngine(engineSelection, {
       sessionKey,
@@ -1213,7 +1275,12 @@ export async function sendToAgent(
     // not a session-scoped one. Operator-owned private OMI memories are reachable
     // exclusively via the scope-aware MCP tool nexusgram_memory_search, where the
     // master-bot's NEXUS_MEMORY_SCOPE=self_private gates them.
-    const memoryContext = injectContext(prompt, config.BOT_MEMORY_PROJECT, false);
+    const memoryContext = injectContext(
+      prompt,
+      config.BOT_MEMORY_PROJECT,
+      false,
+      isMasterBot ? undefined : memoryBotId(),
+    );
     // Load previous day's transcript for context continuity (only on fresh sessions)
     const previousDayContext = existingSessionId ? '' : loadPreviousDayTranscript(sessionKey);
     // Load today's transcript for context recovery after a bot restart.
@@ -1249,7 +1316,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}${voiceCapabilityPrompt}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${todayContext}${previousDayContext}${recentUploadsContext}${contextAvailabilityContext}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
+        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}${voiceCapabilityPrompt}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${todayContext}${previousDayContext}${recentUploadsContext}${contextAvailabilityContext}${recallModelFallbackPrompt}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
       },
       settingSources: config.BOT_SETTING_SOURCES as SettingSource[],
       model: effectiveModel,

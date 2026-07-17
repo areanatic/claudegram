@@ -15,6 +15,7 @@ import { config } from '../config.js';
 import { sessionManager } from './session-manager.js';
 import { getWorkspaceRoot, isPathWithinRoot } from '../utils/workspace-guard.js';
 import {
+  botId as memoryBotId,
   searchMemoryReadOnly,
   recentMemoriesReadOnly,
   readMemoryPolicyFromEnv,
@@ -836,10 +837,21 @@ function nexusMemorySearchTool(toolsCtx: McpToolsContext) {
         const effectivePolicy: MemoryRetrievalPolicy = sessionIsPrivate
           ? { ...safePolicy, scope: 'public' }
           : safePolicy;
-        const hits = searchMemoryReadOnly(query, limit ?? 5, project, { policy: effectivePolicy });
+        const personScope = config.BOT_NAME !== 'Nexusgram';
+        const personProject = config.BOT_MEMORY_PROJECT?.trim();
+        if (personScope && (!personProject || (project && project !== personProject))) {
+          return {
+            content: [{ type: 'text' as const, text: 'Memory search unavailable outside this bot/project silo.' }],
+          };
+        }
+        const effectiveProject = personScope ? personProject : project;
+        const hits = searchMemoryReadOnly(query, limit ?? 5, effectiveProject, {
+          policy: effectivePolicy,
+          originBot: personScope ? memoryBotId() : undefined,
+        });
         if (hits.length === 0) {
           return {
-            content: [{ type: 'text' as const, text: `No memories found for query "${query}"${project ? ` in project "${project}"` : ''}.` }],
+            content: [{ type: 'text' as const, text: `No memories found for query "${query}"${effectiveProject ? ` in project "${effectiveProject}"` : ''}.` }],
           };
         }
         const formatted = hits.map((h, i) =>
@@ -893,10 +905,21 @@ function nexusMemoryRecentTool(toolsCtx: McpToolsContext) {
         const effectivePolicy: MemoryRetrievalPolicy = sessionIsPrivate
           ? { ...safePolicy, scope: 'public' }
           : safePolicy;
-        const hits = recentMemoriesReadOnly(limit ?? 5, project, { policy: effectivePolicy });
+        const personScope = config.BOT_NAME !== 'Nexusgram';
+        const personProject = config.BOT_MEMORY_PROJECT?.trim();
+        if (personScope && (!personProject || (project && project !== personProject))) {
+          return {
+            content: [{ type: 'text' as const, text: 'Recent memory unavailable outside this bot/project silo.' }],
+          };
+        }
+        const effectiveProject = personScope ? personProject : project;
+        const hits = recentMemoriesReadOnly(limit ?? 5, effectiveProject, {
+          policy: effectivePolicy,
+          originBot: personScope ? memoryBotId() : undefined,
+        });
         if (hits.length === 0) {
           return {
-            content: [{ type: 'text' as const, text: `No recent memories found${project ? ` in project "${project}"` : ''}.` }],
+            content: [{ type: 'text' as const, text: `No recent memories found${effectiveProject ? ` in project "${effectiveProject}"` : ''}.` }],
           };
         }
         const formatted = hits.map((h, i) =>
@@ -1151,4 +1174,3 @@ function omiTaskSearchTool(toolsCtx: McpToolsContext) {
     }
   );
 }
-

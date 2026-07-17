@@ -207,7 +207,8 @@ export function searchMemory(
   query: string,
   limit = 5,
   project?: string,
-  includePrivate = false
+  includePrivate = false,
+  originBot?: string,
 ): MemoryRow[] {
   const conn = getDb();
   if (!conn) return [];
@@ -215,9 +216,13 @@ export function searchMemory(
     // Escape FTS5 special characters by wrapping in double quotes (phrase search)
     const safeQuery = `"${query.replace(/"/g, '""')}"`;
     const projectFilter = project ? 'AND m.project = ?' : '';
+    if (originBot && !hasBotColumn(conn)) return [];
+    const botFilter = originBot ? 'AND m.bot = ?' : '';
     const privacyFilter = privacyClause(conn, includePrivate);
-    const params: unknown[] = [safeQuery, limit];
-    if (project) params.splice(1, 0, project);
+    const params: unknown[] = [safeQuery];
+    if (project) params.push(project);
+    if (originBot) params.push(originBot);
+    params.push(limit);
 
     const stmt = conn.prepare(`
       SELECT m.id, m.type, m.content, m.source, m.project, m.tags, m.score, m.created_at, m.last_accessed
@@ -225,6 +230,7 @@ export function searchMemory(
       JOIN memories m ON m.id = fts.rowid
       WHERE memories_fts MATCH ?
       ${projectFilter}
+      ${botFilter}
       ${privacyFilter}
       ORDER BY rank
       LIMIT ?
@@ -243,20 +249,27 @@ export function searchMemory(
 export function recentMemories(
   limit = 5,
   project?: string,
-  includePrivate = false
+  includePrivate = false,
+  originBot?: string,
 ): MemoryRow[] {
   const conn = getDb();
   if (!conn) return [];
   try {
     const projectFilter = project ? 'AND project = ?' : '';
+    if (originBot && !hasBotColumn(conn)) return [];
+    const botFilter = originBot ? 'AND bot = ?' : '';
     const privacyFilter = privacyClause(conn, includePrivate, 'memories');
-    const params: unknown[] = project ? [project, limit] : [limit];
+    const params: unknown[] = [];
+    if (project) params.push(project);
+    if (originBot) params.push(originBot);
+    params.push(limit);
 
     const stmt = conn.prepare(`
       SELECT id, type, content, source, project, tags, score, created_at, last_accessed
       FROM memories
       WHERE archived = 0 AND score > 0.3
       ${projectFilter}
+      ${botFilter}
       ${privacyFilter}
       ORDER BY last_accessed DESC
       LIMIT ?
@@ -336,10 +349,13 @@ export function saveMemory(
 export function injectContext(
   query?: string,
   project?: string,
-  includePrivate = false
+  includePrivate = false,
+  originBot?: string,
 ): string {
-  const ftsResults = query ? searchMemory(query, 3, project, includePrivate) : [];
-  const recentResults = recentMemories(5, project, includePrivate);
+  const ftsResults = query
+    ? searchMemory(query, 3, project, includePrivate, originBot)
+    : [];
+  const recentResults = recentMemories(5, project, includePrivate, originBot);
 
   // Deduplicate: recent may overlap with FTS results
   const seenIds = new Set(ftsResults.map(r => r.id));
@@ -385,6 +401,9 @@ export interface McpMemoryHit {
   tags: string | null;
   project: string | null;
   score: number;
+  /** Creation time is provenance, not hidden implementation metadata. Recall
+   *  answers use it for the mandatory "aus Memory 12.07." citation. */
+  created_at?: string;
   /** Cross-Bot T2 (a): which bot saved this (slug). NULL on legacy / pre-migration rows.
    *  Metadata only — surfaced so the agent can say "saved by family-bot"; never gates visibility. */
   bot?: string | null;
@@ -393,6 +412,9 @@ export interface McpMemoryHit {
 export interface MemorySearchOptions {
   /** Retrieval policy. If omitted, policy is derived from process env at call-time. */
   policy?: MemoryRetrievalPolicy;
+  /** Fail-closed bot-silo filter. Person-bot recall always sets this; the
+   *  operator/master deliberately omits it to search all operator-owned rows. */
+  originBot?: string;
 }
 
 export function searchMemoryReadOnly(
@@ -414,14 +436,20 @@ export function searchMemoryReadOnly(
 
     const { clause: privClause, params: privParams } = buildPrivacyClause(conn, policy);
     const projectClause = project ? `AND m.project = ?` : '';
-    const botCol = hasBotColumn(conn) ? ', m.bot' : '';   // T2(a) additive; absent pre-migration
+    const hasBot = hasBotColumn(conn);
+    // A requested silo filter on a legacy DB without bot attribution cannot be
+    // proven safe. Return no rows instead of broadening visibility.
+    if (options.originBot && !hasBot) return [];
+    const botClause = options.originBot ? 'AND m.bot = ?' : '';
+    const botCol = hasBot ? ', m.bot' : '';   // T2(a) additive; absent pre-migration
 
     const buildStmt = () => conn!.prepare(`
-      SELECT m.content, m.tags, m.project, m.score, m.privacy, m.source${botCol}
+      SELECT m.content, m.tags, m.project, m.score, m.created_at, m.privacy, m.source${botCol}
       FROM memories_fts fts
       JOIN memories m ON m.id = fts.rowid
       WHERE memories_fts MATCH ?
       ${projectClause}
+      ${botClause}
       ${privClause}
       ORDER BY rank
       LIMIT ?
@@ -430,6 +458,7 @@ export function searchMemoryReadOnly(
     const buildParams = (matchExpr: string): unknown[] => {
       const p: unknown[] = [matchExpr];
       if (project) p.push(project);
+      if (options.originBot) p.push(options.originBot);
       p.push(...privParams);
       p.push(clampedLimit);
       return p;
@@ -481,6 +510,7 @@ export function searchMemoryReadOnly(
       tags: r.tags,
       project: r.project,
       score: r.score,
+      created_at: r.created_at,
       bot: r.bot ?? null,
     }));
   } catch (err) {
@@ -532,19 +562,24 @@ export function recentMemoriesReadOnly(
 
     const { clause: privClause, params: privParams } = buildPrivacyClause(conn, policy, 'm');
     const projectClause = project ? 'AND m.project = ?' : '';
-    const botCol = hasBotColumn(conn) ? ', m.bot' : '';   // T2(a) additive; absent pre-migration
+    const hasBot = hasBotColumn(conn);
+    if (options.originBot && !hasBot) return [];
+    const botClause = options.originBot ? 'AND m.bot = ?' : '';
+    const botCol = hasBot ? ', m.bot' : '';   // T2(a) additive; absent pre-migration
 
     const stmt = conn.prepare(`
       SELECT m.content, m.tags, m.project, m.score, m.created_at${botCol}
       FROM memories m
       WHERE m.archived = 0
       ${projectClause}
+      ${botClause}
       ${privClause}
       ORDER BY m.created_at DESC, m.id DESC
       LIMIT ?
     `);
     const params: unknown[] = [];
     if (project) params.push(project);
+    if (options.originBot) params.push(options.originBot);
     params.push(...privParams);
     params.push(clampedLimit);
 
