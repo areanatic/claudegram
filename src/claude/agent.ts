@@ -50,7 +50,7 @@ import {
   evaluateMcpCapabilityHealth,
   type McpCapabilityHealth,
 } from './capability-health.js';
-import { buildVoiceCapabilityPrompt } from './voice-capabilities.js';
+import { buildVoiceCapabilityPrompt, effectiveToolsForVoice, toolBudgetForVoice } from './voice-capabilities.js';
 
 /**
  * Privacy Mode Phase 1 — neutralizing system-prompt suffix.
@@ -947,17 +947,12 @@ export async function sendToAgent(
     const disallowedTools = config.BOT_DISALLOWED_TOOLS;
     const disallowedToolsOption = disallowedTools.length > 0 ? disallowedTools : undefined;
 
-    // RI-27 (2026-06-09): in voiceMode, drop the heavy generic shell/file tools too,
-    // not just Task. A voice turn ("alle Pixi-Termine absagen") must use the focused
-    // domain tools (cal_*/gcal_*), never fall back to Bash loops that blow the tight
-    // voice tool-budget. Bash/Write/Edit are the escalation surface behind the budget
-    // sprenger. They stay available in text mode (where the budget is larger and the
-    // user can see/steer). Quick-win pending the structural bulk-tool fix (RI-27).
-    const VOICE_DROP = new Set(['Task', 'Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
-    const effectiveBotTools = (voiceMode
-      ? config.BOT_TOOLS.filter((t) => !VOICE_DROP.has(t))
-      : config.BOT_TOOLS
-    ).filter((t) => !disallowedTools.includes(t));
+    // Sprint 8: BOT_ROLE=master is Arash's CLI-equivalent lane. Voice retains
+    // the complete configured generic tool set and text-sized budget there.
+    // Person bots deliberately preserve the focused/safe voice policy.
+    const effectiveBotTools = voiceMode
+      ? effectiveToolsForVoice(config.BOT_TOOLS, disallowedTools, isMasterBot)
+      : config.BOT_TOOLS.filter((t) => !disallowedTools.includes(t));
 
     const toolsOption = config.DANGEROUS_MODE
       ? { type: 'preset' as const, preset: 'claude_code' as const }
@@ -973,7 +968,9 @@ export async function sendToAgent(
     // Schlachtplan Akt 1.3 Fix C: per-turn tool budget. When the agent issues
     // more tool_use blocks than this, the turn is aborted as a controlled
     // error instead of running away unbounded. Voice gets the tighter budget.
-    const maxToolsThisTurn = voiceMode ? config.TOOL_BUDGET_VOICE : config.TOOL_BUDGET_TEXT;
+    const maxToolsThisTurn = voiceMode
+      ? toolBudgetForVoice(isMasterBot, config.TOOL_BUDGET_VOICE, config.TOOL_BUDGET_TEXT)
+      : config.TOOL_BUDGET_TEXT;
 
     // PreCompact hook: log + flush conversation context to daily transcript
     const preCompactHook: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
