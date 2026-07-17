@@ -70,6 +70,7 @@ import { handlePhoto, handleImageDocument } from './handlers/photo.handler.js';
 import { handleDocument } from './handlers/document.handler.js';
 import { handleFollowUpCallback } from '../telegram/followup-buttons.js';
 import { startRegistrySweep } from '../handler/request-registry.js';
+import { resumeOpenTask } from '../inbox/task-resume.js';
 
 // Resolve sequentialize constraint: same-chat updates are ordered,
 // but /cancel is registered BEFORE this middleware so it bypasses it.
@@ -310,7 +311,14 @@ export async function createBot(): Promise<Bot> {
   bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data;
 
-    if (data.startsWith('resume:')) {
+    if (data.startsWith('taskresume:')) {
+      const taskId = Number(data.slice('taskresume:'.length));
+      if (!Number.isSafeInteger(taskId) || taskId <= 0) {
+        await ctx.answerCallbackQuery({ text: 'Ungültiger Auftrag.' });
+      } else {
+        await resumeOpenTask(ctx, bot, taskId);
+      }
+    } else if (data.startsWith('resume:')) {
       await handleResumeCallback(ctx);
     } else if (data.startsWith('model:')) {
       await handleModelCallback(ctx);

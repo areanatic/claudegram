@@ -33,7 +33,10 @@ async function notifyOpenTasks(bot: Awaited<ReturnType<typeof createBot>>, tasks
     const remainder = sessionTasks.length > previews.length ? `\n… und ${sessionTasks.length - previews.length} weitere.` : '';
     const message = `⚠️ Ich habe noch ${sessionTasks.length} offene Aufträge aus der vorherigen Sitzung:\n${previews.join('\n')}${remainder}\n\nSchreib „weiter“, wenn ich einen davon fortsetzen soll.`;
     try {
-      await bot.api.sendMessage(chatId, message, threadId === undefined ? {} : { message_thread_id: threadId });
+      await bot.api.sendMessage(chatId, message, {
+        ...(threadId === undefined ? {} : { message_thread_id: threadId }),
+        reply_markup: { inline_keyboard: sessionTasks.slice(0, 3).map((task) => [{ text: `▶️ ${task.taskKind} fortsetzen`, callback_data: `taskresume:${task.id}` }]) },
+      });
     } catch (error) {
       console.error(`[TaskLedger] open-task recovery notice failed for ${sessionKey}:`, error);
     }

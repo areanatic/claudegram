@@ -154,5 +154,12 @@ export function openTaskCount(): number {
     .get(botId()) as { n: number }).n;
 }
 
+export function getOpenTask(id: number): OpenTask | null {
+  const row = getDb().prepare(`SELECT id,chat_id AS chatId,session_key AS sessionKey,input_type AS inputType,
+    task_kind AS taskKind,summary,state,failure_reason AS reason,accepted_at AS acceptedAt
+    FROM task_ledger WHERE id=? AND bot_id=? AND state<>'completed'`).get(id, botId()) as OpenTask | undefined;
+  return row ?? null;
+}
+
 export function closeTaskLedger(): void { if (db) db.close(); db = null; }
 export function __resetTaskLedgerForTest(): void { closeTaskLedger(); }
