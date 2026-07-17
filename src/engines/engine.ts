@@ -89,8 +89,14 @@ export function clearEngineSelection(sessionKey: string): void {
 }
 
 /** Hard code gate: only the Master bot and an allowlisted Telegram user may use these paths. */
-export function isMasterEngineLane(botName: string, allowedUserIds: readonly number[], userId: number | undefined): boolean {
-  return botName === 'Nexusgram' && userId !== undefined && allowedUserIds.includes(userId);
+export function isMasterEngineLane(
+  botName: string,
+  allowedUserIds: readonly number[],
+  userId: number | undefined,
+  botRole?: 'master' | 'person',
+): boolean {
+  const isMaster = botRole === 'master' || (botRole === undefined && botName === 'Nexusgram');
+  return isMaster && userId !== undefined && allowedUserIds.includes(userId);
 }
 
 /** Used by the text fallback so an unregistered person-bot command is silently ignored. */

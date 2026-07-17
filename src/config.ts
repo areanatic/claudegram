@@ -40,7 +40,17 @@ const envSchema = z.object({
     .default('true')
     .transform((val) => val.toLowerCase() === 'true'),
   BOT_NAME: z.string().default('Nexusgram'),
+  // Explicit role is optional for backward compatibility: existing bot envs
+  // continue to infer master from BOT_NAME='Nexusgram'. Test lanes can opt in
+  // with BOT_ROLE=master without borrowing the production name.
+  BOT_ROLE: z.enum(['master', 'person']).optional(),
   BOT_MODE: z.enum(['dev', 'prod']).default('dev'),
+  // Bounded bootstrap retry: covers Telegram 401/429/5xx/network turbulence
+  // before polling starts. It never retries a 409 poller conflict in-process.
+  BOT_INIT_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(12).default(6),
+  BOT_INIT_RETRY_BASE_DELAY_MS: z.coerce.number().int().min(100).max(60_000).default(1_000),
+  BOT_HEALTH_GETME_INTERVAL_MS: z.coerce.number().int().min(60_000).max(3_600_000).default(300_000),
+  TELEGRAM_PING_SCRIPT: z.string().default('/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/dirigent/telegram-ping.sh'),
   // INV-02 Model-Truth (2026-05-31): single source for the default model. 'sonnet'
   // = fast default (user strategy); Opus only on-demand via /model opus. Both
   // effectiveModel AND getModel read this via resolveModel() → display==computed.
@@ -466,16 +476,18 @@ if (!parsed.success) {
 export const config = parsed.data;
 
 // The production Master is deliberately identified once and then used by the
-// MCP wiring and capability-health checks. Person bots never enter this path.
-export const isMasterBot = config.BOT_NAME === 'Nexusgram';
+// MCP wiring and capability-health checks. BOT_ROLE permits a test lane to
+// exercise the same hard gates. Omitting it preserves the legacy name rule.
+export const isMasterBot = config.BOT_ROLE === 'master' ||
+  (config.BOT_ROLE === undefined && config.BOT_NAME === 'Nexusgram');
 
 // Phase 7.1 boot-assertion: master-bot must explicitly declare its scope.
 // Family-/test-bot default-fail-closed to 'public' (no assertion needed).
-// Identifier: BOT_NAME='Nexusgram' is the master-bot per master .env.
+// Identifier: BOT_ROLE=master, or legacy BOT_NAME='Nexusgram' when unset.
 if (isMasterBot && config.NEXUS_MEMORY_SCOPE !== 'self_private') {
   console.error(
     '❌ Master-bot boot-assertion failed (Phase 7.1):\n' +
-    `   BOT_NAME='${config.BOT_NAME}' but NEXUS_MEMORY_SCOPE='${config.NEXUS_MEMORY_SCOPE ?? '(unset)'}'.\n` +
+    `   BOT_NAME='${config.BOT_NAME}' BOT_ROLE='${config.BOT_ROLE ?? '(legacy)'}' but NEXUS_MEMORY_SCOPE='${config.NEXUS_MEMORY_SCOPE ?? '(unset)'}'.\n` +
     "   Master must explicitly set NEXUS_MEMORY_SCOPE='self_private' to access\n" +
     '   operator-owned private memories. Set it in the .env file.\n' +
     '   Family-/test-bot can leave it unset (defaults to public).'

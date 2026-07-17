@@ -33,6 +33,8 @@ clearEngineSelection('chat:unavailable');
 ok(isMasterEngineLane('Nexusgram', [42], 42), 'master allowlisted user passes engine ACL');
 ok(!isMasterEngineLane('Alinas Assistentin', [42], 42), 'person bot never passes engine ACL');
 ok(!isMasterEngineLane('Nexusgram', [42], 7), 'non-allowlisted user never passes engine ACL');
+ok(isMasterEngineLane('NexusgramTest', [42], 42, 'master'), 'BOT_ROLE=master enables engine commands on a test lane');
+ok(!isMasterEngineLane('Nexusgram', [42], 42, 'person'), 'BOT_ROLE=person overrides the legacy production name');
 ok(isRestrictedEngineCommand('/codex inspect this'), 'codex command is recognised for silent person-bot suppression');
 ok(isRestrictedEngineCommand('/engine@Nexusgram ollama'), 'mention-style engine command is recognised');
 

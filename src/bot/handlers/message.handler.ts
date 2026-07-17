@@ -55,6 +55,7 @@ import {
   type RequestContext,
   type RequestOrigin,
 } from '../../handler/request-context.js';
+import { recordSuccessfulTurn } from '../../health/bot-health.js';
 
 async function replyFeatureDisabled(ctx: Context, feature: string): Promise<void> {
   await ctx.reply(`⚠️ ${feature} feature is disabled in configuration.`, { parse_mode: undefined });
@@ -165,7 +166,7 @@ export async function handleMessage(ctx: Context): Promise<void> {
   // Person-bots have no /engine or /codex capability. Because no command
   // handler is registered for them, suppress manually typed variants here too
   // so they are neither advertised nor forwarded to Claude as plain text.
-  if (isRestrictedEngineCommand(text) && !isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id)) {
+  if (isRestrictedEngineCommand(text) && !isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id, config.BOT_ROLE)) {
     return;
   }
 
@@ -863,6 +864,7 @@ async function handleStreamingResponse(
     }
 
     await messageSender.finishStreaming(ctx, response.text);
+    recordSuccessfulTurn();
     streamingFinished = true;
     await maybeSendVoiceReply(ctx, response.text);
 
@@ -971,6 +973,7 @@ async function handleWaitResponse(
     }
 
     await messageSender.sendMessage(ctx, response.text);
+    recordSuccessfulTurn();
     await maybeSendVoiceReply(ctx, response.text);
 
     // Context visibility notifications

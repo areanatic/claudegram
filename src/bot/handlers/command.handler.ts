@@ -17,6 +17,7 @@ import {
 } from '../../claude/agent.js';
 import { occupancyTokens } from '../../claude/context-pressure.js';
 import { config } from '../../config.js';
+import { getBotEffectivenessHealth } from '../../health/bot-health.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { getUptimeFormatted } from '../middleware/stale-filter.js';
 import { getAvailableCommands } from '../../claude/command-parser.js';
@@ -1592,7 +1593,7 @@ export async function handleResetCallback(ctx: Context): Promise<void> {
 }
 
 export async function handleCommands(ctx: Context): Promise<void> {
-  const isMasterLane = isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id);
+  const isMasterLane = isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id, config.BOT_ROLE);
   const engineSection = isMasterLane
     ? '\n\n*Engine Commands:*\n\n• `/engine` \\- Show or switch the active engine\n• `/codex <task>` \\- Run a read\\-only Codex task'
     : '';
@@ -1601,7 +1602,7 @@ export async function handleCommands(ctx: Context): Promise<void> {
 
 /** Master-lane only. The registration gate in bot.ts hides this completely from person-bots. */
 export async function handleEngine(ctx: Context): Promise<void> {
-  if (!isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id)) return;
+  if (!isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id, config.BOT_ROLE)) return;
   const keyInfo = getSessionKeyFromCtx(ctx);
   if (!keyInfo) return;
   const { sessionKey } = keyInfo;
@@ -1644,7 +1645,7 @@ export async function handleEngine(ctx: Context): Promise<void> {
 
 /** Direct Codex escape hatch. Its fixed, read-only process invocation lives in engines/engine.ts. */
 export async function handleCodex(ctx: Context): Promise<void> {
-  if (!isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id)) return;
+  if (!isMasterEngineLane(config.BOT_NAME, config.ALLOWED_USER_IDS, ctx.from?.id, config.BOT_ROLE)) return;
   const keyInfo = getSessionKeyFromCtx(ctx);
   if (!keyInfo) return;
   const task = (ctx.message?.text ?? '').replace(/^\/codex(?:@\w+)?\s*/i, '').trim();
@@ -4056,6 +4057,7 @@ export async function handleHealth(ctx: Context): Promise<void> {
 
   const pid = process.pid;
   const memMB = (process.memoryUsage.rss() / 1024 / 1024).toFixed(1); // allow-hardcoded: reason="bytes→MB display conversion"
+  const effectiveness = getBotEffectivenessHealth();
 
   // Active queue + RequestContext registry
   const activeKeys = getActiveSessionKeys();
@@ -4138,6 +4140,8 @@ export async function handleHealth(ctx: Context): Promise<void> {
     `*Adaptive timeout threshold:* ${config.ADAPTIVE_TIMEOUT_QUEUE_THRESHOLD} queued`,
     `*Hard\\-cap base:* ${Math.round(config.AGENT_RESPONSE_TIMEOUT_MS / 60000)} min`, // allow-hardcoded: reason="ms→min display conversion"
     `*Capability ledger:* \`${esc(ledgerPath)}\``,
+    `*Last delivered turn:* ${esc(effectiveness.turns.last_success_at ?? 'none since boot')}`,
+    `*Telegram getMe:* ${esc(effectiveness.telegram_get_me.last_success_at ?? `failed: ${effectiveness.telegram_get_me.last_error ?? 'never'}`)}`,
   );
 
   // Phase 7.x — Scanner-Pro watcher status (one compact line per Codex P1-3).

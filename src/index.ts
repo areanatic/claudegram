@@ -1,6 +1,6 @@
 import { run } from '@grammyjs/runner';
 import { GrammyError } from 'grammy';
-import { createBot } from './bot/bot.js';
+import { createBot, registerBotCommands } from './bot/bot.js';
 import { config } from './config.js';
 import { preventSleep, allowSleep } from './utils/caffeinate.js';
 import { stopCleanup } from './telegram/deduplication.js';
@@ -15,6 +15,13 @@ import { parseSessionKey } from './utils/session-key.js';
 import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
 import { startScannerProWatcher, stopScannerProWatcher } from './scanners/scanner-pro-watcher.js';
 import { startOmiBridgeWatcher, stopOmiBridgeWatcher } from './scanners/omi-bridge-watcher.js';
+import { initializeBotStartup, StartupRetryExhaustedError } from './telegram/startup-retry.js';
+import { sendStartupFailureAlert } from './telegram/startup-alert.js';
+import {
+  recordInitialTelegramRoundtrip,
+  startBotHealthHeartbeat,
+  stopBotHealthHeartbeat,
+} from './health/bot-health.js';
 
 async function notifyOpenTasks(bot: Awaited<ReturnType<typeof createBot>>, tasks: OpenTask[]): Promise<void> {
   if (!tasks.length) return;
@@ -65,8 +72,29 @@ async function main() {
 
   const bot = await createBot();
 
-  // Initialize bot (fetches bot info from Telegram)
-  await bot.init();
+  // Initialize bot (getMe) before starting a poller. Telegram can return a
+  // transient 401 during provider/network turbulence; retry it in a bounded,
+  // jittered window rather than entering a launchd crash-loop. A 409 is not
+  // retried here: another poller must clear before launchd tries again. The
+  // command menu is part of the bootstrap transaction and remains strictly
+  // post-init on every attempt.
+  await initializeBotStartup(
+    () => bot.init(),
+    () => registerBotCommands(bot),
+    {
+      maxAttempts: config.BOT_INIT_MAX_ATTEMPTS,
+      baseDelayMs: config.BOT_INIT_RETRY_BASE_DELAY_MS,
+      maxDelayMs: 60_000,
+      onRetry: ({ attempt, maxAttempts, delayMs, error }) => {
+        console.warn(
+          `[Startup] bot.init attempt ${attempt}/${maxAttempts} failed; retrying in ${delayMs}ms:`,
+          error instanceof Error ? error.message : error,
+        );
+      },
+    },
+  );
+  recordInitialTelegramRoundtrip();
+  startBotHealthHeartbeat(bot);
   console.log(`✅ Bot started as @${bot.botInfo.username}`);
   console.log('📱 Send /start in Telegram to begin');
 
@@ -236,6 +264,7 @@ async function main() {
     // running child (ssh/rsync/python/ffmpeg descendants) gets the signal
     // together, with 8s grace before SIGKILL.
     try { await stopOmiBridgeWatcher(); } catch { /* ignore */ }
+    stopBotHealthHeartbeat();
 
     // 6. Cleanup
     releaseLock(config.BOT_NAME);
@@ -284,6 +313,19 @@ async function start() {
       console.error('      launchd relaunches after ThrottleInterval; the conflict should be gone by then.');
       console.error('      If this persists: launchctl list | grep nexusgram');
       process.exit(0); // exit 0 — relaunch is throttled, no tight loop
+    }
+
+    if (error instanceof StartupRetryExhaustedError) {
+      const reason = error.cause instanceof Error ? error.cause.message : String(error.cause);
+      const alert = `🚨 NexusGram ${config.BOT_NAME}: Telegram bootstrap failed after ${error.attempts} attempts (${reason.slice(0, 180)}). Process exits fail-loud.`;
+      console.error(`[Startup] ${alert}`);
+      try {
+        await sendStartupFailureAlert(config.TELEGRAM_PING_SCRIPT, alert);
+      } catch (alertError) {
+        // The alert path itself must be visible in launchd logs; it may be the
+        // incident root cause, never a silent best-effort side path.
+        console.error('[Startup] FATAL: Telegram alert path also failed:', alertError);
+      }
     }
 
     console.error('Fatal error:', error);

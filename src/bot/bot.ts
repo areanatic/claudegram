@@ -1,7 +1,7 @@
 import { Bot, type Context } from 'grammy';
 import { autoRetry } from '@grammyjs/auto-retry';
 import { sequentialize } from '@grammyjs/runner';
-import { config } from '../config.js';
+import { config, isMasterBot } from '../config.js';
 import { buildSessionKey } from '../utils/session-key.js';
 import { authMiddleware } from './middleware/auth.middleware.js';
 import { inputLogMiddleware } from './middleware/input-log.middleware.js';
@@ -88,7 +88,7 @@ function getSequentializeKey(ctx: Context): string | undefined {
 export async function createBot(): Promise<Bot> {
   // Registered only for the Master bot. The handlers additionally check the
   // allowed user ID, which keeps the restriction a code gate rather than UI.
-  const masterEngineCommandsEnabled = config.BOT_NAME === 'Nexusgram';
+  const masterEngineCommandsEnabled = isMasterBot;
   // Stage 2b Action 9: defensive RequestContext registry sweep. Eager-remove
   // happens in `disposeRequestContext()`; this periodic safety-net catches
   // contexts whose handler crashed outside the try/finally guard. 60s cadence.
@@ -118,7 +118,9 @@ export async function createBot(): Promise<Bot> {
     rethrowInternalServerErrors: false, // Retry on 5xx errors
   }));
 
-  // Register command menu for autocomplete (non-blocking)
+  // Build the command menu during construction. Registration itself happens
+  // only after bot.init() succeeded; otherwise transient startup auth errors
+  // could leave the menu stale while launchd restarts the process.
   // Minimal mode: Space-Bots only show user-relevant commands
   const minimalCommands: Record<string, { start: string; clear: string; cancel: string; tts: string; inbox: string; transcribe: string; status: string }> = {
     de: { start: '👋 Hilfe und Übersicht', clear: '🗑️ Neues Gespräch starten', cancel: '⏹️ Aktuelle Anfrage abbrechen', tts: '🔊 Sprachantworten an/aus', inbox: '📬 Empfangene Dokumente anzeigen', transcribe: '🎤 Audio in Text umwandeln', status: '📊 Session-Status' },
@@ -189,26 +191,9 @@ export async function createBot(): Promise<Bot> {
   // typed "/health" arrived as plain text, fell through Grammy's command
   // matcher and hit Claude as "Unknown skill: health". Deleting first
   // forces Telegram to drop the cached list before we register the new one.
-  bot.api.deleteMyCommands().catch((err) => {
-    console.warn('⚠️ deleteMyCommands failed (non-fatal):', err?.message ?? err);
-  });
-  bot.api.setMyCommands(commandList).then(async () => {
-    console.log(`📋 Command menu registered (${commandList.length} commands)`);
-    // Confirm the Telegram backend now sees the new list. If a registered
-    // bot.command(...) is missing here it usually means a stale cache or a
-    // mismatch between this commandList and what the user is typing.
-    try {
-      const live = await bot.api.getMyCommands();
-      console.log(
-        `📋 Telegram backend reports ${live.length} commands: ` +
-          `[${live.map((c) => '/' + c.command).join(', ')}]`,
-      );
-    } catch (err) {
-      console.debug('[bot] getMyCommands confirmation failed:', err);
-    }
-  }).catch((err) => {
-    console.warn('⚠️ Failed to register commands:', err.message);
-  });
+  // Keep the list on the bot instance for the startup sequence. This avoids a
+  // second source of truth and guarantees command registration is post-init.
+  Object.assign(bot, { nexusgramCommandList: commandList });
 
   // Apply auth middleware to all updates
   bot.use(authMiddleware);
@@ -404,4 +389,23 @@ export async function createBot(): Promise<Bot> {
   });
 
   return bot;
+}
+
+/** Must be called after a successful bot.init(), never while bootstrap retries. */
+export async function registerBotCommands(bot: Bot): Promise<void> {
+  const commandList = (bot as Bot & { nexusgramCommandList?: Parameters<Bot['api']['setMyCommands']>[0] }).nexusgramCommandList;
+  if (!commandList) throw new Error('Bot command list was not initialized.');
+  try {
+    await bot.api.deleteMyCommands();
+  } catch (error) {
+    console.warn('⚠️ deleteMyCommands failed (non-fatal):', error instanceof Error ? error.message : error);
+  }
+  await bot.api.setMyCommands(commandList);
+  console.log(`📋 Command menu registered (${commandList.length} commands)`);
+  try {
+    const live = await bot.api.getMyCommands();
+    console.log(`📋 Telegram backend reports ${live.length} commands: [${live.map((c) => '/' + c.command).join(', ')}]`);
+  } catch (error) {
+    console.debug('[bot] getMyCommands confirmation failed:', error);
+  }
 }
