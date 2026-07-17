@@ -34,7 +34,11 @@ import { getScannerWatcherStatus } from '../../scanners/scanner-pro-watcher.js';
 import { getOmiBridgeWatcherStatus } from '../../scanners/omi-bridge-watcher.js';
 import { createTelegraphFromFile, createTelegraphPage } from '../../telegram/telegraph.js';
 import { isMediumUrl, fetchMediumArticle, FreediumArticle } from '../../medium/freedium.js';
-import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
+import {
+  escapeMarkdownV2 as esc,
+  escapeTelegramMarkdown,
+  replyWithMarkdownFallback,
+} from '../../telegram/markdown.js';
 import { getTTSSettings, setTTSEnabled, setTTSVoice, setTTSAutoplay, isVoiceActive } from '../../tts/tts-settings.js';
 import { getTerminalUISettings, setTerminalUIEnabled } from '../../telegram/terminal-settings.js';
 import { getTelegraphSettings, setTelegraphEnabled } from '../../telegram/telegraph-settings.js';
@@ -86,7 +90,7 @@ import {
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
-  await ctx.reply(text, { parse_mode: 'MarkdownV2' });
+  await replyWithMarkdownFallback(ctx, text, { parse_mode: 'MarkdownV2' });
 }
 
 function buildFeatureDisabledMessage(feature: string): string {
@@ -355,7 +359,7 @@ export async function handleStart(ctx: Context): Promise<void> {
     try {
       const welcomeText = fs.readFileSync(config.BOT_WELCOME_FILE, 'utf8').trim();
       if (welcomeText) {
-        await ctx.reply(welcomeText, { parse_mode: 'Markdown' });
+        await replyWithMarkdownFallback(ctx, welcomeText, { parse_mode: 'Markdown' });
         return;
       }
     } catch { /* fall through to default */ }
@@ -393,7 +397,8 @@ export async function handleClear(ctx: Context): Promise<void> {
   const session = sessionManager.getSession(sessionKey);
   const projectName = session ? path.basename(session.workingDirectory) : 'current session';
 
-  await ctx.reply(
+  await replyWithMarkdownFallback(
+    ctx,
     `⚠️ *Clear Session?*\n\nThis will clear *${esc(projectName)}* and all conversation history\\.\n\n_This cannot be undone\\._`,
     {
       parse_mode: 'MarkdownV2',
@@ -628,7 +633,7 @@ async function sendProjectBrowser(ctx: Context, state: ProjectBrowserState, edit
     }
   }
 
-  await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: replyMarkup });
+  await replyWithMarkdownFallback(ctx, text, { parse_mode: 'MarkdownV2', reply_markup: replyMarkup });
 }
 
 async function sendProjectManualPrompt(ctx: Context): Promise<void> {
@@ -1187,7 +1192,8 @@ export async function handleBrief(ctx: Context): Promise<void> {
   const rawArg = typeof ctx.match === 'string' ? ctx.match : '';
   const text = rawArg.trim();
   if (!text) {
-    await ctx.reply(
+    await replyWithMarkdownFallback(
+      ctx,
       'Nutze: `/brief <Topic + Stand>` — z.B.\n' +
         '`/brief Apple Watch 4 Setup für Alina, kann nicht anrufen, ChatGPT-Verlauf von 17h gestern auf MacBook`\n\n' +
         'Der Brief landet sofort durchsuchbar im input_log und der Bot kann ihn als Kontext für die nächste Frage ziehen.',
@@ -1250,13 +1256,15 @@ export async function handleBrief(ctx: Context): Promise<void> {
   // event. Configuration alone is not evidence that an MCP process connected.
   const mcpInventory = getLastMcpInventory(sessionKey);
   const capabilityHealth = mcpInventory?.capabilityHealth;
+  const md = escapeTelegramMarkdown;
+  const formatCapabilityNames = (names: readonly string[]) => names.map(md).join(', ');
   const capabilityLines = mcpInventory
     ? [
-        `- Letzter Agent-Start (${mcpInventory.observedAt.slice(0, 16).replace('T', ' ')} UTC): ${capabilityHealth?.connectedServers.length ? `verbundene MCP-Server: ${capabilityHealth.connectedServers.join(', ')}` : 'keine verbundenen MCP-Server gemeldet'}`,
-        `- MCP-Werkzeuge live: ${capabilityHealth?.totalMcpTools ?? 0}; pro Server: ${Object.entries(capabilityHealth?.toolCountByServer ?? {}).map(([server, count]) => `${server}=${count}`).join(', ') || 'keine gemeldet'}`,
-        `- Mail-Konten: lokal ${capabilityHealth?.localMailAccountCount ?? 'unbekannt'}; Master gesamt ${capabilityHealth?.totalMasterMailAccountCount ?? 'unbekannt'} (inkl. mastor.prime nur bei workspace-google-rw-Verbindung)`,
+        `- Letzter Agent-Start (${md(mcpInventory.observedAt.slice(0, 16).replace('T', ' '))} UTC): ${capabilityHealth?.connectedServers.length ? `verbundene MCP-Server: ${formatCapabilityNames(capabilityHealth.connectedServers)}` : 'keine verbundenen MCP-Server gemeldet'}`,
+        `- MCP-Werkzeuge live: ${capabilityHealth?.totalMcpTools ?? 0}; pro Server: ${Object.entries(capabilityHealth?.toolCountByServer ?? {}).map(([server, count]) => `${md(server)}=${count}`).join(', ') || 'keine gemeldet'}`,
+        `- Mail-Konten: lokal ${capabilityHealth?.localMailAccountCount ?? 'unbekannt'}; Master gesamt ${capabilityHealth?.totalMasterMailAccountCount ?? 'unbekannt'} (inkl. ${md('mastor.prime')} nur bei ${md('workspace-google-rw')}-Verbindung)`,
         ...(capabilityHealth?.missingServers.length
-          ? [`- ⚠️ WARNUNG: Soll-MCP fehlt oder ist nicht verbunden: ${capabilityHealth.missingServers.join(', ')}`]
+          ? [`- ⚠️ WARNUNG: Soll-MCP fehlt oder ist nicht verbunden: ${formatCapabilityNames(capabilityHealth.missingServers)}`]
           : []),
       ]
     : ['- Noch kein SDK-MCP-Inventar für diese Sitzung. Sende zuerst einen normalen Text-Turn; erst dessen Init ist ein Verfügbarkeitsbeweis.'];
@@ -1279,12 +1287,7 @@ export async function handleBrief(ctx: Context): Promise<void> {
     'Stelle deine Frage jetzt — ich nehme den Brief als Kontext.',
   ];
 
-  try {
-    await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
-  } catch {
-    // Markdown parse can fail on stray chars — fall back to plain text.
-    await ctx.reply(lines.join('\n'));
-  }
+  await replyWithMarkdownFallback(ctx, lines.join('\n'), { parse_mode: 'Markdown' });
 }
 
 export async function handleContext(ctx: Context): Promise<void> {
@@ -1678,7 +1681,8 @@ export async function handleModelCommand(ctx: Context): Promise<void> {
       return [{ text: label, callback_data: `model:${model}` }];
     });
 
-    await ctx.reply(
+    await replyWithMarkdownFallback(
+      ctx,
       `🤖 *Select Model*\n\n_Current: ${esc(currentModel)}_\n\n• *opus* \\- Most capable \\(default\\)\n• *sonnet* \\- Balanced\n• *haiku* \\- Fast & light`,
       {
         parse_mode: 'MarkdownV2',
@@ -1739,7 +1743,8 @@ export async function handlePlan(ctx: Context): Promise<void> {
   const task = text.split(' ').slice(1).join(' ').trim();
 
   if (!task) {
-    await ctx.reply(
+    await replyWithMarkdownFallback(
+      ctx,
       `📋 *Plan Mode*\n\n_Project: ${esc(path.basename(session.workingDirectory))}_\n\nClaude will analyze your task and create a detailed implementation plan before coding\\.\n\n👇 _Describe your task:_`,
       {
         parse_mode: 'MarkdownV2',
@@ -1775,7 +1780,8 @@ export async function handleExplore(ctx: Context): Promise<void> {
   const question = text.split(' ').slice(1).join(' ').trim();
 
   if (!question) {
-    await ctx.reply(
+    await replyWithMarkdownFallback(
+      ctx,
       `🔍 *Explore Mode*\n\n_Project: ${esc(path.basename(session.workingDirectory))}_\n\nClaude will search and analyze the codebase to answer your question\\.\n\n👇 _What would you like to know?_`,
       {
         parse_mode: 'MarkdownV2',
@@ -2098,7 +2104,8 @@ export async function handleFile(ctx: Context): Promise<void> {
       ? `\n\n*Recent files:*\n${projectFiles.slice(0, 8).map(f => `• \`${esc(f)}\``).join('\n')}`
       : '';
 
-    await ctx.reply(
+    await replyWithMarkdownFallback(
+      ctx,
       `📎 *Download File*\n\n_Project: ${esc(path.basename(session.workingDirectory))}_${fileList}\n\n👇 _Enter the file path:_`,
       {
         parse_mode: 'MarkdownV2',
@@ -2373,7 +2380,7 @@ export async function executeRedditFetch(
       `${esc(previewSnippet)}\n\n` +
       `_Choose how to consume this content:_`;
 
-    const msg = await ctx.reply(previewText, {
+    const msg = await replyWithMarkdownFallback(ctx, previewText, {
       parse_mode: 'MarkdownV2',
       reply_markup: {
         inline_keyboard: [
@@ -2646,7 +2653,7 @@ export async function executeMediumFetch(
           ],
         ];
 
-    const msg = await ctx.reply(previewText, {
+    const msg = await replyWithMarkdownFallback(ctx, previewText, {
       parse_mode: 'MarkdownV2',
       reply_markup: { inline_keyboard: inlineKeyboard },
     });
@@ -2948,7 +2955,7 @@ async function transcribeAndSend(
     try {
       await ctx.api.editMessageText(chatId, ackMsg.message_id, `❌ ${errorMessage}`, { parse_mode: undefined });
     } catch {
-      await ctx.reply(`❌ Transcription error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+      await replyWithMarkdownFallback(ctx, `❌ Transcription error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
     }
   } finally {
     if (tempFilePath && fs.existsSync(tempFilePath)) {
@@ -3253,7 +3260,8 @@ export async function showExtractMenu(ctx: Context, url: string): Promise<void> 
   pendingExtractUrls.set(sessionKey, url);
   pendingExtractTimestamps.set(sessionKey, Date.now());
 
-  await ctx.reply(
+  await replyWithMarkdownFallback(
+    ctx,
     `\u{1F4E5} *Extract from ${esc(label)}*\n\n` +
     `\`${esc(url.length > 60 ? url.slice(0, 57) + '...' : url)}\`\n\n` +
     `What do you want?`,
@@ -3787,7 +3795,7 @@ export async function executeExtract(ctx: Context, url: string, mode: ExtractMod
     // Send transcript (plain text from Whisper or YouTube VTT→text)
     if (result.transcript) {
       if (result.transcript.length <= config.TRANSCRIBE_FILE_THRESHOLD_CHARS) {
-        await ctx.reply(`${header}\n\n${esc(result.transcript)}`, {
+        await replyWithMarkdownFallback(ctx, `${header}\n\n${esc(result.transcript)}`, {
           parse_mode: 'MarkdownV2',
         });
       } else {
@@ -3819,7 +3827,7 @@ export async function executeExtract(ctx: Context, url: string, mode: ExtractMod
 
     // Success summary for non-text modes when no transcript was sent
     if (mode !== 'text' && !result.transcript) {
-      await ctx.reply(header, { parse_mode: 'MarkdownV2' });
+      await replyWithMarkdownFallback(ctx, header, { parse_mode: 'MarkdownV2' });
     }
 
   } catch (error) {
@@ -3828,7 +3836,7 @@ export async function executeExtract(ctx: Context, url: string, mode: ExtractMod
     try {
       await ctx.api.editMessageText(chatId, ackMsg.message_id, `\u{274C} ${errorMessage}`, { parse_mode: undefined });
     } catch {
-      await ctx.reply(`\u{274C} Extraction failed: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+      await replyWithMarkdownFallback(ctx, `\u{274C} Extraction failed: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
     }
   } finally {
     if (result) {
@@ -3855,7 +3863,8 @@ export async function handleWith(ctx: Context): Promise<void> {
   const rawArg = typeof ctx.match === 'string' ? ctx.match : '';
   const person = rawArg.trim();
   if (!person) {
-    await ctx.reply(
+    await replyWithMarkdownFallback(
+      ctx,
       'Nutze: `/with <Person>` — z.B.\n' +
         '`/with Simone`  oder  `/with Tim Zähres`\n\n' +
         'Liefert eine chronologische Liste der jüngsten Mentions aus OMI + Memory mit Datum + Quelle. ' +

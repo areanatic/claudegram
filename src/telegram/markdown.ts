@@ -1,4 +1,5 @@
 import { convert } from 'telegram-markdown-v2';
+import type { Context } from 'grammy';
 
 // Telegram limits
 const MAX_MESSAGE_LENGTH = 4096;
@@ -46,6 +47,47 @@ export function escapeMarkdownV2(text: string): string {
     result = result.replace(new RegExp(`\\${char}`, 'g'), `\\${char}`);
   }
   return result;
+}
+
+/**
+ * Escape arbitrary values embedded in Telegram's legacy Markdown parse mode.
+ *
+ * MarkdownV2 has a larger reserved-character set and must continue using
+ * `escapeMarkdownV2`. This smaller set is specifically for the few legacy
+ * Markdown messages that intentionally retain bold/inline-code formatting.
+ */
+export function escapeTelegramMarkdown(text: string): string {
+  return text.replace(/([\\_*\[\]()`])/g, '\\$1');
+}
+
+/** True only for Telegram's formatting/parser rejections, not general send failures. */
+export function isTelegramMarkdownParseError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /can't parse entities|can't find end of the entity/i.test(message);
+}
+
+type ReplyOptions = NonNullable<Parameters<Context['reply']>[1]>;
+
+/**
+ * Send a Markdown message, but never suppress a user-visible reply because
+ * Telegram rejected its entities. Other errors (network, permissions, etc.)
+ * still surface to their caller unchanged.
+ */
+export async function replyWithMarkdownFallback(
+  ctx: Pick<Context, 'reply'>,
+  text: string,
+  options: ReplyOptions,
+) {
+  try {
+    return await ctx.reply(text, options);
+  } catch (error) {
+    if (!options.parse_mode || !isTelegramMarkdownParseError(error)) {
+      throw error;
+    }
+
+    console.warn('[Telegram] Markdown parse failed; retrying as plain text:', error);
+    return ctx.reply(text, { ...options, parse_mode: undefined });
+  }
 }
 
 /**
