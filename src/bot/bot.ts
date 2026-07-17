@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { buildSessionKey } from '../utils/session-key.js';
 import { authMiddleware } from './middleware/auth.middleware.js';
 import { inputLogMiddleware } from './middleware/input-log.middleware.js';
+import { taskLedgerMiddleware } from './middleware/task-ledger.middleware.js';
 import {
   handleStart,
   handleClear,
@@ -69,6 +70,7 @@ import { handlePhoto, handleImageDocument } from './handlers/photo.handler.js';
 import { handleDocument } from './handlers/document.handler.js';
 import { handleFollowUpCallback } from '../telegram/followup-buttons.js';
 import { startRegistrySweep } from '../handler/request-registry.js';
+import { resumeOpenTask } from '../inbox/task-resume.js';
 
 // Resolve sequentialize constraint: same-chat updates are ordered,
 // but /cancel is registered BEFORE this middleware so it bypasses it.
@@ -208,6 +210,10 @@ export async function createBot(): Promise<Bot> {
   // Apply auth middleware to all updates
   bot.use(authMiddleware);
 
+  // Sprint 3: this is a hard write-ahead gate. A content update does not reach
+  // a handler until its per-bot task record is safely on disk.
+  bot.use(taskLedgerMiddleware);
+
   // Schlachtplan Akt 1.2: durable Input-Log. Registered AFTER auth, BEFORE
   // sequentialize — every content update is persisted to SQLite + ACKed the
   // moment it arrives, so nothing is lost when a later agent turn hangs or
@@ -305,7 +311,14 @@ export async function createBot(): Promise<Bot> {
   bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data;
 
-    if (data.startsWith('resume:')) {
+    if (data.startsWith('taskresume:')) {
+      const taskId = Number(data.slice('taskresume:'.length));
+      if (!Number.isSafeInteger(taskId) || taskId <= 0) {
+        await ctx.answerCallbackQuery({ text: 'Ungültiger Auftrag.' });
+      } else {
+        await resumeOpenTask(ctx, bot, taskId);
+      }
+    } else if (data.startsWith('resume:')) {
       await handleResumeCallback(ctx);
     } else if (data.startsWith('model:')) {
       await handleModelCallback(ctx);

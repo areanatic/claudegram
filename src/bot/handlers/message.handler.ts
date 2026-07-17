@@ -41,7 +41,9 @@ import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
 import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.middleware.js';
+import { getTaskLedgerId } from '../middleware/task-ledger.middleware.js';
 import { markProcessing, markDone, markDropped, markError, markHandledNoAgent } from '../../inbox/input-log.js';
+import { completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
 import {
   createRequestContext,
   disposeRequestContext,
@@ -112,6 +114,10 @@ function buildContextCallbacks(ctx: Context): {
   };
 
   const onHardCap = async (reqCtx: RequestContext): Promise<void> => {
+    interruptTask(
+      getTaskLedgerId(ctx.chat?.id, ctx.message?.message_id),
+      `timeout_after_${Math.round(reqCtx.effectiveTimeoutMs / 60_000)}min`,
+    );
     const minutes = Math.round(reqCtx.effectiveTimeoutMs / 60000); // allow-hardcoded: reason="ms→min display conversion, not a timeout value"
     try {
       await ctx.reply(
@@ -318,6 +324,7 @@ export async function handleMessage(ctx: Context): Promise<void> {
   // Schlachtplan Akt 1.2: durable Input-Log row recorded by the middleware
   // before sequentialize. Track its lifecycle through the agent turn.
   const inputLogRowId = getInputLogRowId(chatId, messageId);
+  const taskLedgerId = getTaskLedgerId(chatId, messageId);
 
   try {
     // Queue the request - process one at a time per session. The handler
@@ -327,6 +334,7 @@ export async function handleMessage(ctx: Context): Promise<void> {
       // D0 Hardening Item 1 / Codex Amendment B (2026-05-27): close the
       // dequeue→createRequestContext race-window BEFORE any side-effect.
       assertTurnIsCurrent(sessionKey, turnEpoch);
+      startTask(taskLedgerId);
       markProcessing(inputLogRowId);
       if (getStreamingMode() === 'streaming') {
         await handleStreamingResponse(ctx, sessionKey, text, turnEpoch, inputLogRowId);
@@ -335,9 +343,11 @@ export async function handleMessage(ctx: Context): Promise<void> {
       }
     });
     markDone(inputLogRowId);
+    completeTask(taskLedgerId);
   } catch (error) {
     if ((error as Error).message === 'Queue cleared') {
       markDropped(inputLogRowId, 'queue_cleared');
+      interruptTask(taskLedgerId, 'queue_cleared');
       forgetInputLogRowId(chatId, messageId);
       return;
     }
@@ -345,6 +355,7 @@ export async function handleMessage(ctx: Context): Promise<void> {
     if (error instanceof StaleTurnError) {
       console.log(`[handleMessage] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
       markDropped(inputLogRowId, 'superseded');
+      interruptTask(taskLedgerId, 'superseded');
       forgetInputLogRowId(chatId, messageId);
       return;
     }
@@ -357,6 +368,7 @@ export async function handleMessage(ctx: Context): Promise<void> {
           `— RequestContext.onHardCap already replied.`,
       );
       markDropped(inputLogRowId, 'queue_failsafe_timeout');
+      interruptTask(taskLedgerId, 'queue_failsafe_timeout');
       forgetInputLogRowId(chatId, messageId);
       return;
     }
@@ -368,6 +380,7 @@ export async function handleMessage(ctx: Context): Promise<void> {
         `[handleMessage] queue-wait timeout for ${sessionKey} after ${Math.round(error.waitedMs / 1000)}s`, // allow-hardcoded: reason="ms→s log conversion"
       );
       markDropped(inputLogRowId, 'queue_wait_timeout');
+      interruptTask(taskLedgerId, 'queue_wait_timeout');
       try {
         await ctx.reply(
           '⏱ Timeout: Deine Anfrage hat zu lange in der Warteschlange gewartet. Bitte nochmal senden.',
@@ -380,6 +393,7 @@ export async function handleMessage(ctx: Context): Promise<void> {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('Error handling message:', error);
     markError(inputLogRowId, errorMessage.slice(0, 200));
+    failTask(taskLedgerId, errorMessage);
     await ctx.reply(`❌ Error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
   } finally {
     forgetInputLogRowId(chatId, messageId);

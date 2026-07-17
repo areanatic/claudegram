@@ -21,7 +21,9 @@ import { config } from '../../config.js';
 import { sendToAgent, StaleTurnError, assertTurnIsCurrent } from '../../claude/agent.js';
 import { runPostAgentSuccess } from './post-agent.js';
 import { getInputLogRowId } from '../middleware/input-log.middleware.js';
+import { getTaskLedgerId } from '../middleware/task-ledger.middleware.js';
 import { markProcessing, markDone, markDropped, markError } from '../../inbox/input-log.js';
+import { completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
@@ -95,6 +97,7 @@ export async function handleDocument(ctx: Context): Promise<void> {
 
   if (!keyInfo || !messageId || !messageDate || !document) return;
   const { sessionKey } = keyInfo;
+  const taskLedgerId = getTaskLedgerId(ctx.chat?.id, messageId);
 
   // Skip stale and duplicate messages
   if (isStaleMessage(messageDate)) {
@@ -154,6 +157,9 @@ export async function handleDocument(ctx: Context): Promise<void> {
 
   // ── Download ──
   try {
+    // Write-ahead ledger entry was created by middleware. Mark it working
+    // before downloading so a crash during media handling is recoverable.
+    startTask(taskLedgerId);
     await downloadTelegramDocument(ctx, document.file_id, destPath, fileSizeMB);
 
     // Verify file was written
@@ -190,6 +196,7 @@ export async function handleDocument(ctx: Context): Promise<void> {
     }
 
     const errorMessage = sanitizeError(error);
+    failTask(taskLedgerId, errorMessage);
     console.error('[Document] Error:', errorMessage);
     await ctx.reply(
       `Failed to save document: ${esc(errorMessage)}`,
@@ -282,11 +289,13 @@ async function sendSingleFileConfirmation(
     // RI-23 (2026-06-06, Codex M-11): hoist rowId out of the callback so the outer catch can tag.
     // Document handler never marked its row → catch-all 'handler_no_finalize' false-tag.
     const inputLogRowId = getInputLogRowId(ctx.chat?.id ?? 0, ctx.message?.message_id ?? 0);
+    const taskLedgerId = getTaskLedgerId(ctx.chat?.id, ctx.message?.message_id);
     try {
       await queueRequest(sessionKey, agentPrompt, async (turnEpoch) => {
         // D0 Hardening Item 1 / Amendment A (2026-05-27): close pre-side-effect
         // race-window before startStreaming/setAbortController/sendToAgent.
         assertTurnIsCurrent(sessionKey, turnEpoch);
+        startTask(taskLedgerId);
         markProcessing(inputLogRowId);
         if (getStreamingMode() === 'streaming') {
           await messageSender.startStreaming(ctx);
@@ -305,6 +314,7 @@ async function sendSingleFileConfirmation(
             await messageSender.finishStreaming(ctx, response.text);
             await runPostAgentSuccess(ctx, sessionKey, response);
             markDone(inputLogRowId);
+            completeTask(taskLedgerId);
           } catch (error) {
             await messageSender.cancelStreaming(ctx);
             if (error instanceof StaleTurnError) throw error; // bubble to outer (tagged there)
@@ -312,6 +322,7 @@ async function sendSingleFileConfirmation(
             // SUCCESSFUL non-agent outcome, not a lost input. Tag it honestly, not as no_finalize.
             await messageSender.sendMessage(ctx, confirmMsg);
             markDone(inputLogRowId);
+            completeTask(taskLedgerId);
           }
         } else {
           await ctx.replyWithChatAction('typing');
@@ -321,6 +332,7 @@ async function sendSingleFileConfirmation(
           await messageSender.sendMessage(ctx, response.text);
           await runPostAgentSuccess(ctx, sessionKey, response);
           markDone(inputLogRowId);
+          completeTask(taskLedgerId);
         }
       });
     } catch (error) {
@@ -328,16 +340,20 @@ async function sendSingleFileConfirmation(
       if (error instanceof StaleTurnError) {
         console.log(`[Document] stale turn discarded for ${sessionKey} (epoch ${error.turnEpoch})`);
         markDropped(inputLogRowId, 'superseded');
+        interruptTask(taskLedgerId, 'superseded');
       } else if ((error as Error).message !== 'Queue cleared') {
         console.error('[Document] Agent error:', error instanceof Error ? error.message : error);
         markError(inputLogRowId, (error instanceof Error ? error.message : String(error)).slice(0, 200));
+        failTask(taskLedgerId, error instanceof Error ? error.message : String(error));
       } else {
         markDropped(inputLogRowId, 'queue_cleared');
+        interruptTask(taskLedgerId, 'queue_cleared');
       }
     }
   } else {
     // No session or no caption — just confirm
     await messageSender.sendMessage(ctx, confirmMsg);
+    completeTask(getTaskLedgerId(ctx.chat?.id, ctx.message?.message_id));
   }
 }
 
