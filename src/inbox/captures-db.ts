@@ -11,6 +11,7 @@
 import Database from 'better-sqlite3';
 
 const NEXUS_MEMORY_DB =
+  process.env.NEXUS_MEMORY_DB_PATH ||
   '/Volumes/AstronOne/NEXUS_miniM_13-03-26/.nexus-memory/memory.db';
 
 let db: Database.Database | null = null;
@@ -201,6 +202,7 @@ export interface CaptureRow {
   transcript: string | null;
   summary: string | null;
   tags: string | null;
+  memory_id: number | null;
   privacy: string;
   created_at: string;
 }
@@ -212,7 +214,7 @@ export function getCaptureById(id: number): CaptureRow | null {
     const row = conn
       .prepare(
         `SELECT id, chat_id, message_id, bot_id, capture_type, platform, source_url,
-                raw_text, status, transcript, summary, tags, privacy, created_at
+                raw_text, status, transcript, summary, tags, memory_id, privacy, created_at
          FROM captures WHERE id = ?`,
       )
       .get(id) as CaptureRow | undefined;
@@ -234,7 +236,7 @@ export function getCaptureByMessage(
     const row = conn
       .prepare(
         `SELECT id, chat_id, message_id, bot_id, capture_type, platform, source_url,
-                raw_text, status, transcript, summary, tags, privacy, created_at
+                raw_text, status, transcript, summary, tags, memory_id, privacy, created_at
          FROM captures WHERE chat_id = ? AND message_id = ? AND bot_id = ?`,
       )
       .get(chatId, messageId, botId) as CaptureRow | undefined;
@@ -252,7 +254,7 @@ export function recentCapturesForChat(chatId: string, limit = 10): CaptureRow[] 
     return conn
       .prepare(
         `SELECT id, chat_id, message_id, bot_id, capture_type, platform, source_url,
-                raw_text, status, transcript, summary, tags, privacy, created_at
+                raw_text, status, transcript, summary, tags, memory_id, privacy, created_at
          FROM captures WHERE chat_id = ?
          ORDER BY created_at DESC LIMIT ?`,
       )
@@ -384,5 +386,105 @@ export function updateCaptureProcessed(
   } catch (err) {
     console.error('[Captures] updateProcessed error:', err);
     return false;
+  }
+}
+
+/**
+ * RI-28 postcondition: a successfully transcribed voice capture is not
+ * "processed" until the same text has a linked row in memories_fts.
+ *
+ * The insert + FTS verification + captures.memory_id link run in one SQLite
+ * transaction. Replays are idempotent: an existing memory_id is returned and
+ * no second memory row is created.
+ */
+export function persistVoiceTranscriptMemory(
+  chatId: string,
+  messageId: number,
+  botIdValue: string,
+  transcript: string,
+): number | null {
+  const cleanTranscript = transcript.trim();
+  if (!cleanTranscript) return null;
+  const conn = getDb();
+  if (!conn) return null;
+
+  try {
+    const persist = conn.transaction((): number | null => {
+      const capture = conn
+        .prepare(
+          `SELECT id, capture_type, tags, privacy, memory_id
+           FROM captures
+           WHERE chat_id = ? AND message_id = ? AND bot_id = ?`,
+        )
+        .get(chatId, messageId, botIdValue) as {
+          id: number;
+          capture_type: string;
+          tags: string | null;
+          privacy: 'public' | 'private';
+          memory_id: number | null;
+        } | undefined;
+
+      if (!capture) return null;
+      if (!['voice', 'audio', 'video_note'].includes(capture.capture_type)) return null;
+      if (capture.memory_id !== null) return capture.memory_id;
+
+      const memoryColumns = conn
+        .prepare('PRAGMA table_info(memories)')
+        .all() as Array<{ name: string }>;
+      const names = new Set(memoryColumns.map((column) => column.name));
+      if (!names.has('content') || !names.has('project')) {
+        throw new Error('memories schema unavailable');
+      }
+
+      const columns = ['type', 'content', 'source', 'project', 'tags', 'decay_rate'];
+      const values: unknown[] = [
+        'episodic',
+        cleanTranscript,
+        // Keep the established trusted source slug; voice provenance lives in
+        // tags. A new untrusted source='voice_inbox' would make private voice
+        // rows invisible even to the master self_private scope.
+        'nexusgram',
+        chatId,
+        ['voice_inbox', `capture:${capture.id}`, capture.tags]
+          .filter(Boolean)
+          .join(','),
+        0.02,
+      ];
+      if (names.has('privacy')) {
+        columns.push('privacy');
+        values.push(capture.privacy);
+      }
+      if (names.has('bot')) {
+        columns.push('bot');
+        values.push(botIdValue);
+      }
+
+      const placeholders = columns.map(() => '?').join(',');
+      const result = conn
+        .prepare(`INSERT INTO memories (${columns.join(',')}) VALUES (${placeholders})`)
+        .run(...values);
+      const memoryId = Number(result.lastInsertRowid);
+
+      // The trigger-backed FTS row is the actual RI-28 contract, not merely a
+      // memories insert. Roll back if the index postcondition is not true.
+      const ftsRow = conn
+        .prepare('SELECT rowid FROM memories_fts WHERE rowid = ?')
+        .get(memoryId) as { rowid: number } | undefined;
+      if (!ftsRow) throw new Error(`memory ${memoryId} missing from memories_fts`);
+
+      conn.prepare(
+        `UPDATE captures
+         SET transcript = ?, summary = ?, status = 'processed',
+             processed_at = COALESCE(processed_at, strftime('%Y-%m-%dT%H:%M:%S','now','localtime')),
+             memory_id = ?
+         WHERE id = ? AND memory_id IS NULL`,
+      ).run(cleanTranscript, cleanTranscript.slice(0, 200), memoryId, capture.id);
+      return memoryId;
+    });
+
+    return persist();
+  } catch (err) {
+    console.error('[Captures] voice FTS persistence failed:', err);
+    return null;
   }
 }

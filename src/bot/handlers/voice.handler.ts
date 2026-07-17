@@ -36,6 +36,7 @@ import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.m
 import { markProcessing, markDone, markDropped, markError, attachContent, markHandledNoAgent } from '../../inbox/input-log.js';
 import { tryAutoDispatch } from '../../inbox/input-auto-dispatch.js';
 import { withHardTimeout, HardTimeoutError } from '../../utils/hard-timeout.js';
+import { persistVoiceTranscriptMemory } from '../../inbox/captures-db.js';
 
 export async function handleVoice(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
@@ -214,6 +215,20 @@ export async function handleVoice(ctx: Context): Promise<void> {
         try { await ctx.reply(askResend); } catch { /* best-effort */ }
       }
       return;
+    }
+
+    // RI-28: the primary Voice handler owns the earliest trustworthy
+    // transcript. Mirror it into memories + memories_fts now; the asynchronous
+    // Capture-Enrichment path repeats the same idempotent postcondition as a
+    // recovery belt, never as a duplicate insert.
+    const voiceMemoryId = persistVoiceTranscriptMemory(
+      String(chatId),
+      messageId,
+      (config.BOT_NAME || 'Nexusgram').toLowerCase().replace(/\s+/g, '-'),
+      transcript,
+    );
+    if (voiceMemoryId === null) {
+      throw new Error('Voice transcript could not be committed to the recall index.');
     }
 
     // Activate voice-first mode (if enabled in config) and store detected language
@@ -526,6 +541,15 @@ async function handleTranscribeOnly(
     // catch-all finalizer doesn't tag it 'handler_no_finalize' (would read as
     // "unanswered") and contextAvailability never sees it as 'dropped'.
     attachContent(inputLogRowId, transcript);
+    const voiceMemoryId = persistVoiceTranscriptMemory(
+      String(chatId),
+      messageId,
+      (config.BOT_NAME || 'Nexusgram').toLowerCase().replace(/\s+/g, '-'),
+      transcript,
+    );
+    if (voiceMemoryId === null) {
+      throw new Error('Voice transcript could not be committed to the recall index.');
+    }
     markHandledNoAgent(inputLogRowId, 'transcribe_only');
   } catch (error) {
     const errorMessage = sanitizeError(error);

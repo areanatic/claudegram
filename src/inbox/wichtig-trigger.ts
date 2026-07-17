@@ -20,6 +20,7 @@ import { config } from '../config.js';
 import {
   getCaptureByMessage,
   appendTags,
+  persistVoiceTranscriptMemory,
   updateCaptureProcessed,
 } from './captures-db.js';
 import {
@@ -76,11 +77,15 @@ export async function handleWichtigReply(ctx: Context): Promise<boolean> {
   try {
     if (cap.capture_type === 'voice' || cap.capture_type === 'audio' || cap.capture_type === 'video_note') {
       const transcript = await deepVoice(ctx, cap.id);
-      updateCaptureProcessed(cap.id, {
+      const memoryId = persistVoiceTranscriptMemory(
+        cap.chat_id,
+        cap.message_id,
+        cap.bot_id,
         transcript,
-        status: 'processed',
-        summary: transcript.slice(0, 200),
-      });
+      );
+      if (memoryId === null) {
+        throw new Error('Voice-Transkript konnte nicht im FTS-Index verankert werden');
+      }
       const display = transcript.length > 1500 ? transcript.slice(0, 1500) + '…' : transcript;
       await ctx.reply(`📝 Transkript Capture #${cap.id}:\n\n${display}`);
       return true;

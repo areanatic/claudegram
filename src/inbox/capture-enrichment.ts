@@ -21,7 +21,11 @@ import {
   transcribeFile,
   downloadTelegramAudio,
 } from '../audio/transcribe.js';
-import { updateCaptureProcessed } from './captures-db.js';
+import {
+  getCaptureById,
+  persistVoiceTranscriptMemory,
+  updateCaptureProcessed,
+} from './captures-db.js';
 import { extractMedia, detectPlatform } from '../media/extract.js';
 
 const VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
@@ -82,12 +86,25 @@ export async function enrichVoiceCapture(
     dest = await downloadTelegramFile(ctx, telegramFileId, '.ogg');
     const transcript = await transcribeFile(dest);
     if (transcript && transcript.trim()) {
-      updateCaptureProcessed(captureId, {
-        transcript,
-        summary: transcript.slice(0, 200),
-        status: 'processed',
-      });
-      console.log(`[CaptureEnrich] voice #${captureId} ✅ ${transcript.length} chars`);
+      const capture = getCaptureById(captureId);
+      const memoryId = capture
+        ? persistVoiceTranscriptMemory(
+          capture.chat_id,
+          capture.message_id,
+          capture.bot_id,
+          transcript,
+        )
+        : null;
+      if (memoryId === null) {
+        updateCaptureProcessed(captureId, {
+          transcript,
+          summary: transcript.slice(0, 200),
+          status: 'failed',
+          last_error: 'voice_transcript_fts_postcondition_failed',
+        });
+        throw new Error('voice transcript FTS postcondition failed');
+      }
+      console.log(`[CaptureEnrich] voice #${captureId} ✅ ${transcript.length} chars, memory=${memoryId}`);
     } else {
       console.warn(`[CaptureEnrich] voice #${captureId}: empty transcript`);
     }
