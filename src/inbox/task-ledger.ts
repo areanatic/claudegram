@@ -137,6 +137,22 @@ export function completeAcceptedTask(id: number | null): void {
     .run(now, now, id);
 }
 
+/** Explicit user completion from an inline action; safe on a repeated press. */
+export function completeOpenTask(id: number): boolean {
+  const now = new Date().toISOString();
+  const result = getDb().prepare(`UPDATE task_ledger SET state='completed', terminal_at=?, updated_at=?
+    WHERE id=? AND state<>'completed'`).run(now, now, id);
+  return result.changes === 1;
+}
+
+/** Retain an audit reason while removing a user-discarded task from the open queue. */
+export function discardOpenTask(id: number): boolean {
+  const now = new Date().toISOString();
+  const result = getDb().prepare(`UPDATE task_ledger SET state='completed', failure_reason='user_discarded',
+    terminal_at=?, updated_at=? WHERE id=? AND state<>'completed'`).run(now, now, id);
+  return result.changes === 1;
+}
+
 export function recoverOpenTasks(now = new Date()): OpenTask[] {
   const conn = getDb();
   const nowIso = now.toISOString();

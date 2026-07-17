@@ -113,6 +113,15 @@ export async function handleFollowUpCallback(ctx: Context): Promise<void> {
     }
   } catch { /* ignore */ }
 
+  await executeFollowUpText(ctx, sessionKey, label);
+}
+
+/**
+ * Reuse the established text-message path for contextual actions. This keeps
+ * buttons from acquiring privileges a user could not exercise by typing the
+ * same text into the chat.
+ */
+export async function executeFollowUpText(ctx: Context, sessionKey: string, label: string): Promise<void> {
   // Send the button label as user message to Claude
   try {
     await queueRequest(sessionKey, label, async (turnEpoch) => {

@@ -70,8 +70,28 @@ import { handleVoice } from './handlers/voice.handler.js';
 import { handlePhoto, handleImageDocument } from './handlers/photo.handler.js';
 import { handleDocument } from './handlers/document.handler.js';
 import { handleFollowUpCallback } from '../telegram/followup-buttons.js';
+import { handleContextActionCallback } from '../telegram/action-buttons.js';
 import { startRegistrySweep } from '../handler/request-registry.js';
 import { resumeOpenTask } from '../inbox/task-resume.js';
+
+export const TELEGRAM_COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
+
+export interface TelegramCommandDefinition { command: string; description: string; }
+
+/**
+ * Telegram rejects the entire command menu for one invalid name. Filter at the
+ * API boundary so a future typo cannot turn a menu refresh into a boot crash.
+ */
+export function filterTelegramCommands<T extends TelegramCommandDefinition>(
+  commands: readonly T[],
+  warn: (message: string) => void = (message) => console.warn(message),
+): T[] {
+  return commands.filter((command) => {
+    const valid = TELEGRAM_COMMAND_NAME_RE.test(command.command);
+    if (!valid) warn(`[bot] Skipping invalid Telegram command name: ${JSON.stringify(command.command)}`);
+    return valid;
+  });
+}
 
 // Resolve sequentialize constraint: same-chat updates are ordered,
 // but /cancel is registered BEFORE this middleware so it bypasses it.
@@ -142,7 +162,7 @@ export async function createBot(): Promise<Bot> {
       { command: 'engine', description: '⚙️ Show or switch AI engine' },
       { command: 'codex', description: '🤖 Run a read-only Codex task' },
     ] : []),
-    { command: 'wo-stehen-wir', description: '📌 Erinnerungen und Aufträge' },
+    { command: 'wo_stehen_wir', description: '📌 Erinnerungen und Aufträge' },
     { command: 'status', description: t.status },
   ] : [
     { command: 'start', description: '🚀 Show help and getting started' },
@@ -175,7 +195,7 @@ export async function createBot(): Promise<Bot> {
     { command: 'terminalui', description: '🖥️ Toggle terminal-style display' },
     { command: 'tts', description: '🔊 Toggle voice replies' },
     { command: 'health', description: '🩺 Compliance + observability dashboard' },
-    { command: 'wo-stehen-wir', description: '📌 Fällige Erinnerungen und offene Aufträge' },
+    { command: 'wo_stehen_wir', description: '📌 Fällige Erinnerungen und offene Aufträge' },
     { command: 'with', description: '🧠 Show recent OMI/memory mentions for a person' },
     ...(masterEngineCommandsEnabled ? [
       { command: 'engine', description: '⚙️ Show or switch AI engine' },
@@ -193,7 +213,7 @@ export async function createBot(): Promise<Bot> {
   // forces Telegram to drop the cached list before we register the new one.
   // Keep the list on the bot instance for the startup sequence. This avoids a
   // second source of truth and guarantees command registration is post-init.
-  Object.assign(bot, { nexusgramCommandList: commandList });
+  Object.assign(bot, { nexusgramCommandList: filterTelegramCommands(commandList) });
 
   // Apply auth middleware to all updates
   bot.use(authMiddleware);
@@ -218,7 +238,7 @@ export async function createBot(): Promise<Bot> {
   // /health is read-only and must respond even when sequentialize is backed up,
   // so register before the sequentialize middleware (same tier as /ping).
   bot.command('health', handleHealth);
-  bot.command('wo-stehen-wir', handleWhereAreWe);
+  bot.command('wo_stehen_wir', handleWhereAreWe);
 
   // Sequentialize: same-chat updates are processed in order.
   // This runs AFTER /cancel so cancel bypasses it.
@@ -298,6 +318,7 @@ export async function createBot(): Promise<Bot> {
 
   // Callback query handler for inline keyboards
   bot.on('callback_query:data', async (ctx) => {
+    if (await handleContextActionCallback(ctx, bot)) return;
     const data = ctx.callbackQuery.data;
 
     if (data.startsWith('taskresume:')) {
@@ -395,13 +416,14 @@ export async function createBot(): Promise<Bot> {
 export async function registerBotCommands(bot: Bot): Promise<void> {
   const commandList = (bot as Bot & { nexusgramCommandList?: Parameters<Bot['api']['setMyCommands']>[0] }).nexusgramCommandList;
   if (!commandList) throw new Error('Bot command list was not initialized.');
+  const validCommandList = filterTelegramCommands(commandList);
   try {
     await bot.api.deleteMyCommands();
   } catch (error) {
     console.warn('⚠️ deleteMyCommands failed (non-fatal):', error instanceof Error ? error.message : error);
   }
-  await bot.api.setMyCommands(commandList);
-  console.log(`📋 Command menu registered (${commandList.length} commands)`);
+  await bot.api.setMyCommands(validCommandList);
+  console.log(`📋 Command menu registered (${validCommandList.length} commands)`);
   try {
     const live = await bot.api.getMyCommands();
     console.log(`📋 Telegram backend reports ${live.length} commands: [${live.map((c) => '/' + c.command).join(', ')}]`);

@@ -89,6 +89,7 @@ import {
   setEngineSelection,
 } from '../../engines/engine.js';
 import { buildWhereAreWe, sendProactiveRecall } from '../../memory/proactive-recall.js';
+import { openTaskActionKeyboard } from '../../telegram/action-buttons.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -397,7 +398,10 @@ Current mode: ${config.STREAMING_MODE}${dangerousWarning}`;
 export async function handleWhereAreWe(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
   if (!keyInfo) return;
-  await ctx.reply(buildWhereAreWe(keyInfo.sessionKey), { parse_mode: undefined });
+  await ctx.reply(buildWhereAreWe(keyInfo.sessionKey), {
+    parse_mode: undefined,
+    reply_markup: openTaskActionKeyboard(ctx, keyInfo.sessionKey),
+  });
 }
 
 export async function handleClear(ctx: Context): Promise<void> {

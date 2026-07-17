@@ -44,6 +44,12 @@ export async function authMiddleware(
 
   if (!config.ALLOWED_USER_IDS.includes(userId)) {
     logAuthAttempt(false, userId, username, chatType);
+    // Callback queries do not show a chat reply as feedback and otherwise keep
+    // Telegram's spinner alive. No handler/action is reached after this gate.
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: '⛔ Nicht berechtigt.' });
+      return;
+    }
     await ctx.reply('⛔ You are not authorized to use this bot.');
     return;
   }

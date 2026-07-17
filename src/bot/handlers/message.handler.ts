@@ -29,7 +29,7 @@ import { isClaudeCommand } from '../../claude/command-parser.js';
 import { isMasterEngineLane, isRestrictedEngineCommand } from '../../engines/engine.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
 import { createTelegraphFromFile } from '../../telegram/telegraph.js';
-import { getStreamingMode, executeRedditFetch, executeMediumFetch, showExtractMenu, projectStatusSuffix, resumeCommandMessage } from './command.handler.js';
+import { getStreamingMode, executeRedditFetch, executeMediumFetch, showExtractMenu, projectStatusSuffix, resumeCommandMessage, handleWhereAreWe } from './command.handler.js';
 import { executeVReddit } from '../../reddit/vreddit.js';
 import { detectPlatform, isValidUrl } from '../../media/extract.js';
 import { detectInboxUrl, processLinkInbox } from '../../media/link-inbox.js';
@@ -40,6 +40,7 @@ import * as path from 'path';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
+import { captureActionKeyboard, decisionActionKeyboard } from '../../telegram/action-buttons.js';
 import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.middleware.js';
 import { getTaskLedgerId } from '../middleware/task-ledger.middleware.js';
 import { markProcessing, markDone, markDropped, markError, markHandledNoAgent } from '../../inbox/input-log.js';
@@ -125,7 +126,10 @@ function buildContextCallbacks(ctx: Context): {
     try {
       await ctx.reply(
         `⏱ Timeout: Keine Antwort nach ${minutes} Min. Bitte nochmal senden.`,
-        { parse_mode: undefined },
+        {
+          parse_mode: undefined,
+          reply_markup: decisionActionKeyboard(ctx, reqCtx.sessionKey),
+        },
       );
     } catch (err) {
       console.debug(
@@ -194,6 +198,13 @@ export async function handleMessage(ctx: Context): Promise<void> {
 
   // Dismiss previous follow-up buttons
   await dismissFollowUpButtons(ctx, sessionKey);
+
+  // Text alias for the valid Telegram command /wo_stehen_wir. Telegram command
+  // names cannot contain hyphens, while this remains the natural German phrase.
+  if (/^wo[\s_-]+stehen[\s_-]+wir[?!\.\s]*$/i.test(text)) {
+    await handleWhereAreWe(ctx);
+    return;
+  }
 
   // Check if this is a reply to a ForceReply prompt
   const replyTo = ctx.message?.reply_to_message;
@@ -317,7 +328,10 @@ export async function handleMessage(ctx: Context): Promise<void> {
         kind: capture.kind,
         dueAtUtc: capture.dueAtUtc,
       });
-      await ctx.reply(formatCaptureProof(record), { parse_mode: undefined });
+      await ctx.reply(formatCaptureProof(record), {
+        parse_mode: undefined,
+        reply_markup: captureActionKeyboard(ctx, sessionKey, record.id),
+      });
     } catch (error) {
       console.error('[Capture] durable write failed:', error);
       await ctx.reply(

@@ -6,17 +6,17 @@ import { parseSessionKey } from '../utils/session-key.js';
 import { splitMessage } from '../telegram/markdown.js';
 
 /** Explicit user approval is required; the CAS claim prevents double execution. */
-export async function resumeOpenTask(ctx: Context, bot: Bot, taskId: number): Promise<void> {
+export async function resumeOpenTask(ctx: Context, bot: Bot, taskId: number, options: { callbackAlreadyAnswered?: boolean } = {}): Promise<void> {
   const task = getOpenTask(taskId);
   if (!task) {
-    await ctx.answerCallbackQuery({ text: 'Dieser Auftrag ist bereits erledigt oder nicht verfügbar.' });
+    if (!options.callbackAlreadyAnswered) await ctx.answerCallbackQuery({ text: 'Dieser Auftrag ist bereits erledigt oder nicht verfügbar.' });
     return;
   }
   if (!claimInterruptedTask(taskId)) {
-    await ctx.answerCallbackQuery({ text: 'Dieser Auftrag wird bereits fortgesetzt.' });
+    if (!options.callbackAlreadyAnswered) await ctx.answerCallbackQuery({ text: 'Dieser Auftrag wird bereits fortgesetzt.' });
     return;
   }
-  await ctx.answerCallbackQuery({ text: 'Auftrag wird fortgesetzt.' });
+  if (!options.callbackAlreadyAnswered) await ctx.answerCallbackQuery({ text: 'Auftrag wird fortgesetzt.' });
   const prompt = [
     'The user explicitly approved resuming an interrupted task.',
     `Task kind: ${task.taskKind}`,

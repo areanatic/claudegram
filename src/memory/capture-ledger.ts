@@ -121,6 +121,25 @@ export class CaptureLedger {
     }));
   }
 
+  /** Read a capture only when it belongs to the requesting Telegram session. */
+  getForSession(id: string, sessionKey: string): CaptureRecord | null {
+    const row = this.db.prepare(`
+      SELECT id, session_key AS sessionKey, chat_id AS chatId, content, kind,
+        due_at_utc AS dueAtUtc, created_at AS createdAt
+      FROM capture_records WHERE id = ? AND session_key = ? AND completed_at IS NULL
+    `).get(id, sessionKey) as CaptureRecord | undefined;
+    return row ?? null;
+  }
+
+  /** Logical undo: retain the audit row but remove it from all open surfaces. */
+  dismissForSession(id: string, sessionKey: string): boolean {
+    const result = this.db.prepare(`
+      UPDATE capture_records SET completed_at = ?
+      WHERE id = ? AND session_key = ? AND completed_at IS NULL
+    `).run(new Date().toISOString(), id, sessionKey);
+    return result.changes === 1;
+  }
+
   /** Atomically reserve items for one daily/session digest, preventing duplicates. */
   reserveForDelivery(sessionKey: string, items: readonly ProactiveItem[], now = new Date()): ProactiveItem[] {
     const day = now.toISOString().slice(0, 10);

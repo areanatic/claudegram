@@ -8,6 +8,7 @@ import {
   normalizeProactiveContent,
   type ProactiveItem,
 } from './capture-ledger.js';
+import { digestActionKeyboard } from '../telegram/action-buttons.js';
 
 function formatDue(dueAtUtc: string | null): string {
   return dueAtUtc ? ` (fällig: ${dueAtUtc.slice(0, 10)})` : '';
@@ -63,7 +64,10 @@ export async function sendProactiveRecall(ctx: Context, sessionKey: string): Pro
   const digest = buildProactiveRecall(sessionKey, now);
   if (!digest) return;
   try {
-    await ctx.reply(digest.text, { parse_mode: undefined });
+    await ctx.reply(digest.text, {
+      parse_mode: undefined,
+      reply_markup: digestActionKeyboard(ctx, sessionKey),
+    });
   } catch (error) {
     getCaptureLedger().releaseDeliveryReservations(sessionKey, digest.items, now);
     console.warn('[ProactiveRecall] delivery failed; reservation released:', error);
