@@ -9,6 +9,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
+    "test": "TELEGRAM_BOT_TOKEN=test ALLOWED_USER_IDS=1 BOT_NAME=test node --import tsx --test tests/**/*.test.ts",
     "test:capability-health": "node --import tsx src/claude/capability-health.test.ts",
     "test:voice-capabilities": "node --import tsx src/claude/voice-capabilities.test.ts",
     "test:task-ledger": "node --import tsx src/inbox/task-ledger.test.ts"

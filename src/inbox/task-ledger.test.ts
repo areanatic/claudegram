@@ -43,6 +43,11 @@ const row = (id: number): Record<string, unknown> => {
   ledger.failTask(id, 'download failed');
   check(row(id).state === 'failed' && row(id).failure_reason === 'download failed', 'failure stays visible with its reason');
 
+  const otherId = ledger.acceptTask({ ...input, messageId: 102, chatId: 8, sessionKey: '8' });
+  ledger.interruptTask(otherId, 'restart_interrupted');
+  const sessionTasks = ledger.listOpenTasksForSession('7');
+  check(sessionTasks.length === 1 && sessionTasks[0]?.id === id, 'open-task recall is isolated to the requested session');
+
   // A corrupt DB never degrades to an untracked acceptance.
   ledger.closeTaskLedger();
   const corruptDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexusgram-task-ledger-corrupt-'));

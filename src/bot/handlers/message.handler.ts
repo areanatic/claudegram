@@ -44,6 +44,8 @@ import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.m
 import { getTaskLedgerId } from '../middleware/task-ledger.middleware.js';
 import { markProcessing, markDone, markDropped, markError, markHandledNoAgent } from '../../inbox/input-log.js';
 import { completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
+import { detectCapture, formatCaptureProof, getCaptureLedger } from '../../memory/capture-ledger.js';
+import { sendProactiveRecall } from '../../memory/proactive-recall.js';
 import {
   createRequestContext,
   disposeRequestContext,
@@ -297,6 +299,32 @@ export async function handleMessage(ctx: Context): Promise<void> {
   // Skip if this is a Claude command (handled by command handler)
   if (isClaudeCommand(text)) {
     return;
+  }
+
+  // Sprint 5 capture contract: surface already-due items at the next turn,
+  // then persist any explicit memory/term/commitment BEFORE acknowledging it.
+  // A failed durable write is terminal for this capture; we never claim it was
+  // remembered merely because the input-log received the Telegram update.
+  await sendProactiveRecall(ctx, sessionKey);
+  const capture = detectCapture(text);
+  if (capture) {
+    try {
+      const record = getCaptureLedger().capture({
+        sessionKey,
+        chatId,
+        content: text.trim(),
+        kind: capture.kind,
+        dueAtUtc: capture.dueAtUtc,
+      });
+      await ctx.reply(formatCaptureProof(record), { parse_mode: undefined });
+    } catch (error) {
+      console.error('[Capture] durable write failed:', error);
+      await ctx.reply(
+        '⚠️ Nicht gespeichert: Der dauerhafte Capture-Speicher konnte nicht schreiben. Ich behaupte deshalb nicht, es zu merken.',
+        { parse_mode: undefined },
+      );
+      return;
+    }
   }
 
   // Check for active session — auto-resume from disk if bot restarted

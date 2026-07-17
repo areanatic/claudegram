@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { preventSleep, allowSleep } from './utils/caffeinate.js';
 import { stopCleanup } from './telegram/deduplication.js';
 import { closeMemoryDb } from './memory/nexus-memory.js';
+import { closeCaptureLedger } from './memory/capture-ledger.js';
 import { closeInputLog, ensureInputLogInitialized, claimResumableOrphans } from './inbox/input-log.js';
 import { closeTaskLedger, ensureTaskLedgerInitialized, recoverOpenTasks, type OpenTask } from './inbox/task-ledger.js';
 import { runAutoResume } from './inbox/auto-resume.js';
@@ -241,6 +242,7 @@ async function main() {
     allowSleep();
     stopCleanup();
     closeMemoryDb();
+    closeCaptureLedger();
     closeInputLog();
     closeTaskLedger();
 

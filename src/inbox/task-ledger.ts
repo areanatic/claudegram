@@ -154,6 +154,14 @@ export function openTaskCount(): number {
     .get(botId()) as { n: number }).n;
 }
 
+/** Read-only, session-scoped view used by the integrated recall surface. */
+export function listOpenTasksForSession(sessionKey: string): OpenTask[] {
+  return getDb().prepare(`SELECT id,chat_id AS chatId,session_key AS sessionKey,input_type AS inputType,
+    task_kind AS taskKind,summary,state,failure_reason AS reason,accepted_at AS acceptedAt
+    FROM task_ledger WHERE bot_id=? AND session_key=? AND state<>'completed'
+    ORDER BY accepted_at ASC`).all(botId(), sessionKey) as OpenTask[];
+}
+
 export function getOpenTask(id: number): OpenTask | null {
   const row = getDb().prepare(`SELECT id,chat_id AS chatId,session_key AS sessionKey,input_type AS inputType,
     task_kind AS taskKind,summary,state,failure_reason AS reason,accepted_at AS acceptedAt
