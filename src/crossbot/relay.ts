@@ -25,6 +25,8 @@ export interface RelayEnvelope {
   kind: RelayKind;
   payload: string;
   sourceUserId: number;
+  /** HMAC-SHA-256 over the canonical unsigned envelope. */
+  signature: string;
 }
 
 export interface BotLiveStatus {
@@ -63,12 +65,32 @@ export function resolveCurrentBotId(input: { isMaster: boolean; configuredId?: s
   return legacyNames[input.botName] ?? null;
 }
 
-function inboxPath(relayDir: string, target: Exclude<BotId, 'master'>): string {
-  return path.join(relayDir, 'inbox', `${target}.jsonl`);
+function assertRealpathWithin(root: string, candidate: string, label: string): string {
+  const rootReal = fs.realpathSync(root);
+  const candidateReal = fs.realpathSync(candidate);
+  const relative = path.relative(rootReal, candidateReal);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${label} resolves outside the configured relay directory.`);
+  }
+  return candidateReal;
 }
 
-function ensureRelayDirectory(relayDir: string): void {
-  fs.mkdirSync(path.join(relayDir, 'inbox'), { recursive: true, mode: 0o700 });
+function ensureRelayDirectory(relayDir: string): { relayRoot: string; inboxRoot: string } {
+  fs.mkdirSync(relayDir, { recursive: true, mode: 0o700 });
+  const relayRoot = fs.realpathSync(relayDir);
+  const inbox = path.join(relayRoot, 'inbox');
+  fs.mkdirSync(inbox, { recursive: true, mode: 0o700 });
+  return { relayRoot, inboxRoot: assertRealpathWithin(relayRoot, inbox, 'Relay inbox') };
+}
+
+function inboxPath(relayDir: string, target: Exclude<BotId, 'master'>): string {
+  const { relayRoot, inboxRoot } = ensureRelayDirectory(relayDir);
+  const candidate = path.join(inboxRoot, `${target}.jsonl`);
+  if (!fs.existsSync(candidate)) return candidate;
+  if (fs.lstatSync(candidate).isSymbolicLink()) {
+    throw new Error('Relay inbox file must not be a symbolic link.');
+  }
+  return assertRealpathWithin(relayRoot, candidate, 'Relay inbox file');
 }
 
 function appendJsonLine(filePath: string, value: unknown): void {
@@ -81,7 +103,36 @@ function appendJsonLine(filePath: string, value: unknown): void {
   }
 }
 
-function parseRelayLines(filePath: string): RelayEnvelope[] {
+function relaySigningKey(override?: string): string {
+  const key = override ?? config.CROSSBOT_RELAY_HMAC_KEY;
+  if (!key) throw new Error('Cross-bot relay HMAC key is unavailable; refusing unsigned relay.');
+  return key;
+}
+
+function canonicalRelay(envelope: Omit<RelayEnvelope, 'signature'>): string {
+  return JSON.stringify({
+    id: envelope.id,
+    createdAt: envelope.createdAt,
+    from: envelope.from,
+    to: envelope.to,
+    kind: envelope.kind,
+    payload: envelope.payload,
+    sourceUserId: envelope.sourceUserId,
+  });
+}
+
+function signRelay(envelope: Omit<RelayEnvelope, 'signature'>, signingKey?: string): string {
+  return crypto.createHmac('sha256', relaySigningKey(signingKey)).update(canonicalRelay(envelope)).digest('hex');
+}
+
+function hasValidSignature(candidate: RelayEnvelope, signingKey?: string): boolean {
+  if (!/^[a-f0-9]{64}$/i.test(candidate.signature)) return false;
+  const expected = Buffer.from(signRelay(candidate, signingKey), 'hex');
+  const actual = Buffer.from(candidate.signature, 'hex');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function parseRelayLines(filePath: string, signingKey?: string): RelayEnvelope[] {
   if (!fs.existsSync(filePath)) return [];
   return fs.readFileSync(filePath, 'utf8')
     .split('\n')
@@ -96,9 +147,11 @@ function parseRelayLines(filePath: string): RelayEnvelope[] {
           !isBotId(String(candidate.to)) ||
           (candidate.kind !== 'note' && candidate.kind !== 'ask') ||
           typeof candidate.payload !== 'string' ||
-          typeof candidate.sourceUserId !== 'number'
+          typeof candidate.sourceUserId !== 'number' ||
+          typeof candidate.signature !== 'string'
         ) return [];
-        return [candidate as RelayEnvelope];
+        const relay = candidate as RelayEnvelope;
+        return hasValidSignature(relay, signingKey) ? [relay] : [];
       } catch {
         // A partial/corrupt line must not stop delivery of later valid handoffs.
         return [];
@@ -114,11 +167,11 @@ export function enqueueRelay(input: {
   payload: string;
   sourceUserId: number;
   now?: Date;
+  signingKey?: string;
 }): RelayEnvelope {
   const payload = input.payload.trim();
   if (!payload || payload.length > 4_000) throw new Error('Relay payload must be between 1 and 4000 characters.');
-  ensureRelayDirectory(input.relayDir);
-  const envelope: RelayEnvelope = {
+  const unsigned: Omit<RelayEnvelope, 'signature'> = {
     id: crypto.randomUUID(),
     createdAt: (input.now ?? new Date()).toISOString(),
     from: 'master',
@@ -127,6 +180,7 @@ export function enqueueRelay(input: {
     payload,
     sourceUserId: input.sourceUserId,
   };
+  const envelope: RelayEnvelope = { ...unsigned, signature: signRelay(unsigned, input.signingKey) };
   appendJsonLine(inboxPath(input.relayDir, input.target), envelope);
   return envelope;
 }
@@ -139,6 +193,7 @@ export function pendingRelays(input: {
   relayDir: string;
   recipient: Exclude<BotId, 'master'>;
   recipientDataDir: string;
+  signingKey?: string;
 }): RelayEnvelope[] {
   const receiptPath = path.join(input.recipientDataDir, 'crossbot-received.jsonl');
   const seen = new Set(
@@ -153,8 +208,24 @@ export function pendingRelays(input: {
       })
       : [],
   );
-  return parseRelayLines(inboxPath(input.relayDir, input.recipient))
+  return parseRelayLines(inboxPath(input.relayDir, input.recipient), input.signingKey)
     .filter((relay) => relay.to === input.recipient && !seen.has(relay.id));
+}
+
+/**
+ * Claim relay receipts before invoking any user-visible recipient processing.
+ * This trades replay for a durable audit record if Telegram itself is down,
+ * which is the required fail-safe against duplicate cross-bot execution.
+ */
+export function claimPendingRelays(input: {
+  relayDir: string;
+  recipient: Exclude<BotId, 'master'>;
+  recipientDataDir: string;
+  signingKey?: string;
+}): RelayEnvelope[] {
+  const relays = pendingRelays(input);
+  for (const relay of relays) markRelayDelivered(input.recipientDataDir, relay.id);
+  return relays;
 }
 
 export function markRelayDelivered(recipientDataDir: string, relayId: string): void {

@@ -25,7 +25,7 @@ import { getTaskLedgerId } from '../middleware/task-ledger.middleware.js';
 import { markProcessing, markDone, markDropped, markError } from '../../inbox/input-log.js';
 import { attachTaskMediaPath, completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
 import { sessionManager } from '../../claude/session-manager.js';
-import { messageSender } from '../../telegram/message-sender.js';
+import { messageSender, TelegramDeliveryError } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
 import { isStaleMessage, shouldNotifyStale, getStaleAgeMinutes } from '../middleware/stale-filter.js';
 import {
@@ -370,6 +370,7 @@ async function sendSingleFileConfirmation(
           } catch (error) {
             await messageSender.cancelStreaming(ctx);
             if (error instanceof StaleTurnError) throw error; // bubble to outer (tagged there)
+            if (error instanceof TelegramDeliveryError) throw error;
             // Codex M-11: agent failed but the file IS saved + confirmation sent → this is a
             // SUCCESSFUL non-agent outcome, not a lost input. Tag it honestly, not as no_finalize.
             await messageSender.sendMessage(ctx, confirmMsg);

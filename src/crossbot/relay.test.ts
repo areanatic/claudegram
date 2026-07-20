@@ -19,24 +19,25 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nexusgram-crossbot-'));
 const relayDir = path.join(root, 'relay');
 const alinaDataDir = path.join(root, 'alina-data');
 const momDataDir = path.join(root, 'mom-data');
+const signingKey = 'test-crossbot-signing-key-that-is-at-least-32-bytes';
 
 const alinaRelay = enqueueRelay({
   relayDir, target: 'alina', kind: 'ask', payload: 'Kannst du morgen kurz antworten?', sourceUserId: 42,
-  now: new Date('2026-07-17T10:00:00.000Z'),
+  now: new Date('2026-07-17T10:00:00.000Z'), signingKey,
 });
 enqueueRelay({
   relayDir, target: 'mom', kind: 'note', payload: 'Bitte Bescheid geben.', sourceUserId: 42,
-  now: new Date('2026-07-17T10:01:00.000Z'),
+  now: new Date('2026-07-17T10:01:00.000Z'), signingKey,
 });
 
 assert.deepEqual(
-  pendingRelays({ relayDir, recipient: 'alina', recipientDataDir: alinaDataDir }).map((relay) => relay.id),
+  pendingRelays({ relayDir, recipient: 'alina', recipientDataDir: alinaDataDir, signingKey }).map((relay) => relay.id),
   [alinaRelay.id],
   'Alina reads only the inbox addressed to Alina, never Mom’s handoff',
 );
 markRelayDelivered(alinaDataDir, alinaRelay.id);
-assert.equal(pendingRelays({ relayDir, recipient: 'alina', recipientDataDir: alinaDataDir }).length, 0, 'recipient receipt prevents duplicate delivery');
-assert.equal(pendingRelays({ relayDir, recipient: 'mom', recipientDataDir: momDataDir }).length, 1, 'another recipient retains its own pending handoff');
+assert.equal(pendingRelays({ relayDir, recipient: 'alina', recipientDataDir: alinaDataDir, signingKey }).length, 0, 'recipient receipt prevents duplicate delivery');
+assert.equal(pendingRelays({ relayDir, recipient: 'mom', recipientDataDir: momDataDir, signingKey }).length, 1, 'another recipient retains its own pending handoff');
 
 assert.deepEqual(parseMasterRelay('Sag Mom-Bot, dass der Termin um 9 Uhr ist.'), {
   target: 'mom', kind: 'note', payload: 'der Termin um 9 Uhr ist.',

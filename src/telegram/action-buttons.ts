@@ -57,8 +57,9 @@ export class ContextActionRouter {
   async handle(
     ctx: Pick<Context, 'callbackQuery' | 'from' | 'chat' | 'answerCallbackQuery' | 'reply'>,
     execute: (action: RegisteredAction) => Promise<void>,
+    callbackData?: string,
   ): Promise<boolean> {
-    const data = ctx.callbackQuery?.data;
+    const data = callbackData ?? ctx.callbackQuery?.data;
     if (!data?.startsWith(CALLBACK_PREFIX)) return false;
 
     // Every branch answers: invalid/expired/foreign callbacks must never spin.
@@ -178,9 +179,7 @@ function getOpenTaskButtons(sessionKey: string) {
   return listOpenTasksForSession(sessionKey).slice(0, 6);
 }
 
-/** Central typed callback router for all newly added contextual action buttons. */
-export async function handleContextActionCallback(ctx: Context, bot: Bot): Promise<boolean> {
-  return contextActionRouter.handle(ctx, async (action) => {
+async function executeContextAction(ctx: Context, bot: Bot, action: RegisteredAction): Promise<void> {
     switch (action.type) {
       case 'capture-view': {
         const record = getCaptureLedger().getForSession(action.captureId, action.sessionKey);
@@ -215,12 +214,12 @@ export async function handleContextActionCallback(ctx: Context, bot: Bot): Promi
         const job = getCalendarBulkJob(action.jobId);
         if (!job || job.sessionKey !== action.sessionKey || job.chatId !== action.chatId || job.userId !== action.userId) throw new Error('calendar preview is unavailable');
         const result = await confirmCalendarBulk(job.id, configuredCalendarBulkExecutor);
-        if (result.state === 'completed') {
-          const ids = result.results?.map((item, index) => `• ${index + 1}: ${item.eventId ?? 'event_id nicht verfügbar'}`).join('\n') ?? '';
-          await ctx.reply(`✅ Kalender-Bulk abgeschlossen:\n${ids}`, { parse_mode: undefined });
-        } else {
-          await ctx.reply(`⚠️ Kalender-Bulk fehlgeschlagen: ${result.failure ?? 'unbekannter Fehler'}`, { parse_mode: undefined });
-        }
+        const eventResults = result.items.map((item, index) => {
+          const event = result.results?.[index];
+          return `• ${item.title}: ${event?.ok ? `angelegt${event.eventId ? ` (${event.eventId})` : ''}` : `fehlgeschlagen${event?.detail ? ` (${event.detail})` : ''}`}`;
+        }).join('\n');
+        const headline = result.state === 'completed' ? '✅ Kalender-Bulk abgeschlossen:' : `⚠️ Kalender-Bulk fehlgeschlagen: ${result.failure ?? 'unbekannter Fehler'}`;
+        await ctx.reply(`${headline}\n${eventResults}`, { parse_mode: undefined });
         return;
       }
       case 'calendar-bulk-cancel': {
@@ -232,5 +231,32 @@ export async function handleContextActionCallback(ctx: Context, bot: Bot): Promi
       case 'text':
         await executeFollowUpText(ctx, action.sessionKey, action.text);
     }
+}
+
+/** Central typed callback router for all newly added contextual action buttons. */
+export async function handleContextActionCallback(ctx: Context, bot: Bot): Promise<boolean> {
+  return contextActionRouter.handle(ctx, (action) => executeContextAction(ctx, bot, action));
+}
+
+/**
+ * Compatibility bridge for pre-router taskresume:<id> buttons. The legacy
+ * payload is never executed directly: it is converted into a scoped router
+ * action, which applies ACL and in-memory idempotency before the ledger's
+ * durable CAS claim executes the retry.
+ */
+export async function handleLegacyTaskResumeCallback(ctx: Context, bot: Bot): Promise<boolean> {
+  const data = ctx.callbackQuery?.data;
+  if (!data?.startsWith('taskresume:')) return false;
+  const taskId = Number(data.slice('taskresume:'.length));
+  const chatId = ctx.chat?.id ?? ctx.callbackQuery?.message?.chat.id;
+  const userId = ctx.from?.id;
+  const task = Number.isSafeInteger(taskId) && taskId > 0 ? getOpenTask(taskId) : null;
+  if (!task || !userId || !chatId || task.chatId !== chatId) {
+    await ctx.answerCallbackQuery({ text: 'Ungültiger oder nicht verfügbarer Auftrag.' });
+    return true;
+  }
+  const routed = contextActionRouter.register({
+    type: 'task-resume', taskId, userId, chatId, sessionKey: task.sessionKey,
   });
+  return contextActionRouter.handle(ctx, (action) => executeContextAction(ctx, bot, action), routed);
 }

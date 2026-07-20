@@ -21,6 +21,14 @@ export interface ToolOperation {
   detail?: string;
 }
 
+/** A Telegram API delivery was not confirmed by Telegram after all safe fallbacks. */
+export class TelegramDeliveryError extends Error {
+  readonly name = 'TelegramDeliveryError';
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+  }
+}
+
 interface StreamState {
   chatId: number;
   threadId?: number;
@@ -125,6 +133,7 @@ export class MessageSender {
             await ctx.reply(plainChunks[i], { parse_mode: undefined });
           } catch (plainErr) {
             console.error('[sendMessage] Plain text fallback failed:', plainErr);
+            throw new TelegramDeliveryError(`Telegram did not confirm response chunk ${i + 1}/${plainChunks.length}.`, plainErr);
           }
         }
         // Already sent remaining content as plain — skip remaining MarkdownV2 parts
@@ -427,8 +436,7 @@ export class MessageSender {
   async finishStreaming(ctx: Context, finalContent: string): Promise<void> {
     const keyInfo = getSessionKeyFromCtx(ctx);
     if (!keyInfo) {
-      console.error('[Stream] finishStreaming: no keyInfo from ctx');
-      return;
+      throw new TelegramDeliveryError('Cannot confirm streamed delivery without a Telegram session key.');
     }
     const { chatId, sessionKey, threadId } = keyInfo;
     // Forum-topic awareness (2026-06-04): the raw error-fallback notices below
@@ -515,6 +523,7 @@ export class MessageSender {
                   await ctx.reply(parts[i], { parse_mode: undefined });
                 } catch (plainErr) {
                   console.error(`Plain text fallback also failed for part ${i + 1}:`, plainErr);
+                  throw new TelegramDeliveryError(`Telegram did not confirm streamed response chunk ${i + 1}/${parts.length}.`, plainErr);
                 }
               }
               await new Promise(resolve => setTimeout(resolve, 100));
@@ -535,26 +544,26 @@ export class MessageSender {
               this.streamStates.delete(sessionKey);
               try {
                 await this.sendMessage(ctx, finalContent);
+                return;
               } catch (sendErr) {
-                console.error('[Stream] sendMessage fallback failed, sending plain error notice:', sendErr);
-                try {
-                  await ctx.api.sendMessage(chatId, '⚠️ Fehler beim Senden der Antwort. Bitte nochmal versuchen.', sendOpts);
-                } catch { /* cannot send anything */ }
+                console.error('[Stream] sendMessage fallback failed:', sendErr);
+                throw new TelegramDeliveryError('Telegram did not confirm the streamed response.', sendErr);
               }
-              return;
             }
           }
         } catch (error) {
           console.error('Error finishing stream:', error);
-          // Last resort: notify user so they don't stare at a spinning indicator
-          try {
-            await ctx.api.sendMessage(chatId, '⚠️ Fehler beim Verarbeiten der Antwort. Bitte nochmal versuchen.', sendOpts);
-          } catch { /* cannot send anything */ }
+          throw error instanceof TelegramDeliveryError
+            ? error
+            : new TelegramDeliveryError('Telegram did not confirm the streamed response.', error);
         }
       }
     }
 
     this.streamStates.delete(sessionKey);
+    if (!state?.messageId) {
+      throw new TelegramDeliveryError('Telegram stream placeholder was unavailable; response delivery is unconfirmed.');
+    }
   }
 
   async cancelStreaming(ctx: Context): Promise<void> {

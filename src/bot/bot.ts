@@ -66,16 +66,15 @@ import {
   handleWhereAreWe,
   handleBots,
 } from './handlers/command.handler.js';
-import { markRelayDelivered, pendingRelays, resolveCurrentBotId } from '../crossbot/relay.js';
+import { claimPendingRelays, resolveCurrentBotId } from '../crossbot/relay.js';
 import { handleMessage } from './handlers/message.handler.js';
 import { handleVoice } from './handlers/voice.handler.js';
 import { handlePhoto, handleImageDocument } from './handlers/photo.handler.js';
 import { handleDocument } from './handlers/document.handler.js';
 import { handleVideo } from './handlers/video.handler.js';
 import { handleFollowUpCallback } from '../telegram/followup-buttons.js';
-import { handleContextActionCallback } from '../telegram/action-buttons.js';
+import { handleContextActionCallback, handleLegacyTaskResumeCallback } from '../telegram/action-buttons.js';
 import { startRegistrySweep } from '../handler/request-registry.js';
-import { resumeOpenTask } from '../inbox/task-resume.js';
 
 export const TELEGRAM_COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
 
@@ -233,7 +232,9 @@ export async function createBot(): Promise<Bot> {
       botName: config.BOT_NAME,
     });
     if (currentBot && currentBot !== 'master' && ctx.message) {
-      const relays = pendingRelays({
+      // Durable receipt is claimed before the relay enters recipient processing;
+      // two incoming turns can therefore never deliver the same handoff twice.
+      const relays = claimPendingRelays({
         relayDir: config.CROSSBOT_RELAY_DIR,
         recipient: currentBot,
         recipientDataDir: config.DATA_DIR,
@@ -241,7 +242,6 @@ export async function createBot(): Promise<Bot> {
       for (const relay of relays) {
         const lead = relay.kind === 'ask' ? 'Arash wollte dich fragen:' : 'Nachricht von Arash:';
         await ctx.reply(`📨 ${lead}\n${relay.payload}`, { parse_mode: undefined });
-        markRelayDelivered(config.DATA_DIR, relay.id);
       }
     }
     await next();
@@ -349,16 +349,10 @@ export async function createBot(): Promise<Bot> {
   // Callback query handler for inline keyboards
   bot.on('callback_query:data', async (ctx) => {
     if (await handleContextActionCallback(ctx, bot)) return;
+    if (await handleLegacyTaskResumeCallback(ctx, bot)) return;
     const data = ctx.callbackQuery.data;
 
-    if (data.startsWith('taskresume:')) {
-      const taskId = Number(data.slice('taskresume:'.length));
-      if (!Number.isSafeInteger(taskId) || taskId <= 0) {
-        await ctx.answerCallbackQuery({ text: 'Ungültiger Auftrag.' });
-      } else {
-        await resumeOpenTask(ctx, bot, taskId);
-      }
-    } else if (data.startsWith('resume:')) {
+    if (data.startsWith('resume:')) {
       await handleResumeCallback(ctx);
     } else if (data.startsWith('model:')) {
       await handleModelCallback(ctx);

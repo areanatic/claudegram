@@ -12,7 +12,7 @@ import {
 import { runPostAgentSuccess } from './post-agent.js';
 import { sessionManager } from '../../claude/session-manager.js';
 import { config, isMasterBot } from '../../config.js';
-import { messageSender } from '../../telegram/message-sender.js';
+import { messageSender, TelegramDeliveryError } from '../../telegram/message-sender.js';
 import { isDuplicate, markProcessed } from '../../telegram/deduplication.js';
 import { isStaleMessage, shouldNotifyStale, getStaleAgeMinutes } from '../middleware/stale-filter.js';
 import {
@@ -40,7 +40,7 @@ import * as path from 'path';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
 import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
-import { captureActionKeyboard, decisionActionKeyboard } from '../../telegram/action-buttons.js';
+import { captureActionKeyboard, decisionActionKeyboard, taskRetryActionKeyboard } from '../../telegram/action-buttons.js';
 import { getInputLogRowId, forgetInputLogRowId } from '../middleware/input-log.middleware.js';
 import { getTaskLedgerId } from '../middleware/task-ledger.middleware.js';
 import { markProcessing, markDone, markDropped, markError, markHandledNoAgent } from '../../inbox/input-log.js';
@@ -415,6 +415,8 @@ export async function handleMessage(ctx: Context): Promise<void> {
         await handleWaitResponse(ctx, sessionKey, chatId, text, turnEpoch, inputLogRowId);
       }
     });
+    // The sender resolves only after Telegram confirmed the final response.
+    // Receipt and ledger completion must remain after that confirmation.
     markDone(inputLogRowId);
     completeTask(taskLedgerId);
   } catch (error) {
@@ -467,7 +469,14 @@ export async function handleMessage(ctx: Context): Promise<void> {
     console.error('Error handling message:', error);
     markError(inputLogRowId, errorMessage.slice(0, 200));
     failTask(taskLedgerId, errorMessage);
-    await ctx.reply(`❌ Error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+    try {
+      await ctx.reply(`❌ Error: ${esc(errorMessage)}`, {
+        parse_mode: 'MarkdownV2',
+        reply_markup: taskLedgerId == null ? undefined : taskRetryActionKeyboard(ctx, sessionKey, taskLedgerId),
+      });
+    } catch (notifyError) {
+      console.error('[Message] delivery-failure notification could not be sent:', notifyError);
+    }
   } finally {
     forgetInputLogRowId(chatId, messageId);
   }
@@ -918,6 +927,16 @@ async function handleStreamingResponse(
     // Follow-up action buttons
     await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
   } catch (error) {
+    // Delivery is part of task success. markSuccess() may already have won for
+    // the agent response, but a failed Telegram write must still reach the
+    // outer ledger path and become retryable rather than being swallowed as a
+    // late RequestContext event.
+    if (error instanceof TelegramDeliveryError) {
+      if (!streamingFinished) {
+        try { await messageSender.cancelStreaming(ctx); } catch { /* cleanup only */ }
+      }
+      throw error;
+    }
     const isAbort =
       error instanceof Error &&
       (error.name === 'AbortError' || error.message.includes('aborted'));

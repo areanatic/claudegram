@@ -51,6 +51,10 @@ const envSchema = z.object({
   // bot identities fail closed (no relay read) instead of guessing a silo.
   CROSSBOT_BOT_ID: z.enum(['master', 'alina', 'mom', 'dad']).optional(),
   CROSSBOT_RELAY_DIR: z.string().default('/Volumes/AstronOne/shared-memory/nexusgram-crossbot'),
+  // Injected by the existing 1Password/keychain runtime wrapper. It is
+  // intentionally optional at boot so unrelated bot capabilities keep working,
+  // but cross-bot relay fails closed until every participating bot has it.
+  CROSSBOT_RELAY_HMAC_KEY: z.string().min(32).optional(),
   BOT_FAMILY_HEALTH_FRESHNESS_MS: z.coerce.number().int().min(60_000).max(3_600_000).default(300_000),
   BOT_MODE: z.enum(['dev', 'prod']).default('dev'),
   // Bounded bootstrap retry: covers Telegram 401/429/5xx/network turbulence

@@ -34,6 +34,8 @@ export interface CalendarBulkJob extends CalendarBulkPlan {
   failure: string | null;
 }
 
+export const CALENDAR_COMMIT_TIMEOUT_MS = 120_000;
+
 let db: Database.Database | null = null;
 function connection(): Database.Database {
   if (db) return db;
@@ -83,28 +85,52 @@ export function prepareCalendarBulk(input: Omit<CalendarBulkJob, 'id' | 'idempot
 }
 
 export function getCalendarBulkJob(id: string): CalendarBulkJob | null {
+  expireStaleCalendarBulkJobs();
   const row = connection().prepare('SELECT * FROM calendar_bulk_jobs WHERE id=?').get(id) as Record<string, unknown> | undefined;
   return row ? rowToJob(row) : null;
 }
 
+/** A crash after the CAS claim must not leave an invisible permanent commit. */
+export function expireStaleCalendarBulkJobs(now = new Date(), timeoutMs = CALENDAR_COMMIT_TIMEOUT_MS): number {
+  const cutoff = new Date(now.getTime() - timeoutMs).toISOString();
+  const result = connection().prepare(`UPDATE calendar_bulk_jobs
+    SET state='failed', failure=?, updated_at=?
+    WHERE state='committing' AND updated_at<=?`).run(
+    `calendar_commit_timeout_after_${Math.round(timeoutMs / 1000)}s`, now.toISOString(), cutoff,
+  );
+  return result.changes;
+}
+
+function normalizeResults(job: CalendarBulkJob, received: CalendarBulkResult[], fallbackDetail: string): CalendarBulkResult[] {
+  return job.items.map((_, index) => {
+    const result = received[index];
+    return result
+      ? { ok: result.ok === true, eventId: result.eventId, detail: result.detail }
+      : { ok: false, detail: fallbackDetail };
+  });
+}
+
 /** Compare-and-set claim makes double confirmation a no-op before any mutation. */
 export async function confirmCalendarBulk(id: string, executor: CalendarBulkExecutor): Promise<CalendarBulkJob> {
+  expireStaleCalendarBulkJobs();
   const now = new Date().toISOString();
   const claimed = connection().prepare(`UPDATE calendar_bulk_jobs SET state='committing',updated_at=? WHERE id=? AND state='prepared'`).run(now, id);
   const job = getCalendarBulkJob(id);
   if (!job) throw new Error('calendar bulk preview is unavailable');
   if (claimed.changes !== 1) return job;
   try {
-    const results = await executor.execute(job);
-    if (results.length !== job.items.length || results.some((result) => !result.ok)) {
-      throw new Error('calendar bulk executor did not atomically confirm every event');
-    }
-    connection().prepare(`UPDATE calendar_bulk_jobs SET state='completed',results_json=?,updated_at=? WHERE id=? AND state='committing'`)
-      .run(JSON.stringify(results), new Date().toISOString(), id);
+    const received = await executor.execute(job);
+    const results = normalizeResults(job, received, 'calendar backend returned no result for this event');
+    const failure = results.some((result) => !result.ok)
+      ? `calendar bulk partially failed (${results.filter((result) => !result.ok).length}/${job.items.length} events)`
+      : null;
+    connection().prepare(`UPDATE calendar_bulk_jobs SET state=?,results_json=?,failure=?,updated_at=? WHERE id=? AND state='committing'`)
+      .run(failure ? 'failed' : 'completed', JSON.stringify(results), failure, new Date().toISOString(), id);
   } catch (error) {
     const failure = error instanceof Error ? error.message : String(error);
-    connection().prepare(`UPDATE calendar_bulk_jobs SET state='failed',failure=?,updated_at=? WHERE id=? AND state='committing'`)
-      .run(failure.slice(0, 500), new Date().toISOString(), id);
+    const results = normalizeResults(job, [], failure.slice(0, 240));
+    connection().prepare(`UPDATE calendar_bulk_jobs SET state='failed',results_json=?,failure=?,updated_at=? WHERE id=? AND state='committing'`)
+      .run(JSON.stringify(results), failure.slice(0, 500), new Date().toISOString(), id);
   }
   return getCalendarBulkJob(id)!;
 }

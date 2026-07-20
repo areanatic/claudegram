@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nexusgram-sprint8-'));
 process.env.NEXUSGRAM_ENV_PATH = path.join(tmp, 'missing.env');
@@ -74,6 +75,41 @@ test('calendar bulk keeps failed confirmation visible for recovery', async () =>
   const failed = await calendar.confirmCalendarBulk(job.id, { execute: async () => { throw new Error('calendar backend unavailable'); } });
   assert.equal(failed.state, 'failed');
   assert.match(failed.failure ?? '', /backend unavailable/);
+  assert.deepEqual(failed.results?.map((result) => result.ok), [false], 'failed batch retains per-event result');
+});
+
+test('calendar bulk persists partial event outcomes instead of claiming an atomic result', async () => {
+  const job = calendar.prepareCalendarBulk({
+    userId: 1, chatId: 10, sessionKey: '10', operation: 'create',
+    items: [
+      { account: 'work', calendarId: 'primary', title: 'Termin D' },
+      { account: 'work', calendarId: 'primary', title: 'Termin E' },
+    ],
+  });
+  const result = await calendar.confirmCalendarBulk(job.id, {
+    execute: async () => [{ ok: true, eventId: 'evt-d' }, { ok: false, detail: 'quota exceeded' }],
+  });
+  assert.equal(result.state, 'failed');
+  assert.deepEqual(result.results?.map((event) => event.ok), [true, false]);
+  assert.equal(result.results?.[0]?.eventId, 'evt-d');
+  assert.match(result.results?.[1]?.detail ?? '', /quota exceeded/);
+});
+
+test('stale committing calendar jobs become visible failures', () => {
+  const job = calendar.prepareCalendarBulk({
+    userId: 1, chatId: 10, sessionKey: '10', operation: 'create',
+    items: [{ account: 'work', calendarId: 'primary', title: 'Termin F' }],
+  });
+  const staleAt = new Date('2026-07-20T00:00:00.000Z');
+  // First claim normally, then expire it as if the worker crashed before it
+  // could persist an outcome. The test uses the public recovery primitive.
+  const db = new Database(path.join(tmp, 'calendar-bulk-ledger.db'));
+  db.prepare("UPDATE calendar_bulk_jobs SET state='committing', updated_at=? WHERE id=?").run(staleAt.toISOString(), job.id);
+  db.close();
+  assert.equal(calendar.expireStaleCalendarBulkJobs(new Date(staleAt.getTime() + calendar.CALENDAR_COMMIT_TIMEOUT_MS + 1)), 1);
+  const recovered = calendar.getCalendarBulkJob(job.id);
+  assert.equal(recovered?.state, 'failed');
+  assert.match(recovered?.failure ?? '', /calendar_commit_timeout/);
 });
 
 test.after(() => {
