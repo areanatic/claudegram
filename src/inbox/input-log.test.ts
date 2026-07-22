@@ -5,7 +5,7 @@
  * Proves the resumable-orphan partition (Tier-2 FINAL Codex corrections #2/#3 +
  * Teil B §2.2/§3/§7): on boot only RECENT, PUBLIC, non-empty TEXT rows with
  * attempts left and NO mutating tool started are claimed for replay; private /
- * media / side-effect / attempts-exhausted / over-cap / old-drift rows are not.
+ * media / side-effect / attempts-exhausted / over-cap / ancient-drift rows are not.
  * The resume_attempts increment is durable (crash-loop terminates at MAX).
  *
  * The config module hard-fails on missing env, so the env below is set BEFORE
@@ -29,7 +29,7 @@ process.env.NEXUSGRAM_MAX_RESUME_ATTEMPTS = '2';
 process.env.NEXUSGRAM_MAX_BOOT_RESUME = '5';
 
 const DB_PATH = path.join(TMP, 'input-log.db');
-const RECENT_WINDOW_MS = 600_000; // mirrors RECENT_ORPHAN_WINDOW_MS
+const RECOVERY_NOTICE_WINDOW_MS = 604_800_000; // mirrors BOOT_RECOVERY_NOTIFY_WINDOW_MS (7 days)
 
 let pass = 0;
 function check(cond: boolean, msg: string) {
@@ -116,7 +116,7 @@ function iso(offsetMs: number): string {
   const E = insert({ chatId: 13, sessionKey: '13', receivedAtMs: -60_000, rawContent: 'poison', resumeAttempts: 2 });
   const F = insert({ chatId: 14, sessionKey: '14', receivedAtMs: -60_000, inputType: 'photo', rawContent: null });
   const G = insert({ chatId: 15, sessionKey: '15', receivedAtMs: -60_000, rawContent: '   ' });
-  const H = insert({ chatId: 16, sessionKey: '16', receivedAtMs: -(2 * RECENT_WINDOW_MS), rawContent: 'old drift' });
+  const H = insert({ chatId: 16, sessionKey: '16', receivedAtMs: -(RECOVERY_NOTICE_WINDOW_MS + 60_000), rawContent: 'ancient drift' });
 
   const r1 = claimResumableOrphans();
 
@@ -132,7 +132,7 @@ function iso(offsetMs: number): string {
   check(recentChats.has(13), 'attempts-exhausted row surfaced for re-send');
   check(recentChats.has(14), 'media row surfaced for re-send');
   check(recentChats.has(15), 'empty-content row surfaced for re-send');
-  check(!recentChats.has(16), 'old-drift row NOT surfaced (silent drop)');
+  check(!recentChats.has(16), 'row older than recovery-notice window NOT surfaced (silent drop)');
   check(!recentChats.has(10), 'claimed chat NOT in re-send notice');
 
   for (const id of [C, D, E, F, G, H]) {
