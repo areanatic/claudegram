@@ -338,6 +338,17 @@ const envSchema = z.object({
     .string()
     .default('600000')
     .transform((val) => parseInt(val, 10)),
+  // RI-32: automatic replay remains deliberately narrow because a replay can
+  // re-run work. User notification is a separate, much wider window so an
+  // older interrupted input is never silently discarded after downtime.
+  BOOT_RESUME_REPLAY_WINDOW_MS: z
+    .string()
+    .default('600000')
+    .transform((val) => parseInt(val, 10)),
+  BOOT_RECOVERY_NOTIFY_WINDOW_MS: z
+    .string()
+    .default('604800000')
+    .transform((val) => parseInt(val, 10)),
   // Mai-Intervention Phase C.1: Heartbeat threshold for RequestContext.
   // When a request exceeds this, a one-time "still working" notification is sent
   // and the state transitions WAITING → LONG_RUNNING. Does NOT finalize the request.

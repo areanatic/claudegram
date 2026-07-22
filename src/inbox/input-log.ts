@@ -687,17 +687,24 @@ export interface OrphanInput {
 }
 
 /**
- * Boot-recovery result: how many rows were dropped, plus the recent subset
- * (arrived <= RECENT_ORPHAN_WINDOW_MS before startup) worth notifying the user
- * about. Old drift is still dropped, just not surfaced.
+ * Boot-recovery result: how many rows were dropped, plus the configured subset
+ * worth notifying the user about. Replay and notification deliberately have
+ * separate windows: replay is narrow; notification covers longer downtime.
  */
 export interface RecoveryResult {
   recovered: number;
   recentOrphans: OrphanInput[];
 }
 
-/** Orphans newer than this before boot are surfaced to the user (FIX 4). */
-const RECENT_ORPHAN_WINDOW_MS = 600_000; // allow-hardcoded: reason="10min boot-recovery user-notify window"
+function recoveryWindows(): { replayMs: number; notifyMs: number } {
+  const replayMs = Number.isFinite(config.BOOT_RESUME_REPLAY_WINDOW_MS)
+    ? Math.max(60_000, config.BOOT_RESUME_REPLAY_WINDOW_MS)
+    : 600_000; // allow-hardcoded: reason="invalid-config fallback for replay safety window"
+  const requestedNotifyMs = Number.isFinite(config.BOOT_RECOVERY_NOTIFY_WINDOW_MS)
+    ? config.BOOT_RECOVERY_NOTIFY_WINDOW_MS
+    : 604_800_000; // allow-hardcoded: reason="invalid-config fallback for recovery notification"
+  return { replayMs, notifyMs: Math.max(replayMs, requestedNotifyMs) };
+}
 
 /**
  * Boot-recovery (Akt 1c): on startup every row still 'received'/'processing'
@@ -722,7 +729,7 @@ export function recoverOrphanedInputs(): RecoveryResult {
   try {
     const now = Date.now();
     const cutoff = new Date(now).toISOString();
-    const recentCutoff = new Date(now - RECENT_ORPHAN_WINDOW_MS).toISOString();
+    const notifyCutoff = new Date(now - recoveryWindows().notifyMs).toISOString();
     // Capture recent orphans BEFORE the UPDATE so the caller can notify the
     // user that their in-flight message was lost to a crash/restart.
     const recentOrphans = conn
@@ -733,7 +740,7 @@ export function recoverOrphanedInputs(): RecoveryResult {
           WHERE status IN ('received', 'processing')
             AND received_at <= ? AND received_at >= ?`,
       )
-      .all(cutoff, recentCutoff) as OrphanInput[];
+      .all(cutoff, notifyCutoff) as OrphanInput[];
     const info = conn
       .prepare(
         `UPDATE input_log
@@ -845,7 +852,9 @@ export function claimResumableOrphans(): ClaimResult {
   try {
     const now = Date.now();
     const cutoff = new Date(now).toISOString();
-    const recentCutoff = new Date(now - RECENT_ORPHAN_WINDOW_MS).toISOString();
+    const { replayMs, notifyMs } = recoveryWindows();
+    const replayCutoff = new Date(now - replayMs).toISOString();
+    const notifyCutoff = new Date(now - notifyMs).toISOString();
 
     const claim = conn.transaction((): ClaimResult => {
       // 1. Eligible resumable rows: recent, text, non-empty, public, no mutating
@@ -858,7 +867,7 @@ export function claimResumableOrphans(): ClaimResult {
                   received_at AS receivedAt, resume_attempts AS resumeAttempts
              FROM input_log
             WHERE status IN ('received','processing')
-              AND received_at <= @cutoff AND received_at >= @recentCutoff
+              AND received_at <= @cutoff AND received_at >= @replayCutoff
               AND input_type = 'text'
               AND raw_content IS NOT NULL AND TRIM(raw_content) <> ''
               AND resume_attempts < @maxAttempts
@@ -869,7 +878,7 @@ export function claimResumableOrphans(): ClaimResult {
         )
         .all({
           cutoff,
-          recentCutoff,
+          replayCutoff,
           maxAttempts: MAX_RESUME_ATTEMPTS,
           bootCap: MAX_BOOT_RESUME,
         }) as ResumableOrphan[];
@@ -896,10 +905,10 @@ export function claimResumableOrphans(): ClaimResult {
                   raw_content AS rawContent, received_at AS receivedAt, privacy
              FROM input_log
             WHERE status IN ('received','processing')
-              AND received_at <= @cutoff AND received_at >= @recentCutoff
+              AND received_at <= @cutoff AND received_at >= @notifyCutoff
               ${notClaimed}`,
         )
-        .all({ cutoff, recentCutoff }) as OrphanInput[];
+        .all({ cutoff, notifyCutoff }) as OrphanInput[];
 
       // 4. Drop everything still open that we did NOT claim (recent
       //    non-replayable + old drift). Claimed rows stay 'processing'.

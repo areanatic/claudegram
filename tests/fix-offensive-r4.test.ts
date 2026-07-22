@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nexusgram-fix-offensive-'));
 process.env.NEXUSGRAM_ENV_PATH = path.join(tmp, 'missing.env');
@@ -17,6 +18,7 @@ const { MessageSender, TelegramDeliveryError } = await import('../src/telegram/m
 const relay = await import('../src/crossbot/relay.js');
 const actions = await import('../src/telegram/action-buttons.js');
 const ledger = await import('../src/inbox/task-ledger.js');
+const inputLog = await import('../src/inbox/input-log.js');
 const { sanitizeError } = await import('../src/utils/sanitize.js');
 
 test('P0: persistent error logs redact Telegram credentials and ignore nested context', () => {
@@ -50,6 +52,30 @@ test('P0: unconfirmed Telegram sends reject instead of being silently accepted',
   };
   await sender.sendMessage(fallbackCtx as never, 'Antwort');
   assert.equal(calls, 2, 'a confirmed plain-text fallback remains a successful delivery');
+});
+
+test('RI-32: an orphan older than the replay window is still surfaced after longer downtime', () => {
+  const rowId = inputLog.recordInput({
+    messageId: 732,
+    chatId: 73,
+    sessionKey: '73',
+    inputType: 'text',
+    rawContent: 'unterbrochener Auftrag',
+    privacy: 'public',
+  });
+  assert.ok(rowId);
+  const conn = new Database(path.join(tmp, 'input-log.db'));
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  conn.prepare("UPDATE input_log SET received_at=?, updated_at=? WHERE id=?").run(oneHourAgo, oneHourAgo, rowId);
+  conn.close();
+
+  const recovery = inputLog.claimResumableOrphans();
+  assert.equal(recovery.resumable.some((row) => row.id === rowId), false, 'unsafe old work is not replayed automatically');
+  assert.equal(recovery.recentOrphans.some((row) => row.chatId === 73), true, 'the user is notified instead of silently losing it');
+  const verify = new Database(path.join(tmp, 'input-log.db'), { readonly: true });
+  const row = verify.prepare('SELECT status,dropped_reason FROM input_log WHERE id=?').get(rowId) as { status: string; dropped_reason: string };
+  verify.close();
+  assert.deepEqual(row, { status: 'dropped', dropped_reason: 'startup_recovery' });
 });
 
 test('P1: relay rejects forged lines, refuses symlinked inbox files, and writes receipt before handoff processing', () => {
@@ -114,6 +140,7 @@ test('P1: release hook writes a verifiable BUILD_INFO.json through build-manifes
 });
 
 test.after(() => {
+  inputLog.closeInputLog();
   ledger.closeTaskLedger();
   fs.rmSync(tmp, { recursive: true, force: true });
 });

@@ -182,8 +182,10 @@ async function main() {
   // FIX 4 (2026-05-22): tell users whose in-flight message was lost to a
   // crash/restart. With INV-01 these are now only the NON-replayable recent
   // orphans (private / media / side-effect-already-started / attempts-exhausted /
-  // over the per-boot cap). Old drift is dropped silently. Grouped per chat,
-  // capped at 3 snippets, best-effort.
+  // over the per-boot cap). RI-32 separates the narrow safe replay window from
+  // the wider notification window, so longer downtime no longer drops an
+  // interrupted input without telling the user. Grouped per chat, capped at
+  // 3 snippets, best-effort.
   if (recovery.recentOrphans.length > 0) {
     // Group by full sessionKey (not just chatId) so a forum-topic notice lands
     // in its originating thread instead of the General topic. parseSessionKey
