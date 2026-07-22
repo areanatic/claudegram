@@ -51,6 +51,7 @@ import {
   type McpCapabilityHealth,
 } from './capability-health.js';
 import { buildVoiceCapabilityPrompt, effectiveToolsForVoice, toolBudgetForVoice } from './voice-capabilities.js';
+import { buildMailCalendarRecoveryPrompt } from './mail-calendar-recovery.js';
 
 /**
  * Privacy Mode Phase 1 — neutralizing system-prompt suffix.
@@ -105,16 +106,21 @@ export function getLastMcpInventory(sessionKey: string): McpInventorySnapshot | 
 const LOCAL_MAIL_ACCOUNTS_REGISTRY =
   '/Volumes/AstronOne/NEXUS_miniM_13-03-26/scripts/dirigent/mail/localsync/config/accounts.json';
 
-function getLocalMailAccountCount(): number | null {
+function getLocalMailAccountLabels(): string[] {
   try {
     const parsed = JSON.parse(fs.readFileSync(LOCAL_MAIL_ACCOUNTS_REGISTRY, 'utf8')) as {
       accounts?: Record<string, unknown>;
     };
-    return parsed.accounts ? Object.keys(parsed.accounts).length : null;
+    return parsed.accounts ? Object.keys(parsed.accounts).sort() : [];
   } catch (error) {
     console.error(`[Claude] ⚠️ CAPABILITY WARN: local mail registry unreadable (${LOCAL_MAIL_ACCOUNTS_REGISTRY}):`, error);
-    return null;
+    return [];
   }
+}
+
+function getLocalMailAccountCount(): number | null {
+  const labels = getLocalMailAccountLabels();
+  return labels.length > 0 ? labels.length : null;
 }
 
 export interface AgentResponse {
@@ -964,6 +970,14 @@ export async function sendToAgent(
     const voiceCapabilityPrompt = voiceMode
       ? buildVoiceCapabilityPrompt(effectiveBotTools)
       : '';
+    const previousMcpInventory = lastMcpInventories.get(sessionKey);
+    const mailCalendarRecoveryPrompt = isMasterBot
+      ? buildMailCalendarRecoveryPrompt({
+          localAccountLabels: getLocalMailAccountLabels(),
+          connectedServers: previousMcpInventory?.capabilityHealth.connectedServers,
+          missingServers: previousMcpInventory?.capabilityHealth.missingServers,
+        })
+      : '';
 
     // Schlachtplan Akt 1.3 Fix C: per-turn tool budget. When the agent issues
     // more tool_use blocks than this, the turn is aborted as a controlled
@@ -1314,7 +1328,7 @@ export async function sendToAgent(
       systemPrompt: {
         type: 'preset' as const,
         preset: 'claude_code' as const,
-        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}${voiceCapabilityPrompt}` : SYSTEM_PROMPT}${memoryContext}${nexusBridgePrompt}${todayContext}${previousDayContext}${recentUploadsContext}${contextAvailabilityContext}${recallModelFallbackPrompt}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
+        append: `${voiceMode ? `${SYSTEM_PROMPT}${VOICE_MODE_PROMPT}${voiceCapabilityPrompt}` : SYSTEM_PROMPT}${mailCalendarRecoveryPrompt}${memoryContext}${nexusBridgePrompt}${todayContext}${previousDayContext}${recentUploadsContext}${contextAvailabilityContext}${recallModelFallbackPrompt}${sessionIsPrivate ? PRIVACY_MODE_PROMPT : ''}`,
       },
       settingSources: config.BOT_SETTING_SOURCES as SettingSource[],
       model: effectiveModel,
