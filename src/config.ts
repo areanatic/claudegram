@@ -2,6 +2,7 @@ import { config as loadEnv } from 'dotenv';
 import { z } from 'zod';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { resolveVoiceAllowedLanguages } from './audio/voice-language-policy.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultEnvPath = path.resolve(__dirname, '..', '.env');
@@ -186,8 +187,7 @@ const envSchema = z.object({
   // asked to resend instead of the nonsense being fed to the agent. Empty = any.
   VOICE_ALLOWED_LANGUAGES: z
     .string()
-    .default('de,en')
-    .transform((val) => val.split(',').map((c) => c.trim().toLowerCase()).filter(Boolean)),
+    .optional(),
   // Voice-first mode: auto-enable TTS when user sends voice messages
   VOICE_FIRST_MODE_ENABLED: z.string().default('true').transform(toBool),
   VOICE_TIMEOUT_MS: z
@@ -485,7 +485,14 @@ if (!parsed.success) {
   process.exit(1);
 }
 
-export const config = parsed.data;
+export const config = {
+  ...parsed.data,
+  VOICE_ALLOWED_LANGUAGES: resolveVoiceAllowedLanguages(
+    parsed.data.VOICE_ALLOWED_LANGUAGES,
+    parsed.data.BOT_ROLE,
+    parsed.data.BOT_NAME,
+  ),
+};
 
 // The production Master is deliberately identified once and then used by the
 // MCP wiring and capability-health checks. BOT_ROLE permits a test lane to

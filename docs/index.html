@@ -1556,6 +1556,11 @@
                   <td class="required-no">No</td>
                 </tr>
                 <tr>
+                  <td class="var-name">VOICE_ALLOWED_LANGUAGES</td>
+                  <td>Optional comma-separated Whisper language gate. Unset Master bots accept all languages; person bots default to <code>de,en</code>.</td>
+                  <td class="required-no">No</td>
+                </tr>
+                <tr>
                   <td class="var-name">EXTRACT_ENABLED</td>
                   <td>Enable /extract command (default: true)</td>
                   <td class="required-no">No</td>
@@ -1693,7 +1698,7 @@
           <div class="feature-card" data-category="voice">
             <div class="feature-icon">🎤</div>
             <h3>Voice Transcription</h3>
-            <p>Send voice messages and have them transcribed with Groq Whisper. Auto-detects language — just talk to Claude instead of typing.</p>
+            <p>Send voice messages and have them transcribed with Groq Whisper. Recall indexing is migrated and retried independently, so an index delay never blocks the answer.</p>
           </div>
           <div class="feature-card" data-category="voice">
             <div class="feature-icon">🔊</div>
