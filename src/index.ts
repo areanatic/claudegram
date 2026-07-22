@@ -17,6 +17,8 @@ import { startScannerProWatcher, stopScannerProWatcher } from './scanners/scanne
 import { startOmiBridgeWatcher, stopOmiBridgeWatcher } from './scanners/omi-bridge-watcher.js';
 import { initializeBotStartup, StartupRetryExhaustedError } from './telegram/startup-retry.js';
 import { sendStartupFailureAlert } from './telegram/startup-alert.js';
+import { ensureVoiceRecallSchema } from './inbox/captures-db.js';
+import { startVoiceRecallRetryWorker, stopVoiceRecallRetryWorker } from './inbox/voice-recall.js';
 import {
   recordInitialTelegramRoundtrip,
   startBotHealthHeartbeat,
@@ -105,6 +107,10 @@ async function main() {
   // migration + FTS rebuild while a parallel session held a connection.
   // Deterministic boot-time init removes that lock-risk surface.
   ensureInputLogInitialized();
+  // RI-28: every runtime owns the same idempotent FTS/capture migration.
+  // Failure does not make voice unavailable; /health exposes the error and the
+  // Sprint-3 retry queue preserves delayed index commits.
+  ensureVoiceRecallSchema();
   // Fail loud before polling: accepting a task without its durable ledger would
   // recreate the exact restart/timeout loss this sprint closes.
   ensureTaskLedgerInitialized();
@@ -150,6 +156,7 @@ async function main() {
     },
   });
   console.log('[Runner] Grammy runner started, polling for updates...');
+  startVoiceRecallRetryWorker();
 
   // Phase 7.x (2026-05-27): in-process Scanner-Pro sync scheduler. Triple-gated
   // inside startScannerProWatcher — only runs when BOT_NAME='Nexusgram',
@@ -264,6 +271,7 @@ async function main() {
     // running child (ssh/rsync/python/ffmpeg descendants) gets the signal
     // together, with 8s grace before SIGKILL.
     try { await stopOmiBridgeWatcher(); } catch { /* ignore */ }
+    stopVoiceRecallRetryWorker();
     stopBotHealthHeartbeat();
 
     // 6. Cleanup

@@ -17,6 +17,18 @@ const NEXUS_MEMORY_DB =
 let db: Database.Database | null = null;
 let initialized = false;
 
+export interface VoiceRecallSchemaHealth {
+  status: 'not_run' | 'ok' | 'error';
+  checkedAt: string | null;
+  error: string | null;
+}
+
+let voiceRecallSchemaHealth: VoiceRecallSchemaHealth = {
+  status: 'not_run',
+  checkedAt: null,
+  error: null,
+};
+
 function getDb(): Database.Database | null {
   if (db) return db;
   try {
@@ -33,9 +45,8 @@ function getDb(): Database.Database | null {
 export function initCapturesSchema(): void {
   if (initialized) return;
   const conn = getDb();
-  if (!conn) return;
-  try {
-    conn.exec(`
+  if (!conn) throw new Error(`cannot open NEXUS memory DB: ${NEXUS_MEMORY_DB}`);
+  conn.exec(`
       CREATE TABLE IF NOT EXISTS captures (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
 
@@ -99,11 +110,90 @@ export function initCapturesSchema(): void {
         ON captures(status, privacy, analyzed_at)
         WHERE status='processed' AND privacy='public';
     `);
-    initialized = true;
-    console.log('[Captures] Schema initialized');
-  } catch (err) {
-    console.error('[Captures] Schema init failed:', err);
+  initialized = true;
+  console.log('[Captures] Schema initialized');
+}
+
+/**
+ * Idempotent boot migration for the trigger-backed voice recall contract.
+ * It deliberately records failure instead of throwing out of boot so /health
+ * remains reachable and reports the schema error loudly.
+ */
+export function ensureVoiceRecallSchema(): VoiceRecallSchemaHealth {
+  const checkedAt = new Date().toISOString();
+  try {
+    initCapturesSchema();
+    const conn = getDb();
+    if (!conn) throw new Error(`cannot open NEXUS memory DB: ${NEXUS_MEMORY_DB}`);
+
+    const memoryColumns = conn.prepare('PRAGMA table_info(memories)').all() as Array<{ name: string }>;
+    const names = new Set(memoryColumns.map((column) => column.name));
+    for (const required of ['id', 'content', 'tags', 'project']) {
+      if (!names.has(required)) throw new Error(`memories schema missing required column: ${required}`);
+    }
+
+    const requiredObjects = ['memories_fts', 'memories_ai', 'memories_ad', 'memories_au'];
+    const existingObjects = new Set(
+      (conn.prepare(`SELECT name FROM sqlite_master WHERE name IN (?,?,?,?)`).all(
+        ...requiredObjects,
+      ) as Array<{ name: string }>).map((row) => row.name),
+    );
+    const schemaWasComplete = requiredObjects.every((name) => existingObjects.has(name));
+
+    conn.transaction(() => {
+      conn.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+          content, tags, project, content=memories, content_rowid=id,
+          tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+          INSERT INTO memories_fts(rowid, content, tags, project)
+          VALUES (new.id, new.content, new.tags, new.project);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+          INSERT INTO memories_fts(memories_fts, rowid, content, tags, project)
+          VALUES ('delete', old.id, old.content, old.tags, old.project);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories
+        WHEN old.content IS NOT new.content OR old.tags IS NOT new.tags OR old.project IS NOT new.project
+        BEGIN
+          INSERT INTO memories_fts(memories_fts, rowid, content, tags, project)
+          VALUES ('delete', old.id, old.content, old.tags, old.project);
+          INSERT INTO memories_fts(rowid, content, tags, project)
+          VALUES (new.id, new.content, new.tags, new.project);
+        END;
+      `);
+
+      const ftsColumns = new Set(
+        (conn.prepare('PRAGMA table_info(memories_fts)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      for (const required of ['content', 'tags', 'project']) {
+        if (!ftsColumns.has(required)) throw new Error(`memories_fts schema missing required column: ${required}`);
+      }
+
+      const memoryCount = (conn.prepare('SELECT COUNT(*) AS n FROM memories').get() as { n: number }).n;
+      const ftsCount = (conn.prepare('SELECT COUNT(*) AS n FROM memories_fts').get() as { n: number }).n;
+      // An external-content FTS table can report the content-table row count
+      // even before its index is populated. Rebuild whenever any schema object
+      // had to be created, as well as on an observable count mismatch.
+      if (!schemaWasComplete || memoryCount !== ftsCount) {
+        conn.prepare("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')").run();
+      }
+    })();
+
+    voiceRecallSchemaHealth = { status: 'ok', checkedAt, error: null };
+    console.log('[VoiceRecall] FTS schema migration verified');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    voiceRecallSchemaHealth = { status: 'error', checkedAt, error: message.slice(0, 240) };
+    console.error('[VoiceRecall] FTS schema migration FAILED:', message);
   }
+  return { ...voiceRecallSchemaHealth };
+}
+
+export function getVoiceRecallSchemaHealth(): VoiceRecallSchemaHealth {
+  return { ...voiceRecallSchemaHealth };
 }
 
 export interface CaptureInsert {
@@ -402,6 +492,7 @@ export function persistVoiceTranscriptMemory(
   messageId: number,
   botIdValue: string,
   transcript: string,
+  privacy: 'public' | 'private' = 'public',
 ): number | null {
   const cleanTranscript = transcript.trim();
   if (!cleanTranscript) return null;
@@ -410,6 +501,16 @@ export function persistVoiceTranscriptMemory(
 
   try {
     const persist = conn.transaction((): number | null => {
+      // bed37b5 assumed captureRouter had already created this row. The router
+      // is not in the current middleware stack, so materialize the minimal
+      // voice capture here in the same transaction. This keeps the contract
+      // independent of optional capture enrichment and remains idempotent.
+      conn.prepare(`INSERT INTO captures
+        (chat_id,message_id,bot_id,capture_type,status,transcript,tags,privacy)
+        VALUES (?,?,?,'voice','queued',?,'voice',?)
+        ON CONFLICT(chat_id,message_id,bot_id) DO NOTHING`).run(
+        chatId, messageId, botIdValue, cleanTranscript, privacy,
+      );
       const capture = conn
         .prepare(
           `SELECT id, capture_type, tags, privacy, memory_id
@@ -484,7 +585,10 @@ export function persistVoiceTranscriptMemory(
 
     return persist();
   } catch (err) {
-    console.error('[Captures] voice FTS persistence failed:', err);
+    console.error(
+      '[Captures] voice FTS persistence failed:',
+      err instanceof Error ? err.message : String(err),
+    );
     return null;
   }
 }

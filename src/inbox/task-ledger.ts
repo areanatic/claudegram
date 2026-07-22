@@ -28,6 +28,26 @@ export interface OpenTask {
   mediaPath?: string | null;
 }
 
+export type TaskRetryKind = 'voice_recall_index';
+
+export interface TaskRetryJob {
+  id: number;
+  parentTaskId: number | null;
+  retryKind: TaskRetryKind;
+  dedupeKey: string;
+  payloadJson: string;
+  attempts: number;
+  lastError: string | null;
+}
+
+export interface EnqueueTaskRetryInput {
+  parentTaskId: number | null;
+  retryKind: TaskRetryKind;
+  dedupeKey: string;
+  payloadJson: string;
+  lastError: string;
+}
+
 export class TaskLedgerError extends Error { readonly name = 'TaskLedgerError'; }
 
 let db: Database.Database | null = null;
@@ -70,6 +90,24 @@ function getDb(): Database.Database {
         UNIQUE(bot_id, chat_id, message_id)
       );
       CREATE INDEX IF NOT EXISTS idx_task_ledger_open ON task_ledger(bot_id, state, accepted_at);
+      CREATE TABLE IF NOT EXISTS task_retry_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_id TEXT NOT NULL,
+        parent_task_id INTEGER,
+        retry_kind TEXT NOT NULL CHECK(retry_kind IN ('voice_recall_index')),
+        dedupe_key TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending','processing','failed','completed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        next_attempt_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        UNIQUE(bot_id, retry_kind, dedupe_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_retry_due
+        ON task_retry_queue(bot_id, retry_kind, state, next_attempt_at);
     `);
     const columns = (conn.prepare('PRAGMA table_info(task_ledger)').all() as { name: string }[]).map((column) => column.name);
     if (!columns.includes('media_path')) conn.exec('ALTER TABLE task_ledger ADD COLUMN media_path TEXT');
@@ -122,6 +160,84 @@ export const startTask = (id: number | null) => transition(id, 'working');
 export const completeTask = (id: number | null) => transition(id, 'completed');
 export const failTask = (id: number | null, reason: string) => transition(id, 'failed', reason.slice(0, 240));
 export const interruptTask = (id: number | null, reason: string) => transition(id, 'interrupted', reason.slice(0, 240));
+
+/**
+ * Add a durable side-effect retry without keeping the user-facing task open.
+ * The parent voice task can complete after Telegram delivery while this row
+ * independently preserves the delayed recall-index write.
+ */
+export function enqueueTaskRetry(input: EnqueueTaskRetryInput): number {
+  const conn = getDb();
+  const now = new Date().toISOString();
+  const result = conn.prepare(`INSERT INTO task_retry_queue
+    (bot_id,parent_task_id,retry_kind,dedupe_key,payload_json,state,attempts,last_error,
+     next_attempt_at,created_at,updated_at)
+    VALUES (?,?,?,?,?,'pending',0,?,?,?,?)
+    ON CONFLICT(bot_id,retry_kind,dedupe_key) DO UPDATE SET
+      parent_task_id=excluded.parent_task_id,
+      payload_json=excluded.payload_json,
+      state=CASE WHEN task_retry_queue.state='completed' THEN 'completed' ELSE 'pending' END,
+      last_error=CASE WHEN task_retry_queue.state='completed' THEN task_retry_queue.last_error ELSE excluded.last_error END,
+      next_attempt_at=CASE WHEN task_retry_queue.state='completed' THEN task_retry_queue.next_attempt_at ELSE excluded.next_attempt_at END,
+      updated_at=excluded.updated_at`).run(
+    botId(), input.parentTaskId, input.retryKind, input.dedupeKey, input.payloadJson,
+    input.lastError.slice(0, 240), now, now, now,
+  );
+  const existing = conn.prepare(`SELECT id FROM task_retry_queue
+    WHERE bot_id=? AND retry_kind=? AND dedupe_key=?`).get(
+    botId(), input.retryKind, input.dedupeKey,
+  ) as { id: number } | undefined;
+  if (!result.changes || !existing) throw new TaskLedgerError('idempotent task retry lookup failed');
+  return existing.id;
+}
+
+/** Atomically claim due retries so overlapping timer ticks cannot duplicate work. */
+export function claimDueTaskRetries(retryKind: TaskRetryKind, limit = 10): TaskRetryJob[] {
+  const conn = getDb();
+  const now = new Date().toISOString();
+  return conn.transaction(() => {
+    // A process crash can strand a claim in processing. Re-open claims older
+    // than ten minutes before selecting this bounded batch.
+    const stale = new Date(Date.now() - 10 * 60_000).toISOString(); // allow-hardcoded: reason="Sprint-3 retry orphan threshold"
+    conn.prepare(`UPDATE task_retry_queue SET state='failed',last_error='retry_worker_restart',
+      next_attempt_at=?,updated_at=? WHERE bot_id=? AND retry_kind=? AND state='processing' AND updated_at<=?`)
+      .run(now, now, botId(), retryKind, stale);
+    const rows = conn.prepare(`SELECT id,parent_task_id AS parentTaskId,retry_kind AS retryKind,
+      dedupe_key AS dedupeKey,payload_json AS payloadJson,attempts,last_error AS lastError
+      FROM task_retry_queue WHERE bot_id=? AND retry_kind=? AND state IN ('pending','failed')
+        AND next_attempt_at<=? ORDER BY next_attempt_at,id LIMIT ?`).all(
+      botId(), retryKind, now, Math.max(1, Math.min(limit, 100)),
+    ) as TaskRetryJob[];
+    const claim = conn.prepare(`UPDATE task_retry_queue SET state='processing',attempts=attempts+1,
+      updated_at=? WHERE id=? AND bot_id=? AND state IN ('pending','failed')`);
+    return rows.filter((row) => claim.run(now, row.id, botId()).changes === 1)
+      .map((row) => ({ ...row, attempts: row.attempts + 1 }));
+  })();
+}
+
+export function completeTaskRetry(id: number): void {
+  const now = new Date().toISOString();
+  getDb().prepare(`UPDATE task_retry_queue SET state='completed',completed_at=?,updated_at=?
+    WHERE id=? AND bot_id=? AND state='processing'`).run(now, now, id, botId());
+}
+
+export function rescheduleTaskRetry(id: number, error: string, delayMs: number): void {
+  const now = new Date();
+  const next = new Date(now.getTime() + Math.max(1_000, delayMs)).toISOString();
+  getDb().prepare(`UPDATE task_retry_queue SET state='failed',last_error=?,next_attempt_at=?,updated_at=?
+    WHERE id=? AND bot_id=? AND state='processing'`).run(
+    error.slice(0, 240), next, now.toISOString(), id, botId(),
+  );
+}
+
+export function pendingTaskRetryCount(retryKind?: TaskRetryKind): number {
+  const row = retryKind
+    ? getDb().prepare(`SELECT COUNT(*) AS n FROM task_retry_queue
+        WHERE bot_id=? AND retry_kind=? AND state<>'completed'`).get(botId(), retryKind)
+    : getDb().prepare(`SELECT COUNT(*) AS n FROM task_retry_queue
+        WHERE bot_id=? AND state<>'completed'`).get(botId());
+  return (row as { n: number }).n;
+}
 
 /** Persist the locally validated media path before the agent may inspect it. */
 export function attachTaskMediaPath(id: number | null, mediaPath: string): void {

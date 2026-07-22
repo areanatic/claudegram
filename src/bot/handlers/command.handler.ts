@@ -91,6 +91,8 @@ import {
 import { buildWhereAreWe, sendProactiveRecall } from '../../memory/proactive-recall.js';
 import { openTaskActionKeyboard } from '../../telegram/action-buttons.js';
 import { botFamily, formatBotFamilyHealth, readBotFamilyHealth } from '../../crossbot/relay.js';
+import { getVoiceRecallSchemaHealth } from '../../inbox/captures-db.js';
+import { voiceRecallRetryCount } from '../../inbox/voice-recall.js';
 
 // Helper for consistent MarkdownV2 replies
 async function replyMd(ctx: Context, text: string): Promise<void> {
@@ -4143,6 +4145,11 @@ export async function handleHealth(ctx: Context): Promise<void> {
   // Tier-1: rows the catch-all finalizer closed without an agent answer (early
   // returns / RI-23 transcribe hijack). A rising number = inputs silently unanswered.
   const handlerNoFinalize = countHandlerNoFinalize();
+  const voiceRecallSchema = getVoiceRecallSchemaHealth();
+  const voiceRecallRetries = voiceRecallRetryCount();
+  const voiceRecallStatus = voiceRecallSchema.status === 'ok'
+    ? `schema=ok retries=${voiceRecallRetries >= 0 ? voiceRecallRetries : 'error'}`
+    : `SCHEMA=${voiceRecallSchema.status.toUpperCase()} ${voiceRecallSchema.error ?? 'boot migration not run'} retries=${voiceRecallRetries >= 0 ? voiceRecallRetries : 'error'}`;
 
   lines.push(
     ``,
@@ -4156,6 +4163,7 @@ export async function handleHealth(ctx: Context): Promise<void> {
     `*Capability ledger:* \`${esc(ledgerPath)}\``,
     `*Last delivered turn:* ${esc(effectiveness.turns.last_success_at ?? 'none since boot')}`,
     `*Telegram getMe:* ${esc(effectiveness.telegram_get_me.last_success_at ?? `failed: ${effectiveness.telegram_get_me.last_error ?? 'never'}`)}`,
+    `*Voice recall:* ${esc(voiceRecallStatus)}`,
   );
 
   // Phase 7.x — Scanner-Pro watcher status (one compact line per Codex P1-3).

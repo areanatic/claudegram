@@ -38,7 +38,8 @@ import { markProcessing, markDone, markDropped, markError, attachContent, markHa
 import { completeTask, failTask, interruptTask, startTask } from '../../inbox/task-ledger.js';
 import { tryAutoDispatch } from '../../inbox/input-auto-dispatch.js';
 import { withHardTimeout, HardTimeoutError } from '../../utils/hard-timeout.js';
-import { persistVoiceTranscriptMemory } from '../../inbox/captures-db.js';
+import { commitVoiceRecallNonBlocking } from '../../inbox/voice-recall.js';
+import { isPrivate } from '../../memory/privacy-state.js';
 
 export async function handleVoice(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
@@ -82,7 +83,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
   // session auto-creation — transcribe-only must never spawn an agent session.)
   const replyTo = ctx.message?.reply_to_message;
   if (takeFreshTranscribeReply(chatId, ctx.from?.id ?? 0, replyTo?.message_id)) {
-    await handleTranscribeOnly(ctx, chatId, messageId, voice, inputLogRowId);
+    await handleTranscribeOnly(ctx, chatId, sessionKey, messageId, voice, inputLogRowId, taskLedgerId);
     return;
   }
 
@@ -224,15 +225,15 @@ export async function handleVoice(ctx: Context): Promise<void> {
     // transcript. Mirror it into memories + memories_fts now; the asynchronous
     // Capture-Enrichment path repeats the same idempotent postcondition as a
     // recovery belt, never as a duplicate insert.
-    const voiceMemoryId = persistVoiceTranscriptMemory(
-      String(chatId),
+    await commitVoiceRecallNonBlocking({
+      chatId: String(chatId),
       messageId,
-      (config.BOT_NAME || 'Nexusgram').toLowerCase().replace(/\s+/g, '-'),
+      botId: (config.BOT_NAME || 'Nexusgram').toLowerCase().replace(/\s+/g, '-'),
       transcript,
-    );
-    if (voiceMemoryId === null) {
-      throw new Error('Voice transcript could not be committed to the recall index.');
-    }
+      privacy: isPrivate(sessionKey) ? 'private' : 'public',
+      parentTaskId: taskLedgerId,
+      notifyDelayed: (notice) => ctx.reply(notice, { parse_mode: undefined }),
+    });
 
     // Activate voice-first mode (if enabled in config) and store detected language
     if (config.VOICE_FIRST_MODE_ENABLED) {
@@ -510,9 +511,11 @@ export async function handleVoice(ctx: Context): Promise<void> {
 async function handleTranscribeOnly(
   ctx: Context,
   chatId: number,
+  sessionKey: string,
   messageId: number,
   voice: { file_id: string; file_size?: number; mime_type?: string },
   inputLogRowId: number | null,
+  taskLedgerId: number | null,
 ): Promise<void> {
   const ackMsg = await ctx.reply('🎤 Transcribing...', { parse_mode: undefined });
 
@@ -550,20 +553,22 @@ async function handleTranscribeOnly(
     // catch-all finalizer doesn't tag it 'handler_no_finalize' (would read as
     // "unanswered") and contextAvailability never sees it as 'dropped'.
     attachContent(inputLogRowId, transcript);
-    const voiceMemoryId = persistVoiceTranscriptMemory(
-      String(chatId),
+    await commitVoiceRecallNonBlocking({
+      chatId: String(chatId),
       messageId,
-      (config.BOT_NAME || 'Nexusgram').toLowerCase().replace(/\s+/g, '-'),
+      botId: (config.BOT_NAME || 'Nexusgram').toLowerCase().replace(/\s+/g, '-'),
       transcript,
-    );
-    if (voiceMemoryId === null) {
-      throw new Error('Voice transcript could not be committed to the recall index.');
-    }
+      privacy: isPrivate(sessionKey) ? 'private' : 'public',
+      parentTaskId: taskLedgerId,
+      notifyDelayed: (notice) => ctx.reply(notice, { parse_mode: undefined }),
+    });
     markHandledNoAgent(inputLogRowId, 'transcribe_only');
+    completeTask(taskLedgerId);
   } catch (error) {
     const errorMessage = sanitizeError(error);
     console.error('[Transcribe] Voice ForceReply error:', errorMessage);
     markError(inputLogRowId, errorMessage.slice(0, 200));
+    failTask(taskLedgerId, errorMessage);
     try {
       await ctx.api.editMessageText(chatId, ackMsg.message_id, `❌ ${errorMessage}`, { parse_mode: undefined });
     } catch {
