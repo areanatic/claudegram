@@ -357,8 +357,16 @@ const envSchema = z.object({
     .string()
     .default('30000')
     .transform((val) => parseInt(val, 10)),
-  // Optional user-facing heartbeat sent on the LONG_RUNNING transition. Sent at
-  // most once per request. Disable by setting empty.
+  // RI-19/RI-23: after the first heartbeat, keep the user informed at a
+  // bounded cadence until the turn finishes or reaches its hard cap.
+  // Set 0 to retain a single notification.
+  HANDLER_PROGRESS_UPDATE_INTERVAL_MS: z
+    .string()
+    .default('120000')
+    .transform((val) => parseInt(val, 10)),
+  // Optional user-facing heartbeat sent on the LONG_RUNNING transition.
+  // Follow-up updates use a concise elapsed-time message. Disable all progress
+  // messages by setting this empty.
   HANDLER_LONG_RUNNING_MESSAGE: z
     .string()
     .default('🐌 Brauche länger als gewöhnlich, bin aber dran…'),

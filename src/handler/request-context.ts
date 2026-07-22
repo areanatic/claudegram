@@ -5,7 +5,7 @@
  * a RequestContext that owns:
  *  - a deterministic state machine (HandlerState)
  *  - a hard-cap timer (gracefulCancel on expiry)
- *  - an optional long-running heartbeat (one user-facing notification, no finalize)
+ *  - optional bounded long-running progress updates (no finalize)
  *  - an atomic `finalizeOnce()` guard so success, cancel and timeout never double-reply
  *  - a `deadline_ms` (absolute epoch ms) for queue + watchdog visibility
  *
@@ -35,7 +35,7 @@ import {
 export enum HandlerState {
   /** Initial — no user-visible reply yet. */
   WAITING = 'WAITING',
-  /** > heartbeat threshold — single notification sent. NOT terminal. */
+  /** > heartbeat threshold — progress notifications active. NOT terminal. */
   LONG_RUNNING = 'LONG_RUNNING',
   /** Real response was delivered (finalizeOnce won). Terminal. */
   RESPONDED = 'RESPONDED',
@@ -77,6 +77,8 @@ export interface RequestContext {
   heartbeatTimer: NodeJS.Timeout | null;
   /** Set true after the first LONG_RUNNING notification fires. */
   longRunningNotified: boolean;
+  /** Number of scheduled progress callbacks already emitted for this request. */
+  progressUpdateCount: number;
 }
 
 export type RequestOrigin =
@@ -90,9 +92,9 @@ export interface CreateRequestContextOptions {
   /** Override the base timeout (defaults to config.AGENT_RESPONSE_TIMEOUT_MS). */
   baseTimeoutMs?: number;
   /**
-   * Invoked exactly once when state transitions to LONG_RUNNING.
-   * The callback runs AFTER state mutation, so consumers can read the new state.
-   * Heartbeat does NOT finalize the request and does NOT count as a reply.
+   * Invoked when state transitions to LONG_RUNNING and then at the configured
+   * bounded progress interval. The callback runs AFTER state/count mutation.
+   * Progress updates do NOT finalize the request.
    */
   onLongRunning?: (ctx: RequestContext) => void | Promise<void>;
   /**
@@ -225,6 +227,7 @@ export function createRequestContext(
     hardCapTimer: null,
     heartbeatTimer: null,
     longRunningNotified: false,
+    progressUpdateCount: 0,
   };
 
   // Hard-cap timer — single source of timeout truth.
@@ -258,29 +261,43 @@ export function createRequestContext(
     }
   }, effectiveTimeoutMs);
 
-  // Optional long-running heartbeat — non-finalizing UX nudge.
+  // Optional long-running heartbeat — non-finalizing UX updates. RI-19/RI-23:
+  // after the first notice, schedule a bounded recurring update instead of
+  // going silent for the rest of a ten-minute turn.
   const heartbeatMs = config.HANDLER_LONG_RUNNING_HEARTBEAT_MS;
   if (heartbeatMs > 0 && options.onLongRunning) {
-    ctx.heartbeatTimer = setTimeout(() => {
-      // Heartbeat must not finalize. If a terminal state is reached, the
-      // disposer below clears this timer — but defensive check keeps us safe.
-      if (
-        ctx.state !== HandlerState.WAITING ||
-        ctx.longRunningNotified
-      ) {
-        return;
-      }
-      ctx.state = HandlerState.LONG_RUNNING;
-      ctx.longRunningNotified = true;
-      Promise.resolve()
-        .then(() => options.onLongRunning?.(ctx))
-        .catch((err) => {
-          console.error(
-            `[RequestContext ${requestId}] onLongRunning threw:`,
-            err,
-          );
-        });
-    }, heartbeatMs);
+    const rawRepeatMs = config.HANDLER_PROGRESS_UPDATE_INTERVAL_MS;
+    const repeatMs = Number.isFinite(rawRepeatMs) && rawRepeatMs > 0
+      ? Math.max(1_000, rawRepeatMs)
+      : 0;
+    const scheduleProgress = (delayMs: number): void => {
+      ctx.heartbeatTimer = setTimeout(() => {
+        // Heartbeats never finalize. Terminal states are cleared by dispose;
+        // this check also protects against timer/callback races.
+        if (ctx.state !== HandlerState.WAITING && ctx.state !== HandlerState.LONG_RUNNING) return;
+        ctx.state = HandlerState.LONG_RUNNING;
+        ctx.longRunningNotified = true;
+        ctx.progressUpdateCount += 1;
+        Promise.resolve()
+          .then(() => options.onLongRunning?.(ctx))
+          .catch((err) => {
+            console.error(
+              `[RequestContext ${requestId}] onLongRunning threw:`,
+              err,
+            );
+          })
+          .finally(() => {
+            if (
+              repeatMs > 0 &&
+              ctx.state === HandlerState.LONG_RUNNING &&
+              Date.now() + repeatMs < ctx.deadline_ms
+            ) {
+              scheduleProgress(repeatMs);
+            }
+          });
+      }, delayMs);
+    };
+    scheduleProgress(heartbeatMs);
   }
 
   registerRequestContext(ctx);

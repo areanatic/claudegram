@@ -90,8 +90,8 @@ export { fmtTokens, getProgressBar } from './post-agent.js';
  * Build the standard onLongRunning / onHardCap callbacks for a Telegram-context
  * RequestContext. Mai-Intervention Phase C.1 / V2.5-1.
  *
- * onLongRunning sends ONE non-finalizing heartbeat. The agent stream keeps
- * running; this is purely UX.
+ * onLongRunning sends non-finalizing progress updates at the bounded cadence
+ * owned by RequestContext. The agent stream keeps running; this is purely UX.
  *
  * onHardCap is invoked AFTER finalizeOnce has been won by the timer and AFTER
  * gracefulCancel has been issued. It sends the user-facing timeout reply.
@@ -103,8 +103,11 @@ function buildContextCallbacks(ctx: Context): {
   onHardCap: (reqCtx: RequestContext) => Promise<void>;
 } {
   const onLongRunning = async (reqCtx: RequestContext): Promise<void> => {
-    const msg = config.HANDLER_LONG_RUNNING_MESSAGE;
-    if (!msg) return;
+    if (!config.HANDLER_LONG_RUNNING_MESSAGE) return;
+    const elapsedMinutes = Math.max(1, Math.floor((Date.now() - reqCtx.startTime_ms) / 60_000));
+    const msg = reqCtx.progressUpdateCount <= 1
+      ? config.HANDLER_LONG_RUNNING_MESSAGE
+      : `🔄 Zwischenstand nach ${elapsedMinutes} Min.: Ich arbeite weiter und melde das Ergebnis hier, sobald der laufende Schritt fertig ist.`;
     // QUIET MODE (2026-06-05): user muted progress nudges for this chat via /quiet.
     // The agent stream keeps running; we just skip the "🐌 brauche länger" heartbeat.
     if (isQuiet(reqCtx.sessionKey)) return;
