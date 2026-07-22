@@ -88,6 +88,7 @@ import {
   runCodex,
   setEngineSelection,
 } from '../../engines/engine.js';
+import { codexFailureMessage, engineUnavailableMessage } from '../../engines/recovery.js';
 import { buildWhereAreWe, sendProactiveRecall } from '../../memory/proactive-recall.js';
 import { openTaskActionKeyboard } from '../../telegram/action-buttons.js';
 import { botFamily, formatBotFamilyHealth, readBotFamilyHealth } from '../../crossbot/relay.js';
@@ -1652,7 +1653,9 @@ export async function handleEngine(ctx: Context): Promise<void> {
   // active engine exactly as it was; there is deliberately no fallback.
   const status = await checkEngineAvailability(requested);
   if (!status.available) {
-    await ctx.reply(`Cannot switch to ${requested}: ${status.detail}. Active engine unchanged.`, { parse_mode: undefined });
+    const active = getEngineSelection(sessionKey);
+    console.warn(`[Engine] ${requested} unavailable: ${sanitizeError(status.detail)}`);
+    await ctx.reply(engineUnavailableMessage(requested, active.engine), { parse_mode: undefined });
     return;
   }
   const selection = setEngineSelection(sessionKey, requested, requestedModel);
@@ -1683,8 +1686,8 @@ export async function handleCodex(ctx: Context): Promise<void> {
     const response = await runCodex(model, task, session.workingDirectory);
     await ctx.reply(response.text, { parse_mode: undefined });
   } catch (error) {
-    const detail = error instanceof Error ? error.message : 'unknown error';
-    await ctx.reply(`Codex failed: ${detail}`, { parse_mode: undefined });
+    console.warn(`[Codex] command failed: ${sanitizeError(error)}`);
+    await ctx.reply(codexFailureMessage(), { parse_mode: undefined });
   }
 }
 
