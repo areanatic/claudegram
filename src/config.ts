@@ -3,6 +3,7 @@ import { z } from 'zod';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { resolveVoiceAllowedLanguages } from './audio/voice-language-policy.js';
+import { resolveBotTools, STANDARD_DEFAULT_BOT_TOOLS } from './claude/master-tools.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultEnvPath = path.resolve(__dirname, '..', '.env');
@@ -409,7 +410,7 @@ const envSchema = z.object({
   BOT_MEMORY_PROJECT: z.string().optional(),
   // Tools available to Claude (comma-separated). Master = all, Space-Bots = restricted.
   BOT_TOOLS: z.string()
-    .default('Bash,Read,Write,Edit,Glob,Grep,Task')
+    .default(STANDARD_DEFAULT_BOT_TOOLS.join(','))
     .transform(val => val.split(',').map(s => s.trim())),
   // RI-24 (2026-06-06): hard tool DENY list (deny wins over any allow, even under
   // DANGEROUS_MODE/bypassPermissions — SDK semantics). For person-bots (e.g. Alina/
@@ -506,6 +507,12 @@ if (!parsed.success) {
 
 export const config = {
   ...parsed.data,
+  BOT_TOOLS: resolveBotTools({
+    configuredTools: parsed.data.BOT_TOOLS,
+    explicitlyConfigured: Boolean(process.env.BOT_TOOLS?.trim()),
+    botRole: parsed.data.BOT_ROLE,
+    botName: parsed.data.BOT_NAME,
+  }),
   VOICE_ALLOWED_LANGUAGES: resolveVoiceAllowedLanguages(
     parsed.data.VOICE_ALLOWED_LANGUAGES,
     parsed.data.BOT_ROLE,
