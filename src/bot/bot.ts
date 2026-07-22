@@ -75,6 +75,7 @@ import { handleVideo } from './handlers/video.handler.js';
 import { handleFollowUpCallback } from '../telegram/followup-buttons.js';
 import { handleContextActionCallback, handleLegacyTaskResumeCallback } from '../telegram/action-buttons.js';
 import { startRegistrySweep } from '../handler/request-registry.js';
+import { sanitizeError } from '../utils/sanitize.js';
 
 export const TELEGRAM_COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
 
@@ -433,7 +434,9 @@ export async function createBot(): Promise<Bot> {
 
   // Error handler
   bot.catch((err) => {
-    console.error('Bot error:', err);
+    // Never log grammY's raw BotError: it embeds ctx.api, including the bot
+    // token. Keep only the sanitized top-level message.
+    console.error('Bot error:', sanitizeError(err));
   });
 
   return bot;

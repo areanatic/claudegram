@@ -17,6 +17,18 @@ const { MessageSender, TelegramDeliveryError } = await import('../src/telegram/m
 const relay = await import('../src/crossbot/relay.js');
 const actions = await import('../src/telegram/action-buttons.js');
 const ledger = await import('../src/inbox/task-ledger.js');
+const { sanitizeError } = await import('../src/utils/sanitize.js');
+
+test('P0: persistent error logs redact Telegram credentials and ignore nested context', () => {
+  const token = `123456789:${'A'.repeat(35)}`;
+  const raw = Object.assign(new Error(`request failed with ${token}`), {
+    ctx: { api: { token } },
+  });
+  const safe = sanitizeError(raw);
+  assert.doesNotMatch(safe, /123456789:/);
+  assert.match(safe, /<redacted-telegram-token>/);
+  assert.doesNotMatch(safe, /ctx|api/);
+});
 
 test('P0: unconfirmed Telegram sends reject instead of being silently accepted', async () => {
   const sender = new MessageSender();
