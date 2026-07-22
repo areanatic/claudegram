@@ -135,6 +135,9 @@ async function main() {
   // that might exclude callback_query (inline button presses).
   const runner = run(bot, {
     runner: {
+      // getUpdates failures are classified and sampled by the API transformer
+      // in createBot(); suppress the runner's unconditional duplicate dump.
+      silent: true,
       fetch: {
         allowed_updates: [
           'message',

@@ -76,6 +76,7 @@ import { handleFollowUpCallback } from '../telegram/followup-buttons.js';
 import { handleContextActionCallback, handleLegacyTaskResumeCallback } from '../telegram/action-buttons.js';
 import { startRegistrySweep } from '../handler/request-registry.js';
 import { sanitizeError } from '../utils/sanitize.js';
+import { observePollingFailure } from '../telegram/polling-observability.js';
 
 export const TELEGRAM_COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
 
@@ -128,6 +129,17 @@ export async function createBot(): Promise<Bot> {
     },
   };
   const bot = new Bot(config.TELEGRAM_BOT_TOKEN, botOptions);
+  // @grammyjs/runner otherwise prints two full error lines for every expected
+  // long-poll timeout. Observe at the API seam so the runner can stay silent
+  // while actionable failures remain visible and sanitized.
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    try {
+      return await prev(method, payload, signal);
+    } catch (error) {
+      if (method === 'getUpdates') observePollingFailure(error);
+      throw error;
+    }
+  });
 
   if (config.TELEGRAM_API_SERVER_URL) {
     console.log(`📡 Using local Telegram API server: ${config.TELEGRAM_API_SERVER_URL}`);
