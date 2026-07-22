@@ -7,6 +7,7 @@ import { resumeOpenTask } from '../inbox/task-resume.js';
 import { cancelCalendarBulk, confirmCalendarBulk, configuredCalendarBulkExecutor, getCalendarBulkJob } from '../calendar/bulk.js';
 import { executeFollowUpText } from './followup-buttons.js';
 import type { Bot } from 'grammy';
+import { sanitizeError } from '../utils/sanitize.js';
 
 /** Telegram permits at most 64 UTF-8 bytes of callback_data. */
 export const CALLBACK_DATA_MAX_BYTES = 64;
@@ -32,6 +33,21 @@ interface StoredAction {
   action: RegisteredAction;
   state: 'ready' | 'running' | 'done';
   createdAt: number;
+}
+
+async function answerCallbackSafely(
+  ctx: Pick<Context, 'answerCallbackQuery'>,
+  payload?: Parameters<Context['answerCallbackQuery']>[0],
+): Promise<boolean> {
+  try {
+    await ctx.answerCallbackQuery(payload);
+    return true;
+  } catch (error) {
+    // The callback update is already in our hands. A Telegram ACK timeout must
+    // not prevent the idempotently claimed server-side action from executing.
+    console.warn('[ContextAction] callback acknowledgement failed:', sanitizeError(error));
+    return false;
+  }
 }
 
 /**
@@ -66,22 +82,22 @@ export class ContextActionRouter {
     const token = data.slice(CALLBACK_PREFIX.length);
     const stored = this.actions.get(token);
     if (!stored) {
-      await ctx.answerCallbackQuery({ text: 'Diese Aktion ist abgelaufen.' });
+      await answerCallbackSafely(ctx, { text: 'Diese Aktion ist abgelaufen.' });
       return true;
     }
     const userId = ctx.from?.id;
     const chatId = ctx.chat?.id ?? ctx.callbackQuery?.message?.chat.id;
     if (!userId || !config.ALLOWED_USER_IDS.includes(userId) || userId !== stored.action.userId || chatId !== stored.action.chatId) {
-      await ctx.answerCallbackQuery({ text: 'Nicht berechtigt.' });
+      await answerCallbackSafely(ctx, { text: 'Nicht berechtigt.' });
       return true;
     }
     if (stored.state !== 'ready') {
-      await ctx.answerCallbackQuery({ text: 'Aktion wurde bereits verarbeitet.' });
+      await answerCallbackSafely(ctx, { text: 'Aktion wurde bereits verarbeitet.' });
       return true;
     }
 
     stored.state = 'running';
-    await ctx.answerCallbackQuery({ text: 'Aktion wird ausgeführt.' });
+    await answerCallbackSafely(ctx, { text: 'Aktion wird ausgeführt.' });
     try {
       await execute(stored.action);
       stored.state = 'done';
@@ -252,7 +268,7 @@ export async function handleLegacyTaskResumeCallback(ctx: Context, bot: Bot): Pr
   const userId = ctx.from?.id;
   const task = Number.isSafeInteger(taskId) && taskId > 0 ? getOpenTask(taskId) : null;
   if (!task || !userId || !chatId || task.chatId !== chatId) {
-    await ctx.answerCallbackQuery({ text: 'Ungültiger oder nicht verfügbarer Auftrag.' });
+    await answerCallbackSafely(ctx, { text: 'Ungültiger oder nicht verfügbarer Auftrag.' });
     return true;
   }
   const routed = contextActionRouter.register({

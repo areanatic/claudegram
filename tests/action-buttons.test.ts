@@ -77,6 +77,22 @@ test('double click is idempotent and each callback is answered', async () => {
   assert.match(second.answers[0]?.text ?? '', /bereits verarbeitet/);
 });
 
+test('a Telegram callback ACK timeout does not strand or skip the claimed action', async () => {
+  const router = new ContextActionRouter();
+  const data = router.register({ type: 'text', text: 'GO', userId: 1, chatId: 9, sessionKey: '9' });
+  const failedAck = callbackContext(1, 9, data);
+  failedAck.ctx.answerCallbackQuery = async () => { throw new Error("Request to 'answerCallbackQuery' timed out"); };
+  let executions = 0;
+
+  assert.equal(await router.handle(failedAck.ctx as never, async () => { executions++; }), true);
+  assert.equal(executions, 1, 'the server-side action still executes exactly once');
+
+  const retry = callbackContext(1, 9, data);
+  await router.handle(retry.ctx as never, async () => { executions++; });
+  assert.equal(executions, 1, 'a second click cannot duplicate the action');
+  assert.match(retry.answers[0]?.text ?? '', /bereits verarbeitet/);
+});
+
 test('callback data remains below Telegram’s 64-byte limit even for a long server payload', () => {
   const router = new ContextActionRouter();
   const data = router.register({
