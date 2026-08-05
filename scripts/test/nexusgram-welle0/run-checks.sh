@@ -8,11 +8,36 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 EXPECTED_MCP_JSON="${WELLE0_EXPECTED_MCP_JSON:-$SCRIPT_DIR/expected-master-mcp.json}"
 ACCOUNTS_JSON="${WELLE0_ACCOUNTS_JSON:-$REPO_ROOT/../../../scripts/dirigent/mail/localsync/config/accounts.json}"
 PYTHON_BIN="${WELLE0_PYTHON:-python3}"
+export WELLE0_PYTHON="$PYTHON_BIN"
 MASTER_BOT_USERNAME="${WELLE0_MASTER_TEST_BOT_USERNAME:-}"
 PERSON_BOT_USERNAME="${WELLE0_PERSON_TEST_BOT_USERNAME:-}"
 PERSON_ALLOWED_ACCOUNT="${WELLE0_PERSON_ALLOWED_ACCOUNT:-pizdec}"
 TESTBOT_PID_CMD="${WELLE0_TESTBOT_PID_CMD:-${WELLE0_MASTER_PID_CMD:-}}"
 RESTART_CMD="${WELLE0_RESTART_CMD:-}"
+
+# shellcheck source=welle0-lib.sh
+source "$SCRIPT_DIR/welle0-lib.sh"
+
+# Evidence is append-only by construction: reserve a fresh log/meta pair before
+# any check runs, and suffix a collision instead of overwriting a prior run.
+RUN_EPOCHSECONDS="${EPOCHSECONDS:-$(date +%s)}"
+EVIDENCE_DIR="${WELLE0_EVIDENCE_DIR:-$SCRIPT_DIR/evidence}"
+EVIDENCE_STEM="${WELLE0_EVIDENCE_STEM:-welle0-$RUN_EPOCHSECONDS}"
+if ! welle0_reserve_evidence_paths "$EVIDENCE_DIR" "$EVIDENCE_STEM"; then
+  printf 'refusing to run without a fresh immutable Welle-0 evidence path\n' >&2
+  exit 70
+fi
+if [ ! -f "$EXPECTED_MCP_JSON" ]; then
+  printf 'refusing to run: contract missing before evidence metadata: %s\n' "$EXPECTED_MCP_JSON" >&2
+  exit 66
+fi
+HARNESS_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)" || exit 65
+CONTRACT_SHA256="$(shasum -a 256 "$EXPECTED_MCP_JSON" | awk '{print $1}')" || exit 65
+printf '{\n  "harness_git_commit": "%s",\n  "contract_sha256": "%s",\n  "epochseconds": "%s"\n}\n' \
+  "$HARNESS_COMMIT" "$CONTRACT_SHA256" "$RUN_EPOCHSECONDS" >> "$WELLE0_EVIDENCE_META"
+trap 'chmod a-w "$WELLE0_EVIDENCE_LOG" "$WELLE0_EVIDENCE_META" 2>/dev/null || true' EXIT
+exec > >(tee -a "$WELLE0_EVIDENCE_LOG") 2>&1
+printf 'Evidence: log=%s meta=%s\n' "$WELLE0_EVIDENCE_LOG" "$WELLE0_EVIDENCE_META"
 
 pass=0; fail=0; skip=0
 report() {
@@ -25,21 +50,8 @@ need_file() {
   [ -f "$1" ] || { report SKIP "$2" "missing file: $1"; return 1; }
 }
 
-# run-turn output may carry library warnings on stderr before the JSON line
-# (e.g. pyrofork's "TgCrypto is missing!"). Parsing the WHOLE output as JSON
-# then fails and every probe reads as FAIL even when the bot answered
-# (2026-08-05: all six live checks red from exactly this). Always extract the
-# LAST parseable JSON line instead.
 json_field() {
-  "$PYTHON_BIN" -c 'import json,sys
-field = sys.argv[1]; fallback = sys.argv[2]
-value = fallback
-for line in sys.stdin.read().splitlines():
-    line = line.strip()
-    if line.startswith("{"):
-        try: value = json.loads(line).get(field, fallback)
-        except Exception: pass
-print(value)' "$1" "$2"
+  welle0_json_field "$1" "$2"
 }
 
 turn() {
@@ -56,6 +68,7 @@ turn_expect_silence() {
   [ -n "$bot" ] || return 2
   output="$($PYTHON_BIN "$SCRIPT_DIR/run-turn.py" --bot "$bot" --message "$message" --timeout 12 --expect-silence 2>&1)"
   status="$(printf '%s' "$output" | json_field status FAIL)"
+  printf '%s' "$output"
   case "$status" in PASS) return 0;; SKIP) return 2;; *) return 1;; esac
 }
 
@@ -76,26 +89,14 @@ if need_file "$EXPECTED_MCP_JSON" "mcp-inventory" && need_file "$ACCOUNTS_JSON" 
   # observed MCP snapshot. A bounded persisted probe is therefore required.
   if inventory="$(turn "$MASTER_BOT_USERNAME" '/brief WELLE0 MCP inventory probe')"; then
     reply="$(printf '%s' "$inventory" | json_reply)"
-    if printf '%s' "$reply" | "$PYTHON_BIN" -c 'import json, re, sys
-expected = json.load(open(sys.argv[1]))
-reply = sys.stdin.read()
-# Every expected server must be named verbatim. Tools may be proven either by
-# verbatim name (old /brief format) or by a per-server live count that covers
-# the expected tool count ("nexus-mail=16" in the current /brief format).
-missing = [server for server in expected.get("servers", []) if server not in reply]
-counts = dict((m.group(1), int(m.group(2))) for m in re.finditer(r"([A-Za-z0-9_-]+)=(\d+)", reply))
-per_server = {}
-for tool in expected.get("tools", []):
-    server = tool.split("__")[1] if tool.count("__") >= 2 else ""
-    per_server.setdefault(server, []).append(tool)
-for server, tools in per_server.items():
-    named = all(tool in reply for tool in tools)
-    counted = counts.get(server, -1) >= len(tools)
-    if not (named or counted):
-        missing.append(f"{server}: {len(tools)} tools weder namentlich noch per Count belegt")
-raise SystemExit(1 if missing else 0)' "$EXPECTED_MCP_JSON"
-    then report PASS "mcp-inventory" "all expected servers/tools reported by the test bot";
-    else report FAIL "mcp-inventory" "expected server/tool missing from observed /brief response"; fi
+    # Counts are deliberately insufficient: a same-count tool replacement is a
+    # regression. Require affirmative connection context for every server plus
+    # either the exact sorted tool sequence or the contract's SHA-256 proof.
+    if printf '%s' "$reply" | welle0_check_mcp_inventory "$EXPECTED_MCP_JSON"; then
+      report PASS "mcp-inventory" "connected servers plus exact tool set or tools_sha256 match";
+    else
+      report FAIL "mcp-inventory" "missing affirmative server context or exact tool/hash contract";
+    fi
   else
     code=$?; [ "$code" -eq 2 ] && report SKIP "mcp-inventory" "test-bot/MTProto environment not configured" || report FAIL "mcp-inventory" "test bot did not return a usable inventory"
   fi

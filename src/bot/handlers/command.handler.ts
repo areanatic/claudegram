@@ -20,6 +20,7 @@ import {
 import { buildCatalog, findEntry, scopeCatalogForRole, SUPPORTED_EFFORTS, isEffortLevel } from '../../engines/model-catalog.js';
 import { getStoredSelection, setStoredSelection } from '../../engines/selection-store.js';
 import { occupancyTokens } from '../../claude/context-pressure.js';
+import { mcpToolsSha256 } from '../../claude/capability-health.js';
 import { config, isMasterBot } from '../../config.js';
 import { userFacingFailure } from '../person-policy.js';
 import { getBotEffectivenessHealth } from '../../health/bot-health.js';
@@ -1289,12 +1290,14 @@ export async function handleBrief(ctx: Context): Promise<void> {
   // event. Configuration alone is not evidence that an MCP process connected.
   const mcpInventory = getLastMcpInventory(sessionKey);
   const capabilityHealth = mcpInventory?.capabilityHealth;
+  const mcpToolsHash = mcpInventory ? mcpToolsSha256(mcpInventory.tools) : null;
   const md = escapeTelegramMarkdown;
   const formatCapabilityNames = (names: readonly string[]) => names.map(md).join(', ');
   const capabilityLines = mcpInventory
     ? [
         `- Letzter Agent-Start (${md(mcpInventory.observedAt.slice(0, 16).replace('T', ' '))} UTC): ${capabilityHealth?.connectedServers.length ? `verbundene MCP-Server: ${formatCapabilityNames(capabilityHealth.connectedServers)}` : 'keine verbundenen MCP-Server gemeldet'}`,
         `- MCP-Werkzeuge live: ${capabilityHealth?.totalMcpTools ?? 0}; pro Server: ${Object.entries(capabilityHealth?.toolCountByServer ?? {}).map(([server, count]) => `${md(server)}=${count}`).join(', ') || 'keine gemeldet'}`,
+        `- MCP-Toolnamen SHA256 (sortiert): ${mcpToolsHash ?? 'keine gemeldet'}`,
         `- Mail-Konten: lokal ${capabilityHealth?.localMailAccountCount ?? 'unbekannt'}; Master gesamt ${capabilityHealth?.totalMasterMailAccountCount ?? 'unbekannt'} (inkl. ${md('mastor.prime')} nur bei ${md('workspace-google-rw')}-Verbindung)`,
         ...(capabilityHealth?.missingServers.length
           ? [`- ⚠️ WARNUNG: Soll-MCP fehlt oder ist nicht verbunden: ${formatCapabilityNames(capabilityHealth.missingServers)}`]

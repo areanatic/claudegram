@@ -1,0 +1,2 @@
+# Immutable local evidence is generated per acceptance run, never source code.
+evidence/

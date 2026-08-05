@@ -6,6 +6,8 @@
  * the model guess that a capability exists.
  */
 
+import { createHash } from 'node:crypto';
+
 export const MASTER_REQUIRED_MCP_SERVERS = [
   'nexusgram-tools',
   'nexus-mail',
@@ -38,6 +40,17 @@ export function countMcpToolsByServer(
   return counts;
 }
 
+/**
+ * Stable proof for the complete observed MCP tool set.  The trailing newline
+ * intentionally matches the Welle-0 contract generator's canonical format.
+ */
+export function mcpToolsSha256(tools: readonly string[]): string {
+  const sortedMcpTools = [...new Set(tools.filter((tool) => tool.startsWith('mcp__')))].sort();
+  return createHash('sha256')
+    .update(`${sortedMcpTools.join('\n')}\n`, 'utf8')
+    .digest('hex');
+}
+
 export function evaluateMcpCapabilityHealth(input: {
   isMasterBot: boolean;
   servers: readonly ObservedMcpServer[];
@@ -65,4 +78,3 @@ export function evaluateMcpCapabilityHealth(input: {
       : input.localMailAccountCount + (workspaceConnected ? 1 : 0),
   };
 }
-
