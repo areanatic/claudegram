@@ -36,12 +36,34 @@ async def main() -> int:
     client = Client(session, api_id=api_id, api_hash=api_hash, workdir=workdir)
     reply = ""
     changed = 0.0
+    any_activity = ""  # silence checks: even a thinking placeholder is a violation
+
+    # Streaming bots first post a thinking placeholder and then EDIT it into the
+    # real answer (memory: feedback-pyrogram-streaming-edit-detection). The
+    # placeholder must never count as the reply, or every slow turn "settles" on
+    # "Denke nach..." and content checks fail against the wrong text.
+    def is_placeholder(text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return True
+        if "denke nach" in stripped.lower():
+            return True
+        return stripped[0] in "◐◓◑◒⏳…"
+
+    # The bot may answer across SEVERAL messages (streamed answer bubble plus a
+    # separate "⏱ 8s" timing footer). Capturing only the newest message hands
+    # the content checks the footer instead of the answer — collect every
+    # non-placeholder bot message of this turn, keyed by message id.
+    parts: dict[int, str] = {}
 
     async def record(_client, message):
-        nonlocal reply, changed
+        nonlocal reply, changed, any_activity
         text = (message.text or message.caption or "").strip()
         if text:
-            reply = text
+            any_activity = text
+        if text and not is_placeholder(text):
+            parts[message.id] = text
+            reply = "\n".join(parts[key] for key in sorted(parts))
             changed = time.monotonic()
 
     handler_filter = filters.chat(args.bot) & filters.bot
@@ -53,10 +75,10 @@ async def main() -> int:
         await client.send_message(args.bot, args.message)
         while time.monotonic() - started < args.timeout:
             await asyncio.sleep(0.5)
-            if args.expect_silence and reply:
-                print(json.dumps({"status": "FAIL", "reason": "unexpected bot reply"}))
+            if args.expect_silence and any_activity:
+                print(json.dumps({"status": "FAIL", "reason": "unexpected bot reply", "reply": any_activity}, ensure_ascii=False))
                 return 1
-            if reply and time.monotonic() - changed >= 4:
+            if reply and time.monotonic() - changed >= 6:
                 print(json.dumps({"status": "PASS", "reply": reply}, ensure_ascii=False))
                 return 0
         if args.expect_silence:

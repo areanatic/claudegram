@@ -25,13 +25,28 @@ need_file() {
   [ -f "$1" ] || { report SKIP "$2" "missing file: $1"; return 1; }
 }
 
+# run-turn output may carry library warnings on stderr before the JSON line
+# (e.g. pyrofork's "TgCrypto is missing!"). Parsing the WHOLE output as JSON
+# then fails and every probe reads as FAIL even when the bot answered
+# (2026-08-05: all six live checks red from exactly this). Always extract the
+# LAST parseable JSON line instead.
+json_field() {
+  "$PYTHON_BIN" -c 'import json,sys
+field = sys.argv[1]; fallback = sys.argv[2]
+value = fallback
+for line in sys.stdin.read().splitlines():
+    line = line.strip()
+    if line.startswith("{"):
+        try: value = json.loads(line).get(field, fallback)
+        except Exception: pass
+print(value)' "$1" "$2"
+}
+
 turn() {
   local bot="$1" message="$2" output status
   [ -n "$bot" ] || return 2
   output="$($PYTHON_BIN "$SCRIPT_DIR/run-turn.py" --bot "$bot" --message "$message" 2>&1)"
-  status="$(printf '%s' "$output" | "$PYTHON_BIN" -c 'import json,sys
-try: print(json.load(sys.stdin).get("status", "FAIL"))
-except Exception: print("FAIL")')"
+  status="$(printf '%s' "$output" | json_field status FAIL)"
   printf '%s' "$output"
   case "$status" in PASS) return 0;; SKIP) return 2;; *) return 1;; esac
 }
@@ -40,16 +55,12 @@ turn_expect_silence() {
   local bot="$1" message="$2" output status
   [ -n "$bot" ] || return 2
   output="$($PYTHON_BIN "$SCRIPT_DIR/run-turn.py" --bot "$bot" --message "$message" --timeout 12 --expect-silence 2>&1)"
-  status="$(printf '%s' "$output" | "$PYTHON_BIN" -c 'import json,sys
-try: print(json.load(sys.stdin).get("status", "FAIL"))
-except Exception: print("FAIL")')"
+  status="$(printf '%s' "$output" | json_field status FAIL)"
   case "$status" in PASS) return 0;; SKIP) return 2;; *) return 1;; esac
 }
 
 json_reply() {
-  "$PYTHON_BIN" -c 'import json,sys
-try: print(json.load(sys.stdin).get("reply", ""))
-except Exception: print("")'
+  json_field reply ""
 }
 
 if NEXUSGRAM_ENV_PATH="$SCRIPT_DIR/nonexistent-test.env" \
@@ -65,10 +76,23 @@ if need_file "$EXPECTED_MCP_JSON" "mcp-inventory" && need_file "$ACCOUNTS_JSON" 
   # observed MCP snapshot. A bounded persisted probe is therefore required.
   if inventory="$(turn "$MASTER_BOT_USERNAME" '/brief WELLE0 MCP inventory probe')"; then
     reply="$(printf '%s' "$inventory" | json_reply)"
-    if printf '%s' "$reply" | "$PYTHON_BIN" -c 'import json, sys
+    if printf '%s' "$reply" | "$PYTHON_BIN" -c 'import json, re, sys
 expected = json.load(open(sys.argv[1]))
 reply = sys.stdin.read()
-missing = [value for group in ("servers", "tools") for value in expected.get(group, []) if value not in reply]
+# Every expected server must be named verbatim. Tools may be proven either by
+# verbatim name (old /brief format) or by a per-server live count that covers
+# the expected tool count ("nexus-mail=16" in the current /brief format).
+missing = [server for server in expected.get("servers", []) if server not in reply]
+counts = dict((m.group(1), int(m.group(2))) for m in re.finditer(r"([A-Za-z0-9_-]+)=(\d+)", reply))
+per_server = {}
+for tool in expected.get("tools", []):
+    server = tool.split("__")[1] if tool.count("__") >= 2 else ""
+    per_server.setdefault(server, []).append(tool)
+for server, tools in per_server.items():
+    named = all(tool in reply for tool in tools)
+    counted = counts.get(server, -1) >= len(tools)
+    if not (named or counted):
+        missing.append(f"{server}: {len(tools)} tools weder namentlich noch per Count belegt")
 raise SystemExit(1 if missing else 0)' "$EXPECTED_MCP_JSON"
     then report PASS "mcp-inventory" "all expected servers/tools reported by the test bot";
     else report FAIL "mcp-inventory" "expected server/tool missing from observed /brief response"; fi
