@@ -285,6 +285,12 @@ export interface AgentOptions {
    * to the old behaviour.
    */
   currentInputLogRowId?: number | null;
+  /**
+   * Memory rows created from this same turn before agent dispatch. They remain
+   * durable for future turns but are excluded from all current-turn recall
+   * surfaces so the model cannot mistake its fresh input mirror for history.
+   */
+  excludeMemoryIds?: readonly number[];
 }
 
 interface LoopOptions extends AgentOptions {
@@ -819,6 +825,7 @@ export async function sendToAgent(
       allowOperatorFiles: isMasterBot && !sessionIsPrivateForRecall,
     },
     policy: recallPolicy,
+    excludeMemoryIds: options.excludeMemoryIds,
   });
   let recallModelFallbackPrompt = '';
   if (recallResult) {
@@ -1284,6 +1291,7 @@ export async function sendToAgent(
       const server = createNexusgramMcpServer({
         telegramCtx: options.telegramCtx,
         sessionKey,
+        excludeMemoryIds: options.excludeMemoryIds,
       });
       mcpServers['nexusgram-tools'] = server;
     }
@@ -1338,6 +1346,7 @@ export async function sendToAgent(
       config.BOT_MEMORY_PROJECT,
       false,
       isMasterBot ? undefined : memoryBotId(),
+      options.excludeMemoryIds,
     );
     // Load previous day's transcript for context continuity (only on fresh sessions)
     const previousDayContext = existingSessionId ? '' : loadPreviousDayTranscript(sessionKey);

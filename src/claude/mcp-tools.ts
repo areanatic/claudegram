@@ -59,6 +59,8 @@ async function importTelegraph() {
 export interface McpToolsContext {
   telegramCtx: Context;
   sessionKey: string;
+  /** Current-turn voice memory rows that must not be returned as history. */
+  excludeMemoryIds?: readonly number[];
 }
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -880,6 +882,7 @@ function nexusMemorySearchTool(toolsCtx: McpToolsContext) {
         const hits = searchMemoryReadOnly(query, limit ?? 5, effectiveProject, {
           policy: effectivePolicy,
           originBot: personScope ? memoryBotId() : undefined,
+          excludeMemoryIds: toolsCtx.excludeMemoryIds,
         });
         if (hits.length === 0) {
           return {
@@ -948,6 +951,7 @@ function nexusMemoryRecentTool(toolsCtx: McpToolsContext) {
         const hits = recentMemoriesReadOnly(limit ?? 5, effectiveProject, {
           policy: effectivePolicy,
           originBot: personScope ? memoryBotId() : undefined,
+          excludeMemoryIds: toolsCtx.excludeMemoryIds,
         });
         if (hits.length === 0) {
           return {

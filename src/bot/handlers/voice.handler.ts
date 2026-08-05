@@ -41,6 +41,8 @@ import { tryAutoDispatch } from '../../inbox/input-auto-dispatch.js';
 import { withHardTimeout, HardTimeoutError } from '../../utils/hard-timeout.js';
 import { commitVoiceRecallNonBlocking } from '../../inbox/voice-recall.js';
 import { isPrivate } from '../../memory/privacy-state.js';
+import { recordSuccessfulTurn } from '../../health/bot-health.js';
+import { handleMiniTapVoice } from './voice-mini-tap.js';
 
 export async function handleVoice(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
@@ -73,6 +75,22 @@ export async function handleVoice(ctx: Context): Promise<void> {
     return;
   }
   markProcessed(messageId);
+
+  // Diagnose follow-up (2026-08-05): reject accidental mic taps before
+  // session creation, download, Whisper, RI-28 memory persistence, or agent
+  // execution. The durable input row remains as dropped_reason='mini_tap'.
+  const miniTapHandled = await handleMiniTapVoice(
+    { duration: voice.duration, fileSize: voice.file_size },
+    {
+      markDropped: (reason) => markDropped(inputLogRowId, reason),
+      interruptTask: (reason) => interruptTask(taskLedgerId, reason),
+      reply: (message) => ctx.reply(message, { parse_mode: undefined }),
+    },
+  );
+  if (miniTapHandled) {
+    forgetInputLogRowId(chatId, messageId);
+    return;
+  }
 
   // Dismiss previous follow-up buttons
   await dismissFollowUpButtons(ctx, sessionKey);
@@ -117,6 +135,10 @@ export async function handleVoice(ctx: Context): Promise<void> {
   // outer hard-cap catch can re-dispatch it through the agent (auto-continue)
   // instead of dropping it with "please re-send". null until transcription lands.
   let recoveredTranscript: string | null = null;
+  // RI-28 self-echo exclusion: the current turn's own transcript is persisted
+  // before the agent starts, but its row must not be visible to recall until a
+  // later turn. The id is threaded into every recall surface below.
+  let currentVoiceMemoryId: number | null = null;
   // P0 Seamless-Input (Codex P1-1): the hard-cap onTimeout fires gracefulCancel
   // fire-and-forget and rejects immediately. Capture its promise so the catch can
   // AWAIT the SDK drain BEFORE re-dispatching — otherwise a late-starting mutating
@@ -226,7 +248,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
     // transcript. Mirror it into memories + memories_fts now; the asynchronous
     // Capture-Enrichment path repeats the same idempotent postcondition as a
     // recovery belt, never as a duplicate insert.
-    await commitVoiceRecallNonBlocking({
+    const recallCommit = await commitVoiceRecallNonBlocking({
       chatId: String(chatId),
       messageId,
       botId: (config.BOT_NAME || 'Nexusgram').toLowerCase().replace(/\s+/g, '-'),
@@ -235,6 +257,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
       parentTaskId: taskLedgerId,
       notifyDelayed: (notice) => ctx.reply(notice, { parse_mode: undefined }),
     });
+    currentVoiceMemoryId = recallCommit.memoryId;
 
     // Activate voice-first mode (if enabled in config) and store detected language
     if (config.VOICE_FIRST_MODE_ENABLED) {
@@ -321,6 +344,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
               voiceMode: true,
               telegramCtx: ctx,
               currentInputLogRowId: inputLogRowId,
+              excludeMemoryIds: currentVoiceMemoryId === null ? [] : [currentVoiceMemoryId],
               turnEpoch,
             });
           } else if (getStreamingMode() === 'streaming') {
@@ -336,6 +360,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
                 abortController,
                 telegramCtx: ctx,
                 currentInputLogRowId: inputLogRowId,
+                excludeMemoryIds: currentVoiceMemoryId === null ? [] : [currentVoiceMemoryId],
                 turnEpoch,
               });
             } catch (error) {
@@ -350,6 +375,7 @@ export async function handleVoice(ctx: Context): Promise<void> {
               abortController,
               telegramCtx: ctx,
               currentInputLogRowId: inputLogRowId,
+              excludeMemoryIds: currentVoiceMemoryId === null ? [] : [currentVoiceMemoryId],
               turnEpoch,
             });
           }
@@ -388,6 +414,10 @@ export async function handleVoice(ctx: Context): Promise<void> {
             await messageSender.sendMessage(ctx, response.text);
             await maybeSendVoiceReply(ctx, response.text, { language: detectedLanguage });
           }
+          // A delivered Voice response is a successful turn for health.json,
+          // exactly like the text path. Record it after primary delivery and
+          // before best-effort post-turn UI/context work.
+          recordSuccessfulTurn();
           await sendFollowUpButtons(ctx, sessionKey, response.text, response.buttons);
           // Tier-1: same post-agent work as the text path (usage footer + Bug-A
           // rotation guard + compaction/new-session notices). Voice was guard-blind

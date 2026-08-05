@@ -351,11 +351,14 @@ export function injectContext(
   project?: string,
   includePrivate = false,
   originBot?: string,
+  excludeMemoryIds: readonly number[] = [],
 ): string {
+  const excluded = new Set(excludeMemoryIds);
   const ftsResults = query
-    ? searchMemory(query, 3, project, includePrivate, originBot)
+    ? searchMemory(query, 3, project, includePrivate, originBot).filter((row) => !excluded.has(row.id))
     : [];
-  const recentResults = recentMemories(5, project, includePrivate, originBot);
+  const recentResults = recentMemories(5, project, includePrivate, originBot)
+    .filter((row) => !excluded.has(row.id));
 
   // Deduplicate: recent may overlap with FTS results
   const seenIds = new Set(ftsResults.map(r => r.id));
@@ -415,6 +418,14 @@ export interface MemorySearchOptions {
   /** Fail-closed bot-silo filter. Person-bot recall always sets this; the
    *  operator/master deliberately omits it to search all operator-owned rows. */
   originBot?: string;
+  /** Omit rows written by the current turn; bounded and parameterized below. */
+  excludeMemoryIds?: readonly number[];
+}
+
+function sanitizeExcludedMemoryIds(ids: readonly number[] | undefined): number[] {
+  return Array.from(new Set((ids ?? []).filter(
+    (id): id is number => Number.isSafeInteger(id) && id > 0,
+  ))).slice(0, 32);
 }
 
 export function searchMemoryReadOnly(
@@ -442,6 +453,10 @@ export function searchMemoryReadOnly(
     if (options.originBot && !hasBot) return [];
     const botClause = options.originBot ? 'AND m.bot = ?' : '';
     const botCol = hasBot ? ', m.bot' : '';   // T2(a) additive; absent pre-migration
+    const excludedIds = sanitizeExcludedMemoryIds(options.excludeMemoryIds);
+    const excludeClause = excludedIds.length > 0
+      ? `AND m.id NOT IN (${excludedIds.map(() => '?').join(',')})`
+      : '';
 
     const buildStmt = () => conn!.prepare(`
       SELECT m.content, m.tags, m.project, m.score, m.created_at, m.privacy, m.source${botCol}
@@ -450,6 +465,7 @@ export function searchMemoryReadOnly(
       WHERE memories_fts MATCH ?
       ${projectClause}
       ${botClause}
+      ${excludeClause}
       ${privClause}
       ORDER BY rank
       LIMIT ?
@@ -459,6 +475,7 @@ export function searchMemoryReadOnly(
       const p: unknown[] = [matchExpr];
       if (project) p.push(project);
       if (options.originBot) p.push(options.originBot);
+      p.push(...excludedIds);
       p.push(...privParams);
       p.push(clampedLimit);
       return p;
@@ -566,6 +583,10 @@ export function recentMemoriesReadOnly(
     if (options.originBot && !hasBot) return [];
     const botClause = options.originBot ? 'AND m.bot = ?' : '';
     const botCol = hasBot ? ', m.bot' : '';   // T2(a) additive; absent pre-migration
+    const excludedIds = sanitizeExcludedMemoryIds(options.excludeMemoryIds);
+    const excludeClause = excludedIds.length > 0
+      ? `AND m.id NOT IN (${excludedIds.map(() => '?').join(',')})`
+      : '';
 
     const stmt = conn.prepare(`
       SELECT m.content, m.tags, m.project, m.score, m.created_at${botCol}
@@ -573,6 +594,7 @@ export function recentMemoriesReadOnly(
       WHERE m.archived = 0
       ${projectClause}
       ${botClause}
+      ${excludeClause}
       ${privClause}
       ORDER BY m.created_at DESC, m.id DESC
       LIMIT ?
@@ -580,6 +602,7 @@ export function recentMemoriesReadOnly(
     const params: unknown[] = [];
     if (project) params.push(project);
     if (options.originBot) params.push(options.originBot);
+    params.push(...excludedIds);
     params.push(...privParams);
     params.push(clampedLimit);
 

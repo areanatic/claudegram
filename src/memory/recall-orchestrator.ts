@@ -58,6 +58,8 @@ export interface RecallOptions {
   paths?: Partial<RecallPaths>;
   policy?: MemoryRetrievalPolicy;
   limit?: number;
+  /** Rows written by this same turn are not historical recall evidence yet. */
+  excludeMemoryIds?: readonly number[];
 }
 
 const DEFAULT_DAILY_DIR =
@@ -306,6 +308,7 @@ export function runRecallContract(
       {
         policy,
         originBot: options.scope.kind === 'person' ? options.scope.botId : undefined,
+        excludeMemoryIds: options.excludeMemoryIds,
       },
     );
     evidence = hits
