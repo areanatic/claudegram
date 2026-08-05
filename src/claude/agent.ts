@@ -609,6 +609,31 @@ function stripReasoningSummary(text: string): string {
   return text.replace(/\n*(?:---\n+)?\*{0,2}Reasoning Summary\*{0,2}\s*\n[\s\S]*$/i, '').trimEnd();
 }
 
+/**
+ * Remove Telegram-only response metadata regardless of whether the model puts
+ * the reasoning summary before or after the [BUTTONS: ...] line.
+ *
+ * The prompt asks for buttons to be the absolute last line, but live model
+ * output can append a Reasoning Summary afterwards. Parsing buttons only once
+ * before stripping that summary leaks the raw marker into Telegram and loses
+ * the inline keyboard.
+ */
+export function parseResponseFormatting(text: string): { text: string; buttons: string[] } {
+  // Prompt-compliant order: response -> reasoning summary -> buttons.
+  const buttonsAtEnd = extractButtons(text);
+  if (buttonsAtEnd.buttons.length > 0) {
+    return {
+      text: stripReasoningSummary(buttonsAtEnd.text),
+      buttons: buttonsAtEnd.buttons,
+    };
+  }
+
+  // Live-observed order: response -> buttons -> reasoning summary. Removing
+  // the trailing summary exposes the button marker for a second parse pass.
+  const withoutReasoning = stripReasoningSummary(text);
+  return extractButtons(withoutReasoning);
+}
+
 type LogLevel = 'off' | 'basic' | 'verbose' | 'trace';
 const LOG_LEVELS: Record<LogLevel, number> = {
   off: 0,
@@ -1892,9 +1917,9 @@ export async function sendToAgent(
     chatUsageCache.set(sessionKey, resultUsage);
   }
 
-  const extracted = extractButtons(fullText);
+  const extracted = parseResponseFormatting(fullText);
   return {
-    text: stripReasoningSummary(extracted.text) || 'No response from Claude.',
+    text: extracted.text || 'No response from Claude.',
     toolsUsed,
     buttons: extracted.buttons.length > 0 ? extracted.buttons : undefined,
     usage: resultUsage,
@@ -1998,9 +2023,9 @@ IMPORTANT: When you have fully completed this task, respond with the word "DONE"
     }
   }
 
-  const loopExtracted = extractButtons(combinedText);
+  const loopExtracted = parseResponseFormatting(combinedText);
   return {
-    text: stripReasoningSummary(loopExtracted.text),
+    text: loopExtracted.text,
     toolsUsed: allToolsUsed,
     buttons: loopExtracted.buttons.length > 0 ? loopExtracted.buttons : undefined,
     // RF-6 Latenz-Marker: total loop wall-clock (sum of all iterations), NOT the

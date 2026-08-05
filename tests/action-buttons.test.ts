@@ -10,6 +10,9 @@ process.env.DATA_DIR ||= '/tmp/nexusgram-action-buttons';
 
 const { ContextActionRouter, CALLBACK_DATA_MAX_BYTES } = await import('../src/telegram/action-buttons.js');
 const { filterTelegramCommands } = await import('../src/bot/bot.js');
+const { parseResponseFormatting } = await import('../src/claude/agent.js');
+const { sendFollowUpButtons } = await import('../src/telegram/followup-buttons.js');
+const { MessageSender } = await import('../src/telegram/message-sender.js');
 
 function callbackContext(userId = 1, chatId = 9, data = '') {
   const answers: Array<{ text?: string }> = [];
@@ -101,4 +104,54 @@ test('callback data remains below Telegram’s 64-byte limit even for a long ser
   });
   assert.ok(Buffer.byteLength(data, 'utf8') <= CALLBACK_DATA_MAX_BYTES, `${data} must fit Telegram callback_data`);
   assert.ok(!data.includes('x'.repeat(20)), 'payload must remain server-side');
+});
+
+test('streaming finalization strips live [BUTTONS] markup and sends all inline buttons', async () => {
+  const edits: Array<{ text: string; options?: { reply_markup?: unknown } }> = [];
+  const replies: Array<{ text: string; options?: { reply_markup?: { inline_keyboard: Array<Array<{ text: string }>> } } }> = [];
+  let nextMessageId = 100;
+  const ctx = {
+    from: { id: 1 },
+    chat: { id: 9 },
+    message: { message_id: 1 },
+    api: {
+      sendChatAction: async () => true,
+      editMessageText: async (_chatId: number, _messageId: number, text: string, options?: { reply_markup?: unknown }) => {
+        edits.push({ text, options });
+        return true;
+      },
+      deleteMessage: async () => true,
+    },
+    reply: async (text: string, options?: { reply_markup?: { inline_keyboard: Array<Array<{ text: string }>> } }) => {
+      replies.push({ text, options });
+      return { message_id: nextMessageId++ };
+    },
+  };
+  const rawResponse = [
+    'Die Analyse ist fertig.',
+    '',
+    '[BUTTONS: 🔍 Wer steckt dahinter? | ⚖️ Vergleich mit NEXUS | ⏭ Reicht]',
+    '',
+    'Reasoning Summary',
+    '- Live-Modelle hängen diese Zusammenfassung nach den Buttons an.',
+  ].join('\n');
+
+  const response = parseResponseFormatting(rawResponse);
+  const sender = new MessageSender();
+  await sender.startStreaming(ctx as never);
+  await sender.finishStreaming(ctx as never, response.text);
+  await sendFollowUpButtons(ctx as never, '9', response.text, response.buttons);
+
+  assert.equal(edits.length, 1);
+  assert.equal(edits[0]?.text.trimEnd(), String.raw`Die Analyse ist fertig\.`);
+  assert.doesNotMatch(edits[0]?.text ?? '', /\[BUTTONS:/);
+  assert.doesNotMatch(edits[0]?.text ?? '', /Reasoning Summary/);
+
+  const keyboardReply = replies.find((reply) => reply.options?.reply_markup);
+  const labels = keyboardReply?.options?.reply_markup?.inline_keyboard.flat().map((button) => button.text);
+  assert.deepEqual(labels, [
+    '🔍 Wer steckt dahinter?',
+    '⚖️ Vergleich mit NEXUS',
+    '⏭ Reicht',
+  ]);
 });
