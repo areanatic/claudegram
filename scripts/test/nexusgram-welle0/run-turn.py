@@ -21,6 +21,7 @@ async def main() -> int:
     parser.add_argument("--bot", required=True)
     parser.add_argument("--message", required=True)
     parser.add_argument("--timeout", type=float, default=150)
+    parser.add_argument("--expect-silence", action="store_true")
     args = parser.parse_args()
 
     try:
@@ -52,9 +53,15 @@ async def main() -> int:
         await client.send_message(args.bot, args.message)
         while time.monotonic() - started < args.timeout:
             await asyncio.sleep(0.5)
+            if args.expect_silence and reply:
+                print(json.dumps({"status": "FAIL", "reason": "unexpected bot reply"}))
+                return 1
             if reply and time.monotonic() - changed >= 4:
                 print(json.dumps({"status": "PASS", "reply": reply}, ensure_ascii=False))
                 return 0
+        if args.expect_silence:
+            print(json.dumps({"status": "PASS", "reply": ""}))
+            return 0
         print(json.dumps({"status": "FAIL", "reason": "reply timeout", "reply": reply}, ensure_ascii=False))
         return 1
     finally:

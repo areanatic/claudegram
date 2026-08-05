@@ -857,8 +857,21 @@ export function claimResumableOrphans(): ClaimResult {
     const notifyCutoff = new Date(now - notifyMs).toISOString();
 
     const claim = conn.transaction((): ClaimResult => {
-      // 1. Eligible resumable rows: recent, text, non-empty, public, no mutating
-      //    tool started, attempts left. ASC received_at preserves user order.
+      // 1. Eligible resumable rows: recent, non-empty, public, no mutating tool
+      //    started, no answer delivered, attempts left. ASC preserves user order.
+      //
+      //    ERWEITERT 2026-08-04 nach einem belegten Datenverlust-Erlebnis:
+      //    Zuvor galt `status IN ('received','processing')` UND `input_type = 'text'`.
+      //    Damit fiel eine gescheiterte Voice-Nachricht durch ZWEI Raster gleichzeitig
+      //    (Zeile 982: voice, status=error, 1816 Zeichen Transkript, resume_attempts=0)
+      //    und wurde nie wieder angefasst — obwohl sie die am sichersten wiederholbare
+      //    Klasse ueberhaupt ist: kein Werkzeug hat begonnen, keine Antwort ging raus.
+      //    Jetzt zusaetzlich zugelassen: status='error' und input_type='voice'.
+      //    Das Transkript liegt bei Voice in raw_content, ist also genauso replaybar wie Text.
+      //    NEU als Bedingung: response_sent_at IS NULL — was schon beantwortet wurde,
+      //    darf nie erneut laufen. Der Schutz gegen Doppelausfuehrung bleibt
+      //    `side_effect_tool_started_at IS NULL`: sobald ein mutierendes Werkzeug lief,
+      //    wird NICHT blind wiederholt.
       //    Capped at MAX_BOOT_RESUME per boot.
       const eligible = conn
         .prepare(
@@ -866,13 +879,14 @@ export function claimResumableOrphans(): ClaimResult {
                   raw_content AS rawContent, privacy,
                   received_at AS receivedAt, resume_attempts AS resumeAttempts
              FROM input_log
-            WHERE status IN ('received','processing')
+            WHERE status IN ('received','processing','error')
               AND received_at <= @cutoff AND received_at >= @replayCutoff
-              AND input_type = 'text'
+              AND input_type IN ('text','voice')
               AND raw_content IS NOT NULL AND TRIM(raw_content) <> ''
               AND resume_attempts < @maxAttempts
               AND privacy = 'public'
               AND side_effect_tool_started_at IS NULL
+              AND response_sent_at IS NULL
             ORDER BY received_at ASC
             LIMIT @bootCap`,
         )

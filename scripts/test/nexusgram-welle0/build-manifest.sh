@@ -24,10 +24,38 @@ if [ "${1:-}" = "--write-release" ]; then
       exit 65
       ;;
   esac
+  # Generated dist/release outputs are allowed; every source/config/test path
+  # must still match HEAD. This catches tracked edits and untracked source files.
+  dirty_source="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- . \
+    ':(exclude)dist/**' ':(exclude)releases/**' ':(exclude)node_modules/**')"
+  if [ -n "$dirty_source" ]; then
+    printf 'refusing provenance for dirty source tree\n%s\n' "$dirty_source" >&2
+    exit 65
+  fi
+  commit_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  source_tree_hash="$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}')"
+  artifact_manifest_sha256="$(
+    cd "$release_real"
+    find . -type f ! -name 'BUILD_INFO.json' ! -name '.BUILD_INFO.json.*' -print0 \
+      | LC_ALL=C sort -z \
+      | xargs -0 shasum -a 256 \
+      | shasum -a 256 \
+      | awk '{print $1}'
+  )"
+  role_profile_sha256="$(
+    {
+      git -C "$REPO_ROOT" show HEAD:src/config.ts
+      git -C "$REPO_ROOT" show HEAD:src/bot/bot.ts
+      git -C "$REPO_ROOT" show HEAD:src/bot/person-policy.ts
+    } | shasum -a 256 | awk '{print $1}'
+  )"
   tmp_file="$release_real/.BUILD_INFO.json.$$"
   umask 077
-  printf '{\n  "commit_sha": "%s",\n  "branch": "%s",\n  "built_at": "%s"\n}\n' \
-    "$(git -C "$REPO_ROOT" rev-parse HEAD)" \
+  printf '{\n  "commit_sha": "%s",\n  "source_tree_hash": "%s",\n  "artifact_manifest_sha256": "%s",\n  "role_profile_sha256": "%s",\n  "dirty": false,\n  "branch": "%s",\n  "built_at": "%s"\n}\n' \
+    "$commit_sha" \
+    "$source_tree_hash" \
+    "$artifact_manifest_sha256" \
+    "$role_profile_sha256" \
     "$(git -C "$REPO_ROOT" branch --show-current)" \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$tmp_file"
   mv "$tmp_file" "$release_real/BUILD_INFO.json"
@@ -38,6 +66,7 @@ fi
 printf 'NexusGram Welle-0 build manifest\n'
 printf 'generated_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 printf 'commit_sha=%s\n\n' "$(git -C "$REPO_ROOT" rev-parse HEAD)"
+printf 'source_tree_hash=%s\n\n' "$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}')"
 
 printf '[dist symlinks]\n'
 found=0

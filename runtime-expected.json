@@ -1,0 +1,18 @@
+{
+  "_kommentar": [
+    "Soll-Werte fuer den Laufzeitstand. Wird beim Bot-Start von src/startup/runtime-truth.ts",
+    "gegen den Ist-Zustand verglichen; jede Abweichung landet als Fehlerzeile im Log.",
+    "",
+    "Warum es diese Datei gibt: Der Master lief vom Februar bis zum 28.07.2026 auf der im SDK",
+    "gebuendelten Claude-Code-Engine 2.1.63 (Build 2026-02-28), waehrend lokal 2.1.205 installiert",
+    "war. Das kostete 800k Kontextfenster, die konfigurierte Effort-Stufe und die Kenntnis der",
+    "gepinnten Modell-ID. Es fiel fuenf Monate nicht auf, weil die Version nirgends ausgegeben",
+    "wurde und nichts sie mit einem Erwartungswert verglich.",
+    "",
+    "'engineBuildDateNotBefore' ist bewusst so gesetzt, dass der Februar-Stand ANSCHLAEGT.",
+    "Nach der Engine-Angleichung diesen Wert auf das dann gueltige Build-Datum hochziehen.",
+    "Weglassen eines Feldes = dieser Punkt wird nicht geprueft."
+  ],
+  "engineBuildDateNotBefore": "2026-06-01T00:00:00Z",
+  "model": "claude-opus-4-8"
+}

@@ -14,9 +14,14 @@ import {
   setQuiet,
   isQuiet,
   getLastMcpInventory,
+  getEffort,
+  setEffort,
 } from '../../claude/agent.js';
+import { buildCatalog, findEntry, scopeCatalogForRole, SUPPORTED_EFFORTS, isEffortLevel } from '../../engines/model-catalog.js';
+import { getStoredSelection, setStoredSelection } from '../../engines/selection-store.js';
 import { occupancyTokens } from '../../claude/context-pressure.js';
 import { config, isMasterBot } from '../../config.js';
+import { userFacingFailure } from '../person-policy.js';
 import { getBotEffectivenessHealth } from '../../health/bot-health.js';
 import { messageSender } from '../../telegram/message-sender.js';
 import { getUptimeFormatted } from '../middleware/stale-filter.js';
@@ -1699,38 +1704,86 @@ export async function handleModelCommand(ctx: Context): Promise<void> {
   const text = ctx.message?.text || '';
   const args = text.split(' ').slice(1).join(' ').trim().toLowerCase();
 
-  const validModels = ['sonnet', 'opus', 'haiku'];
-
-  if (!args) {
-    const currentModel = getModel(sessionKey);
-
-    // Show inline keyboard for model selection
-    const keyboard = validModels.map((model) => {
-      const isCurrent = model === currentModel;
-      const label = isCurrent ? `✓ ${model}` : model;
-      return [{ text: label, callback_data: `model:${model}` }];
-    });
-
-    await replyWithMarkdownFallback(
-      ctx,
-      `🤖 *Select Model*\n\n_Current: ${esc(currentModel)}_\n\n• *opus* \\- Most capable \\(default\\)\n• *sonnet* \\- Balanced\n• *haiku* \\- Fast & light`,
-      {
-        parse_mode: 'MarkdownV2',
-        reply_markup: {
-          inline_keyboard: keyboard,
-        },
-      }
-    );
+  // Direktform: /model high  -> nur den Denk-Aufwand setzen
+  if (args && isEffortLevel(args)) {
+    setEffort(sessionKey, args);
+    await replyMd(ctx, `✅ Denk\-Aufwand: *${esc(args)}*`);
     return;
   }
 
-  if (!validModels.includes(args)) {
-    await replyMd(ctx, `❌ Unknown model "${esc(args)}"\\.\n\nAvailable: ${validModels.join(', ')}`);
+  const catalog = scopeCatalogForRole(await buildCatalog(), isMasterBot);
+
+  // Direktform: /model opus | gpt-5.6-sol | qwen3:14b
+  if (args) {
+    const all = [...catalog.claude, ...catalog.codex, ...catalog.local];
+    const hit = all.find((e) => e.model.toLowerCase() === args || e.label.toLowerCase() === args);
+    if (!hit) {
+      await replyMd(ctx, `❌ Unbekannt: "${esc(args)}"\.\n\nOhne Argument zeigt \/model die Auswahl\.`);
+      return;
+    }
+    applySelection(sessionKey, hit);
+    const hint = hit.nativelyKnown ? '' : ' ⚠️ Fallback\-Profil';
+    await replyMd(ctx, `✅ *${esc(hit.label)}* aktiv \(${esc(hit.engine)}\)${hint}`);
     return;
   }
 
-  setModel(sessionKey, args);
-  await replyMd(ctx, `✅ Model set to *${esc(args)}*`);
+  const stored = getStoredSelection(sessionKey);
+  const currentModel = getModel(sessionKey);
+  const currentEffort = getEffort(sessionKey);
+  const currentEngine = stored.engine ?? 'anthropic';
+
+  const row = (e: { id: string; label: string; model: string; nativelyKnown: boolean }) => {
+    const isCurrent = currentEngine === 'anthropic'
+      ? e.model === currentModel
+      : stored.model === e.model;
+    return [{
+      text: `${isCurrent ? '✓ ' : ''}${e.label}${e.nativelyKnown ? '' : ' ⚠️'}`,
+      callback_data: `model:${e.id}`,
+    }];
+  };
+
+  const keyboard = [
+    ...catalog.claude.map(row),
+    ...catalog.codex.map(row),
+    ...catalog.local.map(row),
+    SUPPORTED_EFFORTS.map((lvl) => ({
+      text: lvl === currentEffort ? `✓ ${lvl}` : lvl,
+      callback_data: `effort:${lvl}`,
+    })),
+  ];
+
+  // Klartext statt MarkdownV2. Live gescheitert an: "Character '-' is reserved and must be
+  // escaped" — das Escaping ueberlebt das JS-String-Parsing nicht zuverlaessig, und ein
+  // Menue, das am Bindestrich zerbricht, ist schlimmer als eines ohne Fettschrift.
+  const body = [
+    'Modell und Denk-Aufwand',
+    '',
+    `Aktuell: ${currentModel} · Aufwand: ${currentEffort ?? 'Engine entscheidet'}`,
+    '',
+    `Claude ${catalog.claude.length} · Codex ${catalog.codex.length} · Lokal ${catalog.local.length}`,
+    catalog.localUnavailable ? 'Lokale Modelle gerade nicht erreichbar.' : '',
+    '',
+    'Ein Modell mit Warnzeichen kennt die geladene Engine nicht nativ. Es laeuft trotzdem,',
+    'bekommt aber ein Fallback-Profil (200k Kontext statt 1M).',
+    '',
+    'Unterste Zeile setzt den Denk-Aufwand. Die Auswahl ueberlebt Neustarts.',
+  ].filter(Boolean).join('\n');
+
+  await ctx.reply(body, { reply_markup: { inline_keyboard: keyboard } });
+}
+
+/** Uebernimmt eine Katalog-Auswahl. Eine Stelle fuer Kommando und Callback. */
+function applySelection(
+  sessionKey: string,
+  entry: { engine: 'anthropic' | 'codex' | 'ollama'; model: string },
+): void {
+  if (entry.engine === 'anthropic') {
+    setModel(sessionKey, entry.model);
+    setEngineSelection(sessionKey, 'anthropic', entry.model);
+  } else {
+    setEngineSelection(sessionKey, entry.engine, entry.model);
+    setStoredSelection(sessionKey, { engine: entry.engine, model: entry.model });
+  }
 }
 
 export async function handleModelCallback(ctx: Context): Promise<void> {
@@ -1739,23 +1792,33 @@ export async function handleModelCallback(ctx: Context): Promise<void> {
   const { sessionKey } = keyInfo;
 
   const data = ctx.callbackQuery?.data;
-  if (!data || !data.startsWith('model:')) return;
+  if (!data) return;
 
-  const model = data.replace('model:', '');
-  const validModels = ['sonnet', 'opus', 'haiku'];
-
-  if (!validModels.includes(model)) {
-    await ctx.answerCallbackQuery({ text: 'Invalid model' });
+  if (data.startsWith('effort:')) {
+    const level = data.slice('effort:'.length);
+    if (!isEffortLevel(level)) {
+      await ctx.answerCallbackQuery({ text: 'Unbekannter Aufwand' });
+      return;
+    }
+    setEffort(sessionKey, level);
+    await ctx.answerCallbackQuery({ text: `Aufwand: ${level}` });
+    await ctx.editMessageText(`✅ Denk\-Aufwand: *${esc(level)}*`, { parse_mode: 'MarkdownV2' });
     return;
   }
 
-  setModel(sessionKey, model);
+  if (!data.startsWith('model:')) return;
 
-  await ctx.answerCallbackQuery({ text: `Model set to ${model}!` });
-  await ctx.editMessageText(
-    `✅ Model set to *${esc(model)}*`,
-    { parse_mode: 'MarkdownV2' }
-  );
+  const catalog = scopeCatalogForRole(await buildCatalog(), isMasterBot);
+  const entry = findEntry(catalog, data.slice('model:'.length));
+  if (!entry) {
+    await ctx.answerCallbackQuery({ text: 'Auswahl nicht mehr gueltig' });
+    return;
+  }
+
+  applySelection(sessionKey, entry);
+  await ctx.answerCallbackQuery({ text: `${entry.label} aktiv` });
+  const hint = entry.nativelyKnown ? '' : ' ⚠️ Fallback\-Profil';
+  await ctx.editMessageText(`✅ ${entry.label} aktiv (${entry.engine})${entry.nativelyKnown ? '' : ' ⚠️ Fallback-Profil'}`);
 }
 
 export async function handlePlan(ctx: Context): Promise<void> {
@@ -2983,9 +3046,14 @@ async function transcribeAndSend(
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('[Transcribe] Error:', sanitizeError(error));
     try {
-      await ctx.api.editMessageText(chatId, ackMsg.message_id, `❌ ${errorMessage}`, { parse_mode: undefined });
+      await ctx.api.editMessageText(
+        chatId,
+        ackMsg.message_id,
+        `❌ ${userFacingFailure(errorMessage, isMasterBot)}`,
+        { parse_mode: undefined },
+      );
     } catch {
-      await replyWithMarkdownFallback(ctx, `❌ Transcription error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+      await ctx.reply(`❌ ${userFacingFailure(errorMessage, isMasterBot)}`, { parse_mode: undefined });
     }
   } finally {
     if (tempFilePath && fs.existsSync(tempFilePath)) {
@@ -3606,7 +3674,7 @@ export async function handlePd(ctx: Context): Promise<void> {
       await messageSender.sendMessage(ctx, response.text);
     }).catch(async (error) => {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      await ctx.reply(`Fehler: ${errorMessage}`, { parse_mode: undefined });
+      await ctx.reply(userFacingFailure(errorMessage, isMasterBot), { parse_mode: undefined });
     });
     return;
   }
@@ -3621,7 +3689,7 @@ export async function handlePd(ctx: Context): Promise<void> {
       await messageSender.sendMessage(ctx, response.text);
     }).catch(async (error) => {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      await ctx.reply(`Fehler: ${errorMessage}`, { parse_mode: undefined });
+      await ctx.reply(userFacingFailure(errorMessage, isMasterBot), { parse_mode: undefined });
     });
     return;
   }
@@ -3636,7 +3704,7 @@ export async function handlePd(ctx: Context): Promise<void> {
       await messageSender.sendMessage(ctx, response.text);
     }).catch(async (error) => {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      await ctx.reply(`Fehler: ${errorMessage}`, { parse_mode: undefined });
+      await ctx.reply(userFacingFailure(errorMessage, isMasterBot), { parse_mode: undefined });
     });
     return;
   }
@@ -3652,7 +3720,7 @@ export async function handlePd(ctx: Context): Promise<void> {
     await messageSender.sendMessage(ctx, response.text);
   }).catch(async (error) => {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    await ctx.reply(`Fehler: ${errorMessage}`, { parse_mode: undefined });
+    await ctx.reply(userFacingFailure(errorMessage, isMasterBot), { parse_mode: undefined });
   });
 }
 
@@ -3864,9 +3932,14 @@ export async function executeExtract(ctx: Context, url: string, mode: ExtractMod
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('[extract] Error:', sanitizeError(error));
     try {
-      await ctx.api.editMessageText(chatId, ackMsg.message_id, `\u{274C} ${errorMessage}`, { parse_mode: undefined });
+      await ctx.api.editMessageText(
+        chatId,
+        ackMsg.message_id,
+        `\u{274C} ${userFacingFailure(errorMessage, isMasterBot)}`,
+        { parse_mode: undefined },
+      );
     } catch {
-      await replyWithMarkdownFallback(ctx, `\u{274C} Extraction failed: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+      await ctx.reply(`\u{274C} ${userFacingFailure(errorMessage, isMasterBot)}`, { parse_mode: undefined });
     }
   } finally {
     if (result) {

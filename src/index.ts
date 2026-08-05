@@ -1,3 +1,4 @@
+import { dirname } from 'path';
 import { run } from '@grammyjs/runner';
 import { GrammyError } from 'grammy';
 import { createBot, registerBotCommands } from './bot/bot.js';
@@ -16,6 +17,7 @@ import { clearAllBatchTimers } from './bot/handlers/document.handler.js';
 import { startScannerProWatcher, stopScannerProWatcher } from './scanners/scanner-pro-watcher.js';
 import { startOmiBridgeWatcher, stopOmiBridgeWatcher } from './scanners/omi-bridge-watcher.js';
 import { initializeBotStartup, StartupRetryExhaustedError } from './telegram/startup-retry.js';
+import { reportRuntimeTruth } from './startup/runtime-truth.js';
 import { sendStartupFailureAlert } from './telegram/startup-alert.js';
 import { ensureVoiceRecallSchema } from './inbox/captures-db.js';
 import { startVoiceRecallRetryWorker, stopVoiceRecallRetryWorker } from './inbox/voice-recall.js';
@@ -99,6 +101,15 @@ async function main() {
   startBotHealthHeartbeat(bot);
   console.log(`✅ Bot started as @${bot.botInfo.username}`);
   console.log('📱 Send /start in Telegram to begin');
+
+  // Laufzeitstand sichtbar machen und gegen runtime-expected.json pruefen.
+  // Ohne diese Zeile blieb eine fuenf Monate alte gebuendelte Engine unbemerkt.
+  reportRuntimeTruth({
+    botName: config.BOT_NAME,
+    botRole: config.BOT_ROLE ?? 'unset',
+    model: config.CLAUDE_DEFAULT_MODEL,
+    artifactDir: dirname(process.argv[1] ?? process.cwd()),
+  });
 
   // FIX 6+ Stage 2b (Codex Pattern-B F-04): force eager input-log init at
   // boot, BEFORE any user-input pathway can demand it. Without this the lazy

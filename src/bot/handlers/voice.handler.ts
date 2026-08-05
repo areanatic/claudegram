@@ -2,7 +2,7 @@ import { Context } from 'grammy';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { config } from '../../config.js';
+import { config, isMasterBot } from '../../config.js';
 import {
   sendToAgent,
   CLAUDE_CANCEL_SENTINEL_TEXT,
@@ -29,6 +29,7 @@ import { sendTranscriptResult } from './command.handler.js';
 import { downloadFileSecure, getTelegramFileUrl } from '../../utils/download.js';
 import { sanitizeError, sanitizePath } from '../../utils/sanitize.js';
 import { getSessionKeyFromCtx } from '../../utils/session-key.js';
+import { userFacingFailure } from '../person-policy.js';
 import { sendFollowUpButtons, dismissFollowUpButtons } from '../../telegram/followup-buttons.js';
 import { runPostAgentSuccess } from './post-agent.js';
 import { takeFreshTranscribeReply } from './transcribe-pending.js';
@@ -477,17 +478,18 @@ export async function handleVoice(ctx: Context): Promise<void> {
       try { await messageSender.cancelStreaming(ctx); } catch { /* best-effort */ }
     }
 
-    const plainReply = isHardTimeout;
+    const visibleError = isHardTimeout ? errorMessage : userFacingFailure(errorMessage, isMasterBot);
+    const plainReply = isHardTimeout || !isMasterBot;
     // Try to update ack message with error
     try {
       await ctx.api.editMessageText(
         chatId,
         ackMsg.message_id,
-        `❌ ${errorMessage}`,
+        `❌ ${visibleError}`,
         { parse_mode: undefined }
       );
     } catch {
-      await ctx.reply(plainReply ? errorMessage : `❌ Voice error: ${esc(errorMessage)}`,
+      await ctx.reply(plainReply ? visibleError : `❌ Voice error: ${esc(visibleError)}`,
         plainReply ? { parse_mode: undefined } : { parse_mode: 'MarkdownV2' });
     }
   } finally {
@@ -570,9 +572,14 @@ async function handleTranscribeOnly(
     markError(inputLogRowId, errorMessage.slice(0, 200));
     failTask(taskLedgerId, errorMessage);
     try {
-      await ctx.api.editMessageText(chatId, ackMsg.message_id, `❌ ${errorMessage}`, { parse_mode: undefined });
+      await ctx.api.editMessageText(
+        chatId,
+        ackMsg.message_id,
+        `❌ ${userFacingFailure(errorMessage, isMasterBot)}`,
+        { parse_mode: undefined },
+      );
     } catch {
-      await ctx.reply(`❌ Transcription error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+      await ctx.reply(`❌ ${userFacingFailure(errorMessage, isMasterBot)}`, { parse_mode: undefined });
     }
   } finally {
     if (tempFilePath && fs.existsSync(tempFilePath)) {

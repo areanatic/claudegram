@@ -58,6 +58,7 @@ import {
 } from '../../handler/request-context.js';
 import { recordSuccessfulTurn } from '../../health/bot-health.js';
 import { enqueueRelay, isRestrictedCrossBotCommand, parseMasterRelay } from '../../crossbot/relay.js';
+import { userFacingFailure } from '../person-policy.js';
 
 async function replyFeatureDisabled(ctx: Context, feature: string): Promise<void> {
   await ctx.reply(`⚠️ ${feature} feature is disabled in configuration.`, { parse_mode: undefined });
@@ -473,8 +474,8 @@ export async function handleMessage(ctx: Context): Promise<void> {
     markError(inputLogRowId, errorMessage.slice(0, 200));
     failTask(taskLedgerId, errorMessage);
     try {
-      await ctx.reply(`❌ Error: ${esc(errorMessage)}`, {
-        parse_mode: 'MarkdownV2',
+      await ctx.reply(`❌ ${userFacingFailure(errorMessage, isMasterBot)}`, {
+        parse_mode: undefined,
         reply_markup: taskLedgerId == null ? undefined : taskRetryActionKeyboard(ctx, sessionKey, taskLedgerId),
       });
     } catch (notifyError) {
@@ -760,7 +761,7 @@ export async function handleAgentReply(
       return;
     }
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    await ctx.reply(`❌ Error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+    await ctx.reply(`❌ ${userFacingFailure(errorMessage, isMasterBot)}`, { parse_mode: undefined });
   }
 }
 

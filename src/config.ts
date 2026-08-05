@@ -80,6 +80,16 @@ const envSchema = z.object({
   // explicit privacy review.
   OLLAMA_BASE_URL: z.string().url().default('http://127.0.0.1:11434'),
   CODEX_EXECUTABLE_PATH: z.string().default('codex'),
+  // Zusaetzliche Claude-Modell-IDs fuers /model-Menue, kommagetrennt. Gedacht fuer
+  // Generationen, die der gebuendelten Engine noch unbekannt sind — die IDs werden
+  // durchgereicht und funktionieren, bekommen aber ein Fallback-Faehigkeitsprofil.
+  CLAUDE_EXTRA_MODELS: z.string().default(''),
+  // Auswaehlbare Codex-Profile. Laufen als eigener Prozess, unabhaengig von der Bot-Engine.
+  CODEX_MODELS: z.string().default('gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna'),
+  // Denk-Aufwand fuer Anthropic-Turns. 'max' ist HERAUS: die Laufzeit lehnt es fuer
+  // Claude.ai-Abos ab ("not available for Claude.ai subscribers") und brach damit
+  // am 2026-08-03 jeden Turn ab. Leer = Feld wird nicht gesetzt, Engine entscheidet.
+  CLAUDE_DEFAULT_EFFORT: z.enum(['', 'low', 'medium', 'high']).default(''),
   STREAMING_MODE: z.enum(['streaming', 'wait']).default('streaming'),
   STREAMING_DEBOUNCE_MS: z
     .string()
@@ -342,9 +352,15 @@ const envSchema = z.object({
   // RI-32: automatic replay remains deliberately narrow because a replay can
   // re-run work. User notification is a separate, much wider window so an
   // older interrupted input is never silently discarded after downtime.
+  // 2026-08-04: von 10 auf 30 Minuten. Belegter Fall: eine Voice-Anfrage scheiterte,
+  // der naechste Neustart kam 13 Minuten spaeter — knapp ausserhalb der 10 Minuten,
+  // also fuer immer verloren. 30 Minuten deckt einen normalen Neustart-/Deploy-Zyklus ab.
+  // BEWUSST NICHT groesser: die Invariante aus RI-32 (Test fix-offensive-r4, 1 Stunde alt)
+  // sagt, dass alte Arbeit nur GEMELDET und nicht automatisch wiederholt werden darf —
+  // nach langer Stille kann die Absicht des Nutzers veraltet sein. 30 Min bleibt darunter.
   BOOT_RESUME_REPLAY_WINDOW_MS: z
     .string()
-    .default('600000')
+    .default('1800000')
     .transform((val) => parseInt(val, 10)),
   BOOT_RECOVERY_NOTIFY_WINDOW_MS: z
     .string()

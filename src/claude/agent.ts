@@ -19,6 +19,7 @@ import { setActiveQuery, clearActiveQuery, isCancelled, clearCancelled, graceful
 import { getActiveContextsForSession } from '../handler/request-registry.js';
 import type { Context } from 'grammy';
 import { config, isMasterBot } from '../config.js';
+import { PERSON_SYSTEM_PROMPT } from '../bot/person-policy.js';
 import { AgentWatchdog } from './agent-watchdog.js';
 import { createNexusgramMcpServer } from './mcp-tools.js';
 import {
@@ -50,6 +51,8 @@ import {
   evaluateMcpCapabilityHealth,
   type McpCapabilityHealth,
 } from './capability-health.js';
+import { getStoredSelection, setStoredSelection } from '../engines/selection-store.js';
+import { isEffortLevel, type EffortLevel } from '../engines/model-catalog.js';
 import { buildVoiceCapabilityPrompt, effectiveToolsForVoice, toolBudgetForVoice } from './voice-capabilities.js';
 import { buildMailCalendarRecoveryPrompt } from './mail-calendar-recovery.js';
 
@@ -470,7 +473,11 @@ Der Master kann Aufträge mit „Sag/Schreib/Frag Alina-, Mom- oder Dad-Bot, das
 
 // Person-bot prompts intentionally contain no family registry, command, or
 // foreign-silo explanation. Foreign silos are absent from their model context.
-const BASE_SYSTEM_PROMPT = CORE_GUIDELINES + (isMasterBot ? MASTER_BOT_GLOSSARY_CONSTANT : '') + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING) + FOLLOWUP_BUTTONS_INSTRUCTION + TASK_OWNERSHIP_INSTRUCTION;
+const BASE_SYSTEM_PROMPT = CORE_GUIDELINES
+  + (isMasterBot ? MASTER_BOT_GLOSSARY_CONSTANT : PERSON_SYSTEM_PROMPT)
+  + (config.TELEGRAPH_ENABLED ? TELEGRAPH_FORMATTING : INLINE_FORMATTING)
+  + FOLLOWUP_BUTTONS_INSTRUCTION
+  + TASK_OWNERSHIP_INSTRUCTION;
 
 const REDDIT_TOOL_PROMPT = `
 
@@ -905,7 +912,21 @@ export async function sendToAgent(
 
   // Determine model to use. Single-source resolveModel() so the RUNNING model here
   // == the model getModel() DISPLAYS (INV-02). Default 'sonnet' (fast); Opus on-demand.
-  const effectiveModel = resolveModel(model, chatModels.get(sessionKey), config.CLAUDE_DEFAULT_MODEL);
+  const effectiveModel = resolveModel(
+    model,
+    chatModels.get(sessionKey) ?? getStoredSelection(sessionKey).model,
+    config.CLAUDE_DEFAULT_MODEL,
+  );
+  // Denk-Aufwand fuer diesen Turn. Wird nur gesetzt, wenn ausdruecklich gewaehlt.
+  // isEffortLevel() filtert Werte, die eine frueher gespeicherte Auswahl enthalten kann,
+  // die die Laufzeit heute ablehnt — z.B. 'max', das fuer Claude.ai-Abos nicht verfuegbar
+  // ist und am 2026-08-03 jeden Turn mit Exit 1 abbrechen liess. Eine alte Auswahl darf
+  // den Bot nicht lahmlegen; im Zweifel entscheidet die Engine selbst.
+  const storedEffort = getEffort(sessionKey);
+  const resolvedEffort = storedEffort && isEffortLevel(storedEffort) ? storedEffort : undefined;
+  if (storedEffort && !resolvedEffort) {
+    console.warn(`[Agent] gespeicherter Denk-Aufwand '${storedEffort}' wird nicht mehr unterstuetzt — ignoriert`);
+  }
 
   // Initialize timer for tracking query duration (watchdog created inside try with controller)
   const timer = createAgentTimer();
@@ -1332,6 +1353,9 @@ export async function sendToAgent(
       },
       settingSources: config.BOT_SETTING_SOURCES as SettingSource[],
       model: effectiveModel,
+      // Denk-Aufwand nur setzen, wenn ausdruecklich gewaehlt — sonst entscheidet die
+      // Engine wie bisher. Die gebuendelte 2.1.63 kennt low|medium|high|max.
+      ...(resolvedEffort ? { effort: resolvedEffort } : {}),
       resume: existingSessionId,
       ...(permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
       ...(config.CLAUDE_USE_BUNDLED_EXECUTABLE ? {} : { pathToClaudeCodeExecutable: config.CLAUDE_EXECUTABLE_PATH }),
@@ -2083,12 +2107,31 @@ export function discardCancelledTurnState(sessionKey: string): void {
 
 export function setModel(sessionKey: string, model: string): void {
   chatModels.set(sessionKey, model);
+  // Ueberlebt den Neustart. Vorher lag die Auswahl nur in der Map und fiel still
+  // auf den .env-Default zurueck, ohne dass der Nutzer es erfuhr.
+  setStoredSelection(sessionKey, { engine: 'anthropic', model });
+}
+
+/** Effort fuer diesen Chat: gespeicherte Auswahl, sonst .env-Default, sonst nichts. */
+export function getEffort(sessionKey: string): EffortLevel | undefined {
+  const stored = getStoredSelection(sessionKey).effort;
+  if (stored && isEffortLevel(stored)) return stored;
+  const fallback = config.CLAUDE_DEFAULT_EFFORT;
+  return fallback && isEffortLevel(fallback) ? fallback : undefined;
+}
+
+export function setEffort(sessionKey: string, effort: EffortLevel): void {
+  setStoredSelection(sessionKey, { effort });
 }
 
 export function getModel(sessionKey: string): string {
   // INV-02: SAME resolveModel() source as effectiveModel (sendToAgent) so /status,
   // /botstatus, /model never show a model different from the one actually running.
-  return resolveModel(undefined, chatModels.get(sessionKey), config.CLAUDE_DEFAULT_MODEL);
+  return resolveModel(
+    undefined,
+    chatModels.get(sessionKey) ?? getStoredSelection(sessionKey).model,
+    config.CLAUDE_DEFAULT_MODEL,
+  );
 }
 
 export function clearModel(sessionKey: string): void {

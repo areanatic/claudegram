@@ -144,3 +144,82 @@ test.after(() => {
   ledger.closeTaskLedger();
   fs.rmSync(tmp, { recursive: true, force: true });
 });
+
+test('2026-08-04: eine gescheiterte Voice-Anfrage wird wieder aufgenommen', () => {
+  // Belegter Verlustfall: Zeile 982 war voice + status=error und fiel durch ZWEI Raster
+  // gleichzeitig (`status IN ('received','processing')` und `input_type = 'text'`).
+  // Transkript war vollstaendig da, kein Werkzeug hatte begonnen, keine Antwort ging raus —
+  // die am sichersten wiederholbare Klasse ueberhaupt, und sie wurde nie angefasst.
+  const rowId = inputLog.recordInput({
+    messageId: 982,
+    chatId: 982,
+    sessionKey: '982',
+    inputType: 'voice',
+    rawContent: 'diktierter Auftrag, der beantwortet werden muss',
+    privacy: 'public',
+  });
+  assert.ok(rowId);
+  const conn = new Database(path.join(tmp, 'input-log.db'));
+  const thirteenMinAgo = new Date(Date.now() - 13 * 60 * 1000).toISOString();
+  conn.prepare(
+    "UPDATE input_log SET status='error', dropped_reason='Claude error: process exited with code 1', received_at=?, updated_at=? WHERE id=?",
+  ).run(thirteenMinAgo, thirteenMinAgo, rowId);
+  conn.close();
+
+  const recovery = inputLog.claimResumableOrphans();
+  assert.equal(
+    recovery.resumable.some((row) => row.id === rowId), true,
+    'gescheiterte Voice ohne Nebenwirkung und ohne Antwort MUSS wieder aufgenommen werden',
+  );
+});
+
+test('2026-08-04: eine bereits beantwortete Anfrage wird NIE wiederholt', () => {
+  // Gegenprobe zum Fix: response_sent_at ist der Schutz gegen Doppelantworten.
+  const rowId = inputLog.recordInput({
+    messageId: 983,
+    chatId: 983,
+    sessionKey: '983',
+    inputType: 'voice',
+    rawContent: 'diese Anfrage wurde schon beantwortet',
+    privacy: 'public',
+  });
+  assert.ok(rowId);
+  const conn = new Database(path.join(tmp, 'input-log.db'));
+  const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  conn.prepare(
+    "UPDATE input_log SET status='error', received_at=?, updated_at=?, response_sent_at=? WHERE id=?",
+  ).run(fiveMinAgo, fiveMinAgo, fiveMinAgo, rowId);
+  conn.close();
+
+  const recovery = inputLog.claimResumableOrphans();
+  assert.equal(
+    recovery.resumable.some((row) => row.id === rowId), false,
+    'was schon beantwortet wurde, darf nicht erneut laufen',
+  );
+});
+
+test('2026-08-04: nach begonnener Nebenwirkung wird NICHT blind wiederholt', () => {
+  // Die harte Sicherheitsgrenze bleibt: sobald ein mutierendes Werkzeug lief, ist ein
+  // Replay potenziell eine Doppelausfuehrung (Mail zweimal senden, Datei zweimal schreiben).
+  const rowId = inputLog.recordInput({
+    messageId: 984,
+    chatId: 984,
+    sessionKey: '984',
+    inputType: 'voice',
+    rawContent: 'Auftrag mit Nebenwirkung',
+    privacy: 'public',
+  });
+  assert.ok(rowId);
+  const conn = new Database(path.join(tmp, 'input-log.db'));
+  const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  conn.prepare(
+    "UPDATE input_log SET status='error', received_at=?, updated_at=?, side_effect_tool_started_at=? WHERE id=?",
+  ).run(fiveMinAgo, fiveMinAgo, fiveMinAgo, rowId);
+  conn.close();
+
+  const recovery = inputLog.claimResumableOrphans();
+  assert.equal(
+    recovery.resumable.some((row) => row.id === rowId), false,
+    'nach begonnener Nebenwirkung niemals blind replayen',
+  );
+});

@@ -1,5 +1,7 @@
 import type { Context } from 'grammy';
 import { taskRetryActionKeyboard } from '../../telegram/action-buttons.js';
+import { isMasterBot } from '../../config.js';
+import { userFacingFailure } from '../person-policy.js';
 
 /** Visible lifecycle notices for durable caption jobs. The task itself was
  * already written by task-ledger.middleware before this handler starts. */
@@ -17,7 +19,7 @@ export async function announceMediaTaskFailure(
   reason: string,
 ): Promise<void> {
   const suffix = taskId == null ? '' : ` Auftrag #${taskId} bleibt sichtbar.`;
-  await ctx.reply(`⚠️ Medienauftrag fehlgeschlagen: ${reason}.${suffix}`, {
+  await ctx.reply(`⚠️ ${userFacingFailure(`Medienauftrag fehlgeschlagen: ${reason}.`, isMasterBot)}${suffix}`, {
     parse_mode: undefined,
     ...(taskId == null ? {} : { reply_markup: taskRetryActionKeyboard(ctx, sessionKey, taskId) }),
   });

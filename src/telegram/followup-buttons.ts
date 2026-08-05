@@ -1,5 +1,5 @@
 import { Context } from 'grammy';
-import { config } from '../config.js';
+import { config, isMasterBot } from '../config.js';
 import { getSessionKeyFromCtx } from '../utils/session-key.js';
 import { queueRequest, setAbortController } from '../claude/request-queue.js';
 import { sendToAgent, StaleTurnError, assertTurnIsCurrent } from '../claude/agent.js';
@@ -7,6 +7,7 @@ import { messageSender } from './message-sender.js';
 import { maybeSendVoiceReply } from '../tts/voice-reply.js';
 import { sanitizeError } from '../utils/sanitize.js';
 import { escapeMarkdownV2 as esc } from './markdown.js';
+import { userFacingFailure } from '../bot/person-policy.js';
 
 // Track active follow-up button messages so we can dismiss them
 const activeButtons = new Map<string, { chatId: number; messageId: number }>();
@@ -155,7 +156,7 @@ export async function executeFollowUpText(ctx: Context, sessionKey: string, labe
     const errorMessage = sanitizeError(error);
     console.error('[FollowUp] Callback error:', errorMessage);
     try {
-      await ctx.reply(`⚠️ ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
+      await ctx.reply(`⚠️ ${userFacingFailure(errorMessage, isMasterBot)}`, { parse_mode: undefined });
     } catch { /* best-effort */ }
   }
 }

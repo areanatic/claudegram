@@ -367,7 +367,9 @@ export async function createBot(): Promise<Bot> {
 
     if (data.startsWith('resume:')) {
       await handleResumeCallback(ctx);
-    } else if (data.startsWith('model:')) {
+    } else if (data.startsWith('model:') || data.startsWith('effort:')) {
+      // effort: gehoert in denselben Handler — er setzt Modell UND Denk-Aufwand.
+      // Ohne diesen Zweig liefen die Effort-Buttons ins Leere (Codex-Review 2026-08-03).
       await handleModelCallback(ctx);
     } else if (data.startsWith('mode:')) {
       await handleModeCallback(ctx);
