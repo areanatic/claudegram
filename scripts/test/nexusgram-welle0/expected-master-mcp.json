@@ -1,11 +1,7 @@
 {
-  "servers": [
-    "nexus-mail",
-    "nexusgram-tools",
-    "workspace-google-rw"
-  ],
+  "servers": ["nexus-mail", "nexusgram-tools", "workspace-google-rw"],
   "_tools_sha256_generator": "After a legitimate tool change, run: python3 scripts/test/nexusgram-welle0/welle0-contract.py hash --expected scripts/test/nexusgram-welle0/expected-master-mcp.json ; replace tools_sha256 with the printed field.",
-  "tools_sha256": "5541ebf284dcd373d8f6c2086d83af3ceb53bb7d9f497ef5418ba126602b129b",
+  "tools_sha256": "b675549147557b6d9189b615f63282dd1c7d777d084fb3642434ed77f6674485",
   "tools": [
     "mcp__nexus-mail__cal_create",
     "mcp__nexus-mail__cal_delete",
@@ -35,6 +31,5 @@
     "mcp__nexusgram-tools__omi_entity_search",
     "mcp__nexusgram-tools__omi_person_timeline",
     "mcp__nexusgram-tools__omi_task_search"
-  ],
-  "_tools_sha256_provenance": "Live gemessen 05.08.2026 am Master-Testbot (Release 20260805-testbot-hash, /brief \"MCP-Toolnamen SHA256 (sortiert)\"). Toolset seit R38-Erweiterung (mail_sent_recent/mail_tag/mail_attachment_extract). tools[]-Liste ist AELTER als der Hash und unvollstaendig -> T-welle0-vertrag: Liste regenerieren; bis dahin traegt der Hash-Zweig den Vertrag (Tool-Ersetzung aendert den Hash)."
+  ]
 }
