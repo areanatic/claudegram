@@ -1,3 +1,4 @@
+import { createHmac, randomBytes } from 'node:crypto';
 import Database from 'better-sqlite3';
 
 // Default points at the live shared NEXUS memory DB. Overridable via env ONLY so
@@ -198,6 +199,112 @@ function privacyClause(conn: Database.Database, includePrivate: boolean, alias =
     : `AND ${alias}.privacy = 'public'`;
 }
 
+// ── RI-25 FTS5 MATCH compiler ──────────────────────────────────────────────
+// User input is data, never FTS5 query syntax. SQLite FTS5 §3.1 permits a
+// narrow bareword alphabet; quote every phrase/token instead, doubling embedded
+// quotes per SQLite's documented escaping rule. The fallback intentionally
+// extracts only word-like tokens: punctuation/emoji remain safe in the phrase
+// pass, while tokenless/pathological input fails closed without calling MATCH.
+const FTS5_MAX_INPUT_LENGTH = 4096;
+const FTS5_MAX_FALLBACK_TOKENS = 64;
+const FTS5_UNSAFE_CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u;
+const FTS5_FALLBACK_TOKEN = /[\p{L}\p{N}_][\p{L}\p{N}\p{M}_]*/gu;
+// Per-process only: preserves correlation inside one runtime without leaving a
+// stable offline dictionary oracle for short names or other low-entropy input.
+const FTS5_LOG_HMAC_KEY = randomBytes(32);
+
+interface Fts5MatchPlan {
+  phrase: string | null;
+  tokenOr: string | null;
+  raw: { length: number; hmacSha256: string | null };
+  sanitized: {
+    phraseLength: number;
+    phraseHmacSha256: string | null;
+    tokenOrLength: number;
+    tokenOrHmacSha256: string | null;
+    tokenCount: number;
+    rejected: boolean;
+  };
+}
+
+function fts5Metadata(value: string): { length: number; hmacSha256: string } {
+  return {
+    length: value.length,
+    hmacSha256: createHmac('sha256', FTS5_LOG_HMAC_KEY).update(value).digest('hex'),
+  };
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      if (index + 1 >= value.length) return true;
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xDC00 || next > 0xDFFF) return true;
+      index++;
+    } else if (code >= 0xDC00 && code <= 0xDFFF) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function quoteFts5String(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Compile untrusted user input into the only two MATCH forms this module uses:
+ * an exact quoted phrase followed (only after zero hits) by quoted OR tokens.
+ * No caller may append FTS5 syntax or interpret user-provided operators.
+ */
+function compileFts5MatchPlan(query: string): Fts5MatchPlan {
+  const raw = typeof query === 'string' ? query : '';
+  const withinBudget = raw.length <= FTS5_MAX_INPUT_LENGTH;
+  const normalized = withinBudget ? raw.trim() : '';
+  const accepted = Boolean(normalized)
+    && !FTS5_UNSAFE_CONTROL.test(normalized)
+    && !hasUnpairedSurrogate(normalized);
+  const tokens = accepted
+    ? Array.from(new Set(normalized.match(FTS5_FALLBACK_TOKEN) ?? []))
+      .slice(0, FTS5_MAX_FALLBACK_TOKENS)
+    : [];
+  const phrase = tokens.length > 0 ? quoteFts5String(normalized) : null;
+  const tokenOr = phrase ? tokens.map(quoteFts5String).join(' OR ') : null;
+  const phraseMetadata = phrase ? fts5Metadata(phrase) : null;
+  const tokenOrMetadata = tokenOr ? fts5Metadata(tokenOr) : null;
+  return {
+    phrase,
+    tokenOr,
+    raw: withinBudget
+      ? fts5Metadata(raw)
+      : { length: raw.length, hmacSha256: null },
+    sanitized: {
+      phraseLength: phraseMetadata?.length ?? 0,
+      phraseHmacSha256: phraseMetadata?.hmacSha256 ?? null,
+      tokenOrLength: tokenOrMetadata?.length ?? 0,
+      tokenOrHmacSha256: tokenOrMetadata?.hmacSha256 ?? null,
+      tokenCount: tokens.length,
+      rejected: !phrase,
+    },
+  };
+}
+
+function logFts5SearchFailure(pathName: 'searchMemory' | 'searchMemoryReadOnly', error: unknown, plan: Fts5MatchPlan): void {
+  const message = error instanceof Error ? error.message : String(error);
+  const errorClass = /no such column|fts5|syntax error|malformed match/i.test(message)
+    ? 'fts5_match'
+    : 'other';
+  // RI-25 previously logged rawQuery to reconstruct the live crasher. That made
+  // user text a log payload. Keep correlation/debuggability via independent
+  // length+ephemeral-HMAC metadata for raw input and compiler output, never contents.
+  console.error(`[NexusMemory/${pathName}] search failure`, {
+    errorClass,
+    raw: plan.raw,
+    sanitized: plan.sanitized,
+  });
+}
+
 /**
  * FTS5 search — finds ALL memories (including archived) sorted by relevance.
  * Privacy filter: by default only 'public' rows are returned. Callers in
@@ -210,19 +317,16 @@ export function searchMemory(
   includePrivate = false,
   originBot?: string,
 ): MemoryRow[] {
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 5;
+  const matchPlan = compileFts5MatchPlan(query);
+  if (!matchPlan.phrase) return [];
   const conn = getDb();
   if (!conn) return [];
   try {
-    // Escape FTS5 special characters by wrapping in double quotes (phrase search)
-    const safeQuery = `"${query.replace(/"/g, '""')}"`;
     const projectFilter = project ? 'AND m.project = ?' : '';
     if (originBot && !hasBotColumn(conn)) return [];
     const botFilter = originBot ? 'AND m.bot = ?' : '';
     const privacyFilter = privacyClause(conn, includePrivate);
-    const params: unknown[] = [safeQuery];
-    if (project) params.push(project);
-    if (originBot) params.push(originBot);
-    params.push(limit);
 
     const stmt = conn.prepare(`
       SELECT m.id, m.type, m.content, m.source, m.project, m.tags, m.score, m.created_at, m.last_accessed
@@ -235,9 +339,21 @@ export function searchMemory(
       ORDER BY rank
       LIMIT ?
     `);
-    return stmt.all(...params) as MemoryRow[];
+    const buildParams = (matchExpr: string): unknown[] => {
+      const params: unknown[] = [matchExpr];
+      if (project) params.push(project);
+      if (originBot) params.push(originBot);
+      params.push(safeLimit);
+      return params;
+    };
+
+    let rows = stmt.all(...buildParams(matchPlan.phrase)) as MemoryRow[];
+    if (rows.length === 0 && matchPlan.tokenOr) {
+      rows = stmt.all(...buildParams(matchPlan.tokenOr)) as MemoryRow[];
+    }
+    return rows;
   } catch (err) {
-    console.error('[NexusMemory] Search error:', err);
+    logFts5SearchFailure('searchMemory', err, matchPlan);
     return [];
   }
 }
@@ -393,7 +509,7 @@ export function injectContext(
  *  - Opens its OWN read-only connection (separate from the write-capable singleton)
  *  - Fail-CLOSED by default (scope='public'); broader scopes only via explicit
  *    MemoryRetrievalPolicy in options.policy, or env-derived policy at call-time
- *  - Phrase-search first, falls back to bare-token search when 0 results
+ *  - Phrase-search first, falls back to quoted-token OR search when 0 results
  *  - Output stripped to {content, tags, project, score} — no file_path/source/privacy leak
  *  - Limit clamped to [1, 20]
  *
@@ -434,8 +550,11 @@ export function searchMemoryReadOnly(
   project?: string,
   options: MemorySearchOptions = {},
 ): McpMemoryHit[] {
-  const clampedLimit = Math.max(1, Math.min(20, Math.floor(limit)));
-  if (!query.trim()) return [];
+  const clampedLimit = Number.isFinite(limit)
+    ? Math.max(1, Math.min(20, Math.floor(limit)))
+    : 5;
+  const matchPlan = compileFts5MatchPlan(query);
+  if (!matchPlan.phrase) return [];
 
   const policy = options.policy ?? readMemoryPolicyFromEnv();
   const auditEnabled = (process.env.NEXUS_MEMORY_AUDIT ?? '') === '1';
@@ -482,27 +601,12 @@ export function searchMemoryReadOnly(
     };
 
     type RawRow = McpMemoryHit & { privacy?: string | null; source?: string | null };
-    const phraseQuery = `"${query.replace(/"/g, '""')}"`;
-    let rows = buildStmt().all(...buildParams(phraseQuery)) as RawRow[];
+    let rows = buildStmt().all(...buildParams(matchPlan.phrase)) as RawRow[];
 
-    // Fallback: when phrase-search returns 0, try a bare token search.
-    // FTS5-CRASH-FIX (2026-06-05, dev1.err.log:1 "no such column: Sync"): each token
-    // MUST be wrapped as its own quoted phrase. An unquoted token like `OMI-Sync` makes
-    // FTS5 read `-Sync` as column-negation → "no such column: Sync" (the live OMI bug);
-    // bare `NOT`/`@`/`*`/`AND` likewise hit FTS5 operator syntax → SqliteError → caught →
-    // silent [] → bot says "nothing found" although the memory exists. Per-token quoting
-    // keeps OR-across-tokens semantics while treating each token as literal content.
-    if (rows.length === 0) {
-      const tokenQuery = query
-        .replace(/[^\p{L}\p{N}\s@-]/gu, ' ')
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean)
-        .map((t) => `"${t.replace(/"/g, '""')}"`)
-        .join(' OR ');
-      if (tokenQuery) {
-        rows = buildStmt().all(...buildParams(tokenQuery)) as RawRow[];
-      }
+    // The single RI-25 compiler above keeps phrase-first semantics and only
+    // releases the quoted OR-token fallback after zero phrase hits.
+    if (rows.length === 0 && matchPlan.tokenOr) {
+      rows = buildStmt().all(...buildParams(matchPlan.tokenOr)) as RawRow[];
     }
 
     if (auditEnabled) {
@@ -531,16 +635,7 @@ export function searchMemoryReadOnly(
       bot: r.bot ?? null,
     }));
   } catch (err) {
-    // RI-25 (2026-06-07): log the RAW query + derived MATCH exprs so the next real
-    // FTS5 crash ("no such column: X") shows the actual offending input instead of
-    // forcing us to guess. The aktuelle dist passes all synthetic repros — the live
-    // crasher is a bot-generated query we have not yet captured.
-    const errMsg = err instanceof Error ? err.message : String(err);
-    if (/no such column|fts5|syntax error|malformed MATCH/i.test(errMsg)) {
-      console.error(`[NexusMemory/MCP] RI-25 FTS5-CRASH on rawQuery=${JSON.stringify(query)} | err=${errMsg}`);
-    } else {
-      console.error('[NexusMemory/MCP] searchMemoryReadOnly error:', err);
-    }
+    logFts5SearchFailure('searchMemoryReadOnly', err, matchPlan);
     return [];
   } finally {
     try { conn?.close(); } catch { /* swallow */ }
