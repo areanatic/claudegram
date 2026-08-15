@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+
+# This is an executable operator facade, not a shell library. A top-level
+# `return` succeeds only while the file is being sourced, so this guard cannot
+# be bypassed by spoofing argv[0]. Refuse before changing the caller's shell
+# options or defining any legacy function.
+if (return 0 2>/dev/null); then
+  printf '%s\n' "BLOCKED: nexusgram-ctl cannot be sourced." >&2
+  return 2
+fi
+
 set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════
@@ -14,6 +24,12 @@ set -euo pipefail
 #   nexusgram-ctl.sh stop <bot-id>
 #   nexusgram-ctl.sh logs <bot-id>
 #   nexusgram-ctl.sh rebuild          — npm run build + restart all bots
+#
+# R53 safety note (2026-08-15): PM2 was retired as a Nexusgram supervisor.
+# The public dispatch at the end of this file is now deliberately read-only.
+# Historical creation/PM2 functions remain in-place for forensic recovery, but
+# no public action can reach them. Lifecycle changes use the reviewed Dirigent
+# deployment path and always require a separate operator Go.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NEXUSGRAM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -521,53 +537,169 @@ rebuild() {
   list_bots
 }
 
+# ─── read-only launchd status facade ─────────────────────────
+
+# Status tools are initialized only for the read-only actions. This keeps every
+# blocked lifecycle action independent from test/status configuration and makes
+# it fail with the promised Exit 2 before any external command can run.
+LAUNCHCTL_BIN=""
+ID_BIN=""
+AWK_BIN=""
+GREP_BIN=""
+
+init_status_tools() {
+  if [[ "${NEXUSGRAM_CTL_TEST_MODE:-0}" == "1" ]]; then
+    [[ -n "${NEXUSGRAM_LAUNCHCTL_BIN:-}" && -n "${NEXUSGRAM_ID_BIN:-}" ]] || {
+      yellow "UNKNOWN — test mode requires launchctl and id fixtures"
+      return 3
+    }
+    LAUNCHCTL_BIN="$NEXUSGRAM_LAUNCHCTL_BIN"
+    ID_BIN="$NEXUSGRAM_ID_BIN"
+    AWK_BIN="${NEXUSGRAM_AWK_BIN:-/usr/bin/awk}"
+    GREP_BIN="${NEXUSGRAM_GREP_BIN:-/usr/bin/grep}"
+  else
+    LAUNCHCTL_BIN="/bin/launchctl"
+    ID_BIN="/usr/bin/id"
+    AWK_BIN="/usr/bin/awk"
+    GREP_BIN="/usr/bin/grep"
+  fi
+}
+
+resolve_bot_label() {
+  local bot_id="$1"
+  case "$bot_id" in
+    master)       printf '%s\n' 'com.nexus.nexusgram' ;;
+    family)       printf '%s\n' 'com.nexus.nexusgram-family' ;;
+    mom)          printf '%s\n' 'com.nexus.nexusgram-mom' ;;
+    dad)          printf '%s\n' 'com.nexus.nexusgram-dad' ;;
+    family-arash) printf '%s\n' 'com.nexus.nexusgram-family-arash' ;;
+    family-test)  printf '%s\n' 'com.nexus.nexusgram-family-test' ;;
+    test)         printf '%s\n' 'com.nexus.nexusgram-test' ;;
+    work)         printf '%s\n' 'com.nexus.nexusgram-work' ;;
+    memo)         printf '%s\n' 'com.nexus.nexusgram-memo' ;;
+    dev1)         printf '%s\n' 'com.nexus.nexusgram-dev1' ;;
+    dev2)         printf '%s\n' 'com.nexus.nexusgram-dev2' ;;
+    dev3)         printf '%s\n' 'com.nexus.nexusgram-dev3' ;;
+    *) return 64 ;;
+  esac
+}
+
+launchd_domain() {
+  local uid
+  uid="$($ID_BIN -u)" || return 3
+  [[ "$uid" =~ ^[0-9]+$ ]] || return 3
+  printf 'gui/%s\n' "$uid"
+}
+
+read_launchd_job() {
+  local bot_id="$1" label domain output rc state pid runs last_exit program
+  label="$(resolve_bot_label "$bot_id")" || {
+    red "Unknown bot id '$bot_id'"
+    return 64
+  }
+  domain="$(launchd_domain)" || {
+    yellow "UNKNOWN [$bot_id] — user launchd domain is not readable"
+    return 3
+  }
+
+  if output="$($LAUNCHCTL_BIN print "$domain/$label" 2>&1)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if (( rc != 0 )); then
+    if "$GREP_BIN" -qiE 'could not find service|service .* not found' <<<"$output"; then
+      yellow "NOT_LOADED [$bot_id] $label"
+      return 4
+    fi
+    yellow "UNKNOWN [$bot_id] $label — launchctl query failed (rc=$rc)"
+    return 3
+  fi
+
+  if ! state="$("$AWK_BIN" '$1 == "state" && $2 == "=" { sub(/^[^=]*=[[:space:]]*/, ""); print; exit }' <<<"$output")" ||
+     ! pid="$("$AWK_BIN" '$1 == "pid" && $2 == "=" { print $3; exit }' <<<"$output")" ||
+     ! runs="$("$AWK_BIN" '$1 == "runs" && $2 == "=" { print $3; exit }' <<<"$output")" ||
+     ! last_exit="$("$AWK_BIN" '$1 == "last" && $2 == "exit" && $3 == "code" && $4 == "=" { print $5; exit }' <<<"$output")" ||
+     ! program="$("$AWK_BIN" '$1 == "program" && $2 == "=" { sub(/^[^=]*=[[:space:]]*/, ""); print; exit }' <<<"$output")"; then
+    yellow "UNKNOWN [$bot_id] $label — launchctl output parser failed"
+    return 3
+  fi
+
+  if [[ "$state" == "running" ]]; then
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      green "RUNNING [$bot_id] label=$label pid=$pid runs=${runs:-?} last_exit=${last_exit:-?}"
+      [[ -z "$program" ]] || printf '  program=%s\n' "$program"
+      return 0
+    fi
+    yellow "UNKNOWN [$bot_id] $label — state is running without a numeric pid"
+    return 3
+  fi
+  if [[ -n "$state" ]]; then
+    yellow "LOADED_NOT_RUNNING [$bot_id] label=$label state=$state runs=${runs:-?} last_exit=${last_exit:-?}"
+    [[ -z "$program" ]] || printf '  program=%s\n' "$program"
+    return 4
+  fi
+  yellow "UNKNOWN [$bot_id] $label — launchctl returned no parseable state"
+  return 3
+}
+
+list_launchd_bots() {
+  local bot_id rc unknown=0
+  local -a bot_ids=(master family mom dad family-arash family-test test work memo dev1 dev2 dev3)
+  bold "Nexusgram Bots — read-only launchd view"
+  printf '\n'
+  for bot_id in "${bot_ids[@]}"; do
+    if read_launchd_job "$bot_id"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if (( rc == 3 || rc == 64 )); then
+      unknown=1
+    fi
+  done
+  (( unknown == 0 )) || return 3
+}
+
+blocked_mutation() {
+  red "BLOCKED: nexusgram-ctl is read-only; '$ACTION' cannot manage production bots."
+  red "Use the reviewed Dirigent deployment path only after explicit operator Go."
+  return 2
+}
+
+readonly_usage() {
+  bold "Nexusgram Control — read-only launchd status"
+  echo ""
+  echo "  list                    List the 12 canonical bot LaunchAgents"
+  echo "  status [bot-id]         Read one canonical LaunchAgent (default: master)"
+  echo "  help                    Show this help"
+  echo ""
+  echo "Blocked here: create-bot, start, stop, restart, logs, rebuild."
+}
+
 # ─── Main ─────────────────────────────────────────────────────
 
 case "$ACTION" in
-  create-bot)
-    create_bot "$@"
-    ;;
-  list|ls)
-    list_bots
+  list)
+    [[ $# -eq 0 ]] || { red "list accepts no arguments"; exit 64; }
+    init_status_tools || exit $?
+    list_launchd_bots
     ;;
   status)
-    bot_action "${1:-master}" status
+    [[ $# -le 1 ]] || { red "status accepts at most one bot id"; exit 64; }
+    init_status_tools || exit $?
+    read_launchd_job "${1:-master}"
     ;;
-  start)
-    bot_action "${1:-master}" start
+  create-bot|start|stop|restart|logs|log|rebuild)
+    blocked_mutation
     ;;
-  stop)
-    bot_action "${1:-master}" stop
+  help|-h|--help)
+    [[ $# -eq 0 ]] || { red "help accepts no arguments"; exit 64; }
+    readonly_usage
     ;;
-  restart)
-    bot_action "${1:-master}" restart
-    ;;
-  logs|log)
-    bot_action "${1:-master}" logs
-    ;;
-  rebuild)
-    rebuild
-    ;;
-  help|*)
-    bold "Nexusgram Control — Multi-Bot Management"
-    echo ""
-    echo "  $(bold "Bot Creation:")"
-    echo "    create-bot --name \"Name\" --id ID --token TOKEN [--lang de] [--lang2 fa] [--project ID] [--tools \"Read,Write\"]"
-    echo ""
-    echo "  $(bold "Bot Management:")"
-    echo "    list                    List all bots and their status"
-    echo "    status [bot-id]         Show bot status (default: master)"
-    echo "    start [bot-id]          Start a bot"
-    echo "    stop [bot-id]           Stop a bot"
-    echo "    restart [bot-id]        Restart a bot"
-    echo "    logs [bot-id]           Show bot logs"
-    echo "    rebuild                 Build + restart all bots"
-    echo ""
-    echo "  $(bold "Examples:")"
-    echo "    nexusgram-ctl.sh create-bot --name \"Mom Assistant\" --id mom --token \"123:ABC\" --lang de --lang2 fa --project mom"
-    echo "    nexusgram-ctl.sh list"
-    echo "    nexusgram-ctl.sh restart family"
-    echo "    nexusgram-ctl.sh logs master"
-    echo ""
+  *)
+    red "Unknown action '$ACTION'"
+    readonly_usage >&2
+    exit 64
     ;;
 esac
